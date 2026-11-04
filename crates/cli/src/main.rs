@@ -1,3 +1,5 @@
+//! `vrcnext-cli` binary: headless clap CLI driving `vrc-core`.
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
