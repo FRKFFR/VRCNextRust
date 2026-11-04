@@ -11,7 +11,6 @@ VRCNextRust/
 ├─ rust-toolchain.toml     # stable, components rustfmt + clippy
 ├─ .github/workflows/ci.yml# fmt --check, clippy -D warnings, test (windows-latest, ubuntu-latest)
 ├─ RULES.md  STATUS.md  docs/architecture.md
-├─ tools/agent-orchestrator/
 └─ crates/
    ├─ vrc-api/       # REST client, auth + 2FA, rate limiter, models, USER_AGENT
    ├─ vrc-pipeline/  # WebSocket event stream

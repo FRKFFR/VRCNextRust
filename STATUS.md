@@ -13,5 +13,4 @@
 | M8 Optional | not started | | | | |
 
 ## Notes
-- Orchestrator: `tools/agent-orchestrator` (MCP server `kodex-orchestrator`).
-  No send-message/terminate tools; corrections are follow-up tasks on the same branch.
+- Orchestration tooling lives outside this repo.
