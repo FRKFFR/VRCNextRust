@@ -1,0 +1,9 @@
+/target
+.worktrees/
+*.env
+.env
+tools/agent-orchestrator/node_modules/
+tools/agent-orchestrator/runs/
+.devin/mcp_config.local.json
+*.db
+*.sqlite
