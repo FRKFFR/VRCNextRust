@@ -1,0 +1,7 @@
+[package]
+name = "vrc-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vrc-api.workspace = true

@@ -1,0 +1,6 @@
+[package]
+name = "vrc-osc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

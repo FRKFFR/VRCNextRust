@@ -1,0 +1,8 @@
+[package]
+name = "ui-egui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe.workspace = true
+vrc-core.workspace = true

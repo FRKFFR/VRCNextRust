@@ -1,0 +1,11 @@
+[package]
+name = "vrcnextrust"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ui-egui.workspace = true
+vrc-core.workspace = true
