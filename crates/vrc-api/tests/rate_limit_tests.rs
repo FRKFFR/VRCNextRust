@@ -143,6 +143,83 @@ async fn honors_retry_after_and_pauses_all_requests() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn honors_http_date_retry_after() {
+    let server = MockServer::start().await;
+    // An HTTP-date far in the future must be parsed and honoured; a parse
+    // failure would fall back to ~1 s of backoff instead.
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "Sat, 01 Jan 2050 00:00:00 GMT"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(ok_user())
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server, 1_000.0, 100);
+    let start = Instant::now();
+    client.current_user().await.unwrap();
+    assert!(
+        start.elapsed() >= Duration::from_secs(86_400),
+        "HTTP-date must pause far longer than backoff, elapsed {:?}",
+        start.elapsed()
+    );
+    assert_eq!(request_count(&server).await, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_429_still_pauses_following_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server, 1_000.0, 100);
+    let err = client.current_user().await.unwrap_err();
+    assert!(matches!(err, ApiError::RateLimited { .. }));
+
+    // The last 429's Retry-After applies to the shared limiter: a follow-up
+    // request may not fire for ~30 s (paused clock auto-advances).
+    let start = Instant::now();
+    let _ = client.current_user().await;
+    assert!(
+        start.elapsed() >= Duration::from_secs(29),
+        "requests must stay paused after RateLimited, elapsed {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn absurd_retry_after_cannot_crash_the_limiter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("retry-after", "18446744073709551615"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(ok_user())
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server, 1_000.0, 100);
+    client.current_user().await.unwrap();
+    assert_eq!(request_count(&server).await, 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn persistent_429_returns_rate_limited() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

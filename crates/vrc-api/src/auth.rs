@@ -36,19 +36,28 @@ impl Client {
     ) -> Result<LoginOutcome, ApiError> {
         let url = self.url("/auth/user");
         let username = form_encode(username);
-        let password = form_encode(password.expose_secret());
+        // The encoded credential is still a secret; keep it wrapped until the
+        // moment reqwest consumes it.
+        let password = SecretString::from(form_encode(password.expose_secret()));
         let resp = self
-            .send(|http| http.get(&url).basic_auth(&username, Some(&password)))
+            .send(|http| {
+                http.get(&url)
+                    .basic_auth(&username, Some(password.expose_secret()))
+            })
             .await?;
         let value: Value = self.decode(resp).await?;
         let state: AuthState = serde_json::from_value(value.clone()).map_err(ApiError::Decode)?;
         if !state.requires_two_factor_auth.is_empty() {
-            let methods = state
+            let methods: Vec<TwoFactorMethod> = state
                 .requires_two_factor_auth
                 .iter()
                 .filter_map(|m| TwoFactorMethod::parse(m))
                 .collect();
-            return Ok(LoginOutcome::Needs2fa(methods));
+            return if methods.is_empty() {
+                Err(ApiError::Requires2fa)
+            } else {
+                Ok(LoginOutcome::Needs2fa(methods))
+            };
         }
         let user: CurrentUser = serde_json::from_value(value).map_err(ApiError::Decode)?;
         self.persist_auth_cookies()?;
@@ -65,8 +74,12 @@ impl Client {
         code: &SecretString,
     ) -> Result<CurrentUser, ApiError> {
         let path = format!("/auth/twofactorauth/{}/verify", method.verify_path());
-        let body = serde_json::json!({ "code": code.expose_secret() });
-        let value: Value = self.post_json(&path, &body).await?;
+        // `serde_json::to_string` cannot fail on a &str.
+        let code_json = SecretString::from(
+            serde_json::to_string(code.expose_secret()).map_err(ApiError::Decode)?,
+        );
+        let body = SecretString::from(format!("{{\"code\":{}}}", code_json.expose_secret()));
+        let value: Value = self.post_secret_json(&path, &body).await?;
         let verified = value
             .get("verified")
             .and_then(Value::as_bool)

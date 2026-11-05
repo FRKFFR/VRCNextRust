@@ -9,10 +9,10 @@ use std::fmt;
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use reqwest::header::{self, HeaderValue};
+use reqwest::header;
 use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 
@@ -152,15 +152,20 @@ impl Client {
         self.decode(resp).await
     }
 
-    /// `POST path` with a JSON body, decoding the JSON response into `T`.
-    pub(crate) async fn post_json<T: DeserializeOwned>(
+    /// `POST path` with a secret JSON body (e.g. a 2FA code), decoding the
+    /// JSON response into `T`. `body` is sent verbatim as `application/json`.
+    pub(crate) async fn post_secret_json<T: DeserializeOwned>(
         &self,
         path: &str,
-        body: &serde_json::Value,
+        body: &SecretString,
     ) -> Result<T, ApiError> {
         let url = self.url(path);
         let resp = self
-            .send(|http| http.request(Method::POST, &url).json(body))
+            .send(|http| {
+                http.request(Method::POST, &url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.expose_secret().to_string())
+            })
             .await?;
         self.decode(resp).await
     }
@@ -181,6 +186,12 @@ impl Client {
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let retry_after = retry_after(resp.headers());
                         if retries >= MAX_RETRIES {
+                            // Even a failed request must honour the delay:
+                            // keep every caller paused until the API's stated
+                            // window has passed.
+                            if let Some(wait) = retry_after {
+                                self.inner.limiter.pause(wait);
+                            }
                             return Err(ApiError::RateLimited { retry_after });
                         }
                         let wait = retry_after.unwrap_or_else(|| self.retry_delay(retries));
@@ -296,16 +307,68 @@ impl Client {
     }
 }
 
-/// Parse a `Retry-After` header value (integer seconds).
+/// Parse a `Retry-After` header value: delta-seconds or an HTTP-date
+/// (IMF-fixdate), per RFC 9110. A date in the past means "retry now".
 fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(header::RETRY_AFTER)
-        .and_then(|v: &HeaderValue| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let until = parse_http_date(value)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(Duration::from_secs((until - now).max(0) as u64))
 }
 
-/// Best-effort body text for an error response, capped at 512 bytes.
+/// Parse an HTTP-date (`Www, dd Mmm yyyy hh:mm:ss GMT`) into unix seconds.
+fn parse_http_date(value: &str) -> Option<i64> {
+    let (_, date) = value.split_once(',')?;
+    let mut parts = date.split_whitespace();
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut hms = parts.next()?.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() || parts.next() != Some("GMT") {
+        return None;
+    }
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days since the unix epoch for a proleptic Gregorian date
+/// (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_prime = i64::from((month + 9) % 12);
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Best-effort body text for an error response, capped at 512 characters.
 async fn error_body(resp: Response) -> String {
     let body = resp.bytes().await.unwrap_or_default();
     extract_error_message(&body)
@@ -329,6 +392,7 @@ fn extract_error_message(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn builder_defaults_to_api_root() {
@@ -341,5 +405,37 @@ mod tests {
         let body = br#"{"error":{"message":"synthetic failure","status_code":400}}"#;
         assert_eq!(extract_error_message(body), "synthetic failure");
         assert_eq!(extract_error_message(b"not json"), "not json");
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_date() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(5)));
+
+        // Epoch of this IMF-fixdate is 1445412480 (21 Oct 2015 07:28:00 GMT).
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(1_445_412_480)
+        );
+        assert_eq!(
+            parse_http_date("Fri, 01 Jan 2027 00:00:00 GMT"),
+            Some(1_798_761_600)
+        );
+        // A past date is honoured as "retry now".
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::ZERO));
+
+        // Garbage is ignored rather than guessed.
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("soon"));
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 PST"),
+        );
+        assert_eq!(retry_after(&headers), None);
     }
 }

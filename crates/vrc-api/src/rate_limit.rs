@@ -10,6 +10,10 @@ use std::time::Duration;
 
 use tokio::time::{sleep, Instant};
 
+/// Upper bound for a single pause; guards against absurd `Retry-After`
+/// values and `Instant` overflow.
+const MAX_PAUSE: Duration = Duration::from_secs(365 * 86_400);
+
 /// Token-bucket rate limiter shared by all requests on a [`crate::Client`].
 pub struct RateLimiter {
     rate_per_second: f64,
@@ -70,9 +74,14 @@ impl RateLimiter {
     }
 
     /// Block all callers for `duration` (e.g. after a 429). Extends, never
-    /// shortens, an existing pause.
+    /// shortens, an existing pause. Absurd durations saturate at [`MAX_PAUSE`]
+    /// so `Instant` arithmetic cannot overflow.
     pub fn pause(&self, duration: Duration) {
-        let until = Instant::now() + duration;
+        let now = Instant::now();
+        let until = now
+            .checked_add(duration.min(MAX_PAUSE))
+            .or_else(|| now.checked_add(MAX_PAUSE))
+            .unwrap_or(now);
         let mut state = self.lock();
         if state.paused_until.is_none_or(|current| current < until) {
             state.paused_until = Some(until);

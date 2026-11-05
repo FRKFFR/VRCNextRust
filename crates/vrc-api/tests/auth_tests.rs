@@ -178,17 +178,19 @@ async fn auth_token_returns_secret_auth_cookie_value() {
     assert!(!format!("{token:?}").contains(FAKE_COOKIE));
 }
 
-#[tokio::test]
-async fn verify_2fa_persists_cookies_and_returns_current_user() {
+/// Drive one successful `POST /auth/twofactorauth/<verify_path>/verify` flow
+/// and assert cookies persist and the CurrentUser is returned.
+async fn assert_verify_2fa_success(factor: TwoFactorMethod, verify_path: &str) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/auth/twofactorauth/emailotp/verify"))
+        .and(path(format!("/auth/twofactorauth/{verify_path}/verify")))
         .and(body_json(json!({ "code": "000000" })))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "verified": true }))
                 .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
         )
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -200,7 +202,7 @@ async fn verify_2fa_persists_cookies_and_returns_current_user() {
     let vault = test_vault();
     let client = test_client(&server, vault.clone());
     let user = client
-        .verify_2fa(TwoFactorMethod::EmailOtp, &SecretString::from("000000"))
+        .verify_2fa(factor, &SecretString::from("000000"))
         .await
         .unwrap();
 
@@ -209,6 +211,16 @@ async fn verify_2fa_persists_cookies_and_returns_current_user() {
         vault.load().unwrap().as_deref(),
         Some(format!("auth={FAKE_COOKIE}").as_str())
     );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn verify_2fa_succeeds_for_every_documented_method() {
+    // Task: "then verify for each method" — totp, emailOtp, and the recovery
+    // `otp` endpoint all round-trip through the same code path.
+    assert_verify_2fa_success(TwoFactorMethod::Totp, "totp").await;
+    assert_verify_2fa_success(TwoFactorMethod::EmailOtp, "emailotp").await;
+    assert_verify_2fa_success(TwoFactorMethod::RecoveryOtp, "otp").await;
 }
 
 #[tokio::test]

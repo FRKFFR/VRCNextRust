@@ -14,7 +14,7 @@ pub enum ApiError {
     Http { status: u16, message: String },
 
     /// The API returned 429 and the retry budget was exhausted.
-    #[error("rate limited by the VRChat API")]
+    #[error("rate limited by the VRChat API (retry after {retry_after:?})")]
     RateLimited { retry_after: Option<Duration> },
 
     /// The API rejected the credentials or the session is no longer valid.
