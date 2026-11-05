@@ -4781,6 +4781,9 @@ name = "ui-egui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "secrecy",
+ "tokio",
+ "tracing",
  "vrc-core",
 ]
 

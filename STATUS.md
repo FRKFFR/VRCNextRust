@@ -4,7 +4,7 @@
 |---|---|---|---|---|---|
 | Setup | done | lead | main | repo, RULES.md, architecture, orchestrator | — |
 | M1 Foundations | M1b in review | m1b-coder | agent/m1b-vrc-api-client-read-rules-md-first-m-mw3qpgur | M1b vrc-api client: auth + 2FA, CookieVault (keyring/memory), token-bucket rate limiter + retry, models, wiremock tests | clipboard-win 5.4.3 via eframe accepted as pin exception; re-pin to 5.4.2 after 2026-11-06 |
-| M2 Real-time | M2a in review | m2a-coder | agent/m2a-real-time-data-layer-read-rules-md-f-mw3so8op | real-time data layer: paginated friends/favorites in vrc-api, reconnecting WS pipeline (vrc-pipeline), vrc-core App merging REST+events into AppState (sections/search/worlds), vrcnext-cli login/me/friends/watch/logout | — |
+| M2 Real-time | M2b in review | m2b-coder | agent/m2b-desktop-ui-for-real-time-friends-rea-mw3vxzls | M2b desktop UI: egui login/2FA/main screens, friend sections + search, friends' worlds dashboard with lazy world-name resolution (`GET /worlds/{id}`, 10-min failure cache) | — |
 | M3 Local data | not started | | | | agent time limit 60 min |
 | M4 Social actions | not started | | | | |
 | M5 Worlds, groups, avatars | not started | | | | |

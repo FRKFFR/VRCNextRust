@@ -22,12 +22,13 @@ mod friends;
 pub mod models;
 mod rate_limit;
 mod vault;
+mod worlds;
 
 pub use auth::LoginOutcome;
 pub use client::{Client, ClientBuilder, API_ROOT};
 pub use error::ApiError;
 pub use models::{
-    CurrentUser, Favorite, LimitedUser, PastDisplayName, TrustRank, TwoFactorMethod, User,
+    CurrentUser, Favorite, LimitedUser, PastDisplayName, TrustRank, TwoFactorMethod, User, World,
 };
 pub use rate_limit::RateLimiter;
 pub use vault::{CookieVault, KeyringVault, MemoryVault};

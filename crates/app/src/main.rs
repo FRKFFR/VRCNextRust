@@ -1,5 +1,7 @@
 //! `vrcnextrust` binary: init tracing, spawn the core, run the egui UI.
 
+use eframe::egui;
+
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
     // The credential store is best-effort: login still works in memory when
@@ -14,5 +16,14 @@ fn main() -> eframe::Result<()> {
     }
     .expect("REST client builds");
     let handle = vrc_core::App::spawn(vrc_core::AppConfig::new(client));
-    ui_egui::run(handle)
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("VRCNextRust")
+            .with_app_id("vrcnextrust")
+            .with_inner_size(egui::vec2(1100.0, 720.0))
+            .with_min_inner_size(egui::vec2(760.0, 480.0)),
+        ..Default::default()
+    };
+    ui_egui::run(handle, options)
 }

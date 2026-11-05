@@ -339,6 +339,49 @@ impl User {
     }
 }
 
+/// A world (`GET /worlds/{id}`).
+///
+/// Public metadata only; every field defaults so partially populated
+/// responses still decode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct World {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "name", deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(rename = "authorName", deserialize_with = "null_to_default")]
+    pub author_name: String,
+    #[serde(rename = "authorId", deserialize_with = "null_to_default")]
+    pub author_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub capacity: i32,
+    #[serde(rename = "recommendedCapacity", deserialize_with = "null_to_default")]
+    pub recommended_capacity: i32,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub url: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub popularity: i32,
+    #[serde(deserialize_with = "null_to_default")]
+    pub favorites: i32,
+    #[serde(deserialize_with = "null_to_default")]
+    pub occupancy: i32,
+    #[serde(rename = "releaseStatus", deserialize_with = "null_to_default")]
+    pub release_status: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub platforms: Vec<String>,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+    #[serde(rename = "publicationDate", deserialize_with = "null_to_default")]
+    pub publication_date: String,
+}
+
 /// One entry of `GET /favorites` — a pointer at a favorited object.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

@@ -7,12 +7,14 @@
 //! `vrc-pipeline` events — never re-fetched per event (RULES.md §3).
 
 mod app;
+mod dashboard;
 mod sections;
 mod state;
 
 pub use app::{App, AppConfig, AppEvent, AppHandle, Command, CommandSender, StateHandle};
+pub use dashboard::{dashboard, friend_names, world_name_label, DashboardEntry};
 pub use sections::{search, sections, worlds_with_friends, FriendSections, WorldGroup};
-pub use state::{AppState, AuthState, Friend, PipelineStatus};
+pub use state::{AppState, AuthState, Friend, PipelineStatus, WorldName};
 
 // Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
 // the leaf crates they legitimately need.

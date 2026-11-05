@@ -5,6 +5,7 @@
 //! per event (RULES.md §3).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use vrc_api::{CurrentUser, LimitedUser, TrustRank, TwoFactorMethod, User};
 
@@ -172,6 +173,30 @@ pub(crate) fn world_id_from(location: &str) -> String {
         .to_string()
 }
 
+/// Resolution state of a world's display name (`GET /worlds/{id}`),
+/// fetched once per world id and cached here (RULES.md §3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorldName {
+    /// A `GET /worlds/{id}` request is in flight for this world.
+    Pending,
+    /// The world's display name.
+    Known(String),
+    /// Resolution failed; don't retry before `retry_at`.
+    Unknown {
+        /// Earliest instant a retry is allowed.
+        retry_at: Instant,
+    },
+}
+
+impl Default for WorldName {
+    /// Treated like a fresh `Unknown`: eligible for an immediate fetch.
+    fn default() -> Self {
+        Self::Unknown {
+            retry_at: Instant::now(),
+        }
+    }
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -185,4 +210,7 @@ pub struct AppState {
     pub pipeline: PipelineStatus,
     /// Most recent command error, if any (never secret material).
     pub last_error: Option<String>,
+    /// World display names keyed by `wrld_…` id, resolved lazily by the
+    /// dashboard's name-resolution task.
+    pub world_names: HashMap<String, WorldName>,
 }

@@ -14,9 +14,9 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vrc_core::{
-    search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle, AppState,
-    AuthState, Client, Command, MemoryVault, PipelineConfig, PipelineEvent, PipelineStatus,
-    TwoFactorMethod,
+    dashboard, search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle,
+    AppState, AuthState, Client, Command, MemoryVault, PipelineConfig, PipelineEvent,
+    PipelineStatus, TwoFactorMethod, WorldName,
 };
 
 const CURRENT_USER: &str = include_str!("../../vrc-api/tests/fixtures/current_user.json");
@@ -478,4 +478,134 @@ async fn unauthorized_on_refresh_tears_down_session() {
     assert!(state.current_user.is_none());
     assert!(state.friends.is_empty());
     assert_eq!(state.pipeline, PipelineStatus::Disconnected);
+    assert!(state.world_names.is_empty());
+}
+
+#[tokio::test]
+async fn dashboard_world_names_resolve_once_and_failures_are_cached() {
+    const WORLD_OK: &str = "wrld_00000000-0000-0000-0000-0000000000a1";
+    const WORLD_BAD: &str = "wrld_00000000-0000-0000-0000-0000000000b2";
+    const FRIEND_A: &str = "usr_00000000-0000-0000-0000-0000000000a1";
+    const FRIEND_B: &str = "usr_00000000-0000-0000-0000-0000000000b2";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CURRENT_USER, "application/json")
+                .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .and(query_param("offline", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+            fake_friend(FRIEND_A, "Test In World", &format!("{WORLD_OK}:inst1")),
+            fake_friend(FRIEND_B, "Test Gone World", &format!("{WORLD_BAD}:inst2")),
+        ]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .and(query_param("offline", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorites"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    // One world resolves, one is gone — both looked up exactly once.
+    Mock::given(method("GET"))
+        .and(path(format!("/worlds/{WORLD_OK}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": WORLD_OK,
+            "name": "Test World Name"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/worlds/{WORLD_BAD}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let client = Client::builder()
+        .base_url(server.uri())
+        .vault(MemoryVault::new())
+        .rate_limit(1_000.0, 100)
+        .build()
+        .unwrap();
+    let config = AppConfig {
+        client,
+        pipeline: PipelineConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            ..PipelineConfig::default()
+        },
+    };
+    let mut handle = App::spawn(config);
+
+    handle
+        .commands
+        .send(Command::Login {
+            username: "testuser".to_string(),
+            password: SecretString::from("synthetic password"),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Authenticated))
+    })
+    .await;
+
+    // Both resolutions report back; order between them is not guaranteed.
+    let mut resolved = std::collections::HashSet::new();
+    for _ in 0..2 {
+        match wait_for(&mut handle, |e| {
+            matches!(e, AppEvent::WorldNameResolved { .. })
+        })
+        .await
+        {
+            AppEvent::WorldNameResolved { world_id } => {
+                resolved.insert(world_id);
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert!(resolved.contains(WORLD_OK));
+    assert!(resolved.contains(WORLD_BAD));
+
+    let state = handle.state.snapshot();
+    assert_eq!(
+        state.world_names.get(WORLD_OK),
+        Some(&WorldName::Known("Test World Name".to_string()))
+    );
+    assert!(matches!(
+        state.world_names.get(WORLD_BAD),
+        Some(WorldName::Unknown { .. })
+    ));
+
+    // The dashboard surfaces the resolved name and keeps friend-count order.
+    let entries = dashboard(&state);
+    assert_eq!(entries.len(), 2);
+    let named = entries
+        .iter()
+        .find(|e| e.group.world_id == WORLD_OK)
+        .expect("dashboard entry for resolved world");
+    assert_eq!(vrc_core::world_name_label(named), "Test World Name");
+
+    server.verify().await;
 }
