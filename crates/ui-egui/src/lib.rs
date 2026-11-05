@@ -6,7 +6,10 @@
 //! local form buffers, are moved into `SecretString`s on submit, and are
 //! never stored in `AppState` or logged (RULES.md §4).
 
+mod social;
 mod tabs;
+
+use std::collections::HashSet;
 
 use eframe::egui;
 use secrecy::SecretString;
@@ -16,6 +19,22 @@ use vrc_core::{
     search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
     PipelineStatus, StateHandle, TimelineKind, TrustRank, TwoFactorMethod,
 };
+
+/// A destructive action awaiting explicit user confirmation (RULES.md:
+/// unfriend/block never fire without one).
+#[derive(Debug, Clone)]
+pub(crate) enum ConfirmAction {
+    /// `Command::Unfriend { confirm: true }`.
+    Unfriend {
+        /// `usr_…` target id.
+        user_id: String,
+    },
+    /// `Command::ModerateUser { kind: Block, confirm: true }`.
+    Block {
+        /// `usr_…` target id.
+        user_id: String,
+    },
+}
 
 /// Root eframe application.
 pub struct VrcNextApp {
@@ -42,6 +61,16 @@ pub struct VrcNextApp {
     history_page: u32,
     /// Stats tab range preset.
     stats_preset: tabs::StatsPreset,
+    /// Profile-tab note editor buffer, keyed by the profile's user id.
+    note_edit: String,
+    /// Which user's note `note_edit` currently edits.
+    note_edit_user: Option<String>,
+    /// Whether the multi-invite picker window is open.
+    multi_invite_open: bool,
+    /// Friend ids ticked in the multi-invite picker.
+    multi_invite_selected: HashSet<String>,
+    /// Pending destructive action shown in the confirm dialog.
+    confirm: Option<ConfirmAction>,
 }
 
 impl VrcNextApp {
@@ -62,6 +91,11 @@ impl VrcNextApp {
             history_query: String::new(),
             history_page: 0,
             stats_preset: tabs::StatsPreset::AllTime,
+            note_edit: String::new(),
+            note_edit_user: None,
+            multi_invite_open: false,
+            multi_invite_selected: HashSet::new(),
+            confirm: None,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).
@@ -71,7 +105,7 @@ impl VrcNextApp {
 
     /// Queue a command; the channel is bounded and commands are cheap, so a
     /// full channel simply drops the action rather than blocking the UI.
-    fn send(&self, command: Command) {
+    pub(crate) fn send(&self, command: Command) {
         if let Err(TrySendError::Closed(_)) = self.commands.try_send(command) {
             tracing::warn!("vrc-core command channel closed");
         }
@@ -217,12 +251,15 @@ impl VrcNextApp {
                     .desired_width(f32::INFINITY)
                     .show(ui);
                 ui.separator();
+                if ui.button("Multi-invite…").clicked() {
+                    self.multi_invite_open = true;
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let grouped = search(&sections(state), &self.search);
-                    friend_section(ui, "Favorites", &grouped.favorites);
-                    friend_section(ui, "In Game", &grouped.in_game);
-                    friend_section(ui, "Web / App", &grouped.web_active);
-                    friend_section(ui, "Offline", &grouped.offline);
+                    friend_section(self, ui, "Favorites", &grouped.favorites);
+                    friend_section(self, ui, "In Game", &grouped.in_game);
+                    friend_section(self, ui, "Web / App", &grouped.web_active);
+                    friend_section(self, ui, "Offline", &grouped.offline);
                 });
             });
     }
@@ -231,6 +268,9 @@ impl VrcNextApp {
         self.top_bar(ui, state);
         self.friends_panel(ui, state);
         tabs::central_panel(self, ui, state);
+        // Floating windows render above the central panel.
+        social::multi_invite_window(self, ui, state);
+        social::confirm_dialog(self, ui);
     }
 }
 
@@ -254,7 +294,7 @@ fn error_text(ui: &mut egui::Ui, state: &AppState) {
 }
 
 /// One collapsible friend section inside the left panel.
-fn friend_section(ui: &mut egui::Ui, title: &str, friends: &[Friend]) {
+fn friend_section(app: &mut VrcNextApp, ui: &mut egui::Ui, title: &str, friends: &[Friend]) {
     egui::CollapsingHeader::new(format!("{title} ({})", friends.len()))
         .default_open(true)
         .show(ui, |ui| {
@@ -263,23 +303,45 @@ fn friend_section(ui: &mut egui::Ui, title: &str, friends: &[Friend]) {
                 return;
             }
             for friend in friends {
-                friend_row(ui, friend);
+                friend_row(app, ui, friend);
             }
         });
     ui.add_space(4.0);
 }
 
-/// A single friend row: presence dot, name, trust badge, status/location.
-fn friend_row(ui: &mut egui::Ui, friend: &Friend) {
+/// A single friend row: presence dot, name (click → profile), trust badge,
+/// status/location, and a small invite button.
+fn friend_row(app: &mut VrcNextApp, ui: &mut egui::Ui, friend: &Friend) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("●")
                 .color(presence_color(friend))
                 .size(14.0),
         );
-        ui.strong(&friend.display_name);
+        if ui
+            .strong(&friend.display_name)
+            .on_hover_text("Open profile")
+            .clicked()
+        {
+            app.send(Command::LoadProfile {
+                user_id: friend.id.clone(),
+            });
+            app.tab = tabs::Tab::Profile;
+        }
         let (color, label) = trust_badge(friend.trust_rank);
         ui.colored_label(color, label);
+        if friend.is_online()
+            && ui
+                .small_button("invite")
+                .on_hover_text("Invite to your instance")
+                .clicked()
+        {
+            app.send(Command::InviteUser {
+                user_id: friend.id.clone(),
+                instance_id: None,
+                message_slot: None,
+            });
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Status description first (the user's own status text), then
             // the location tag, then the presence status as last resort.
@@ -353,6 +415,20 @@ pub fn twofa_method_label(method: TwoFactorMethod) -> &'static str {
         TwoFactorMethod::EmailOtp => "E-mail code",
         TwoFactorMethod::RecoveryOtp => "Recovery code",
     }
+}
+
+/// Short timestamp for notification rows: `YYYY-MM-DD HH:MM` from an ISO
+/// string, or the raw string when it doesn't parse.
+pub(crate) fn fmt_short_ts(iso: &str) -> String {
+    if iso.len() >= 16 {
+        // ISO-8601 `2026-01-02T03:04:05…` → `2026-01-02 03:04`.
+        let date = &iso[..10];
+        let time = &iso[11..16];
+        if date.len() == 10 && time.len() == 5 && date.as_bytes()[4] == b'-' {
+            return format!("{date} {time}");
+        }
+    }
+    iso.to_string()
 }
 
 /// Open the "VRCNextRust" window and run the UI loop.
