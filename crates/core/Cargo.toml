@@ -1,0 +1,13 @@
+[package]
+name = "vrc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vrc-api.workspace = true
+vrc-pipeline.workspace = true
+vrc-store.workspace = true
+vrc-logs.workspace = true
+vrc-osc.workspace = true
+vrc-launcher.workspace = true

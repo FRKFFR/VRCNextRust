@@ -3,7 +3,7 @@
 | Milestone | State | Session | Branch / PR | Outcome | Open issues |
 |---|---|---|---|---|---|
 | Setup | done | lead | main | repo, RULES.md, architecture, orchestrator | — |
-| M1 Foundations | not started | | | | |
+| M1 Foundations | in review | m1a-coder | agent/m1a-workspace-skeleton-read-rules-md-fir-mw2mob17 | M1a workspace skeleton: 10 crates, toolchain pin, CI, USER_AGENT | — |
 | M2 Real-time | not started | | | | |
 | M3 Local data | not started | | | | agent time limit 60 min |
 | M4 Social actions | not started | | | | |
