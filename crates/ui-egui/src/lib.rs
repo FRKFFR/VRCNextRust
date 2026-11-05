@@ -313,7 +313,7 @@ fn world_card(ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
                     ));
                 });
             });
-            ui.small(egui::RichText::new(&entry.location).monospace().weak());
+            ui.small(egui::RichText::new(&entry.instance_id).monospace().weak());
             ui.separator();
             for friend in &entry.friends {
                 ui.horizontal(|ui| {

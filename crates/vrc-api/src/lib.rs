@@ -32,6 +32,7 @@ pub use models::{
 };
 pub use rate_limit::RateLimiter;
 pub use vault::{CookieVault, KeyringVault, MemoryVault};
+pub use worlds::valid_world_id;
 
 #[cfg(test)]
 mod tests {

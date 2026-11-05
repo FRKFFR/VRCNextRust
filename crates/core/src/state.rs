@@ -176,14 +176,7 @@ pub(crate) fn world_id_from(location: &str) -> String {
 /// True when `id` is a plausible `wrld_…` world id, safe to interpolate
 /// into a `/worlds/{id}` path segment. Pipeline payloads are remote data,
 /// so ids that bypassed [`world_id_from`] are re-validated here.
-pub(crate) fn valid_world_id(id: &str) -> bool {
-    id.strip_prefix("wrld_").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    })
-}
+pub(crate) use vrc_api::valid_world_id;
 
 /// Resolution state of a world's display name (`GET /worlds/{id}`),
 /// fetched once per world id and cached here (RULES.md §3).
