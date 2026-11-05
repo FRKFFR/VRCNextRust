@@ -16,8 +16,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use vrc_core::{
     dashboard, search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle,
     AppState, AuthState, Client, Command, FriendHistoryFilter, MemoryVault, NewSession,
-    PipelineConfig, PipelineEvent, PipelineStatus, StatsRange, TimelineFilter, TimelineKind,
-    TwoFactorMethod, WorldName,
+    PipelineConfig, PipelineEvent, PipelineStatus, PlayerModerationKind, StatsRange,
+    TimelineFilter, TimelineKind, TwoFactorMethod, WorldName,
 };
 
 const CURRENT_USER: &str = include_str!("../../vrc-api/tests/fixtures/current_user.json");
@@ -965,4 +965,638 @@ async fn read_only_instance_neither_tails_nor_touches_sessions() {
         .unwrap();
     wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
     assert_eq!(handle.state.snapshot().timeline.unwrap().total, 0);
+}
+
+const NOTIF_ID: &str = "not_00000000-0000-0000-0000-000000000001";
+const FRQ_ID: &str = "frq_00000000-0000-0000-0000-000000000009";
+const INVITE_INSTANCE: &str = "55~hidden(usr_00000000-0000-0000-0000-000000000002)~region(us)";
+
+fn fake_notification(id: &str, kind: &str, sender: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "type": kind,
+        "created_at": "2026-01-02T03:04:05.000Z",
+        "details": "{}",
+        "message": "Synthetic notification.",
+        "seen": false,
+        "senderUserId": sender,
+        "senderUsername": "",
+        "receiverUserId": "usr_00000000-0000-0000-0000-0000000000ff"
+    })
+}
+
+fn success_body() -> serde_json::Value {
+    json!({"success": {"message": "ok", "status_code": 200}})
+}
+
+/// Shared login setup for the social tests: wiremock REST + a WS listener
+/// whose frames the test drives through `frames_tx`.
+struct SocialHarness {
+    handle: AppHandle,
+    frames_tx: mpsc::Sender<String>,
+}
+
+async fn spawn_social_app(server: &MockServer) -> SocialHarness {
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CURRENT_USER, "application/json")
+                .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .and(query_param("offline", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_friend(
+            ONLINE_ID,
+            "Test Online",
+            "wrld_00000000-0000-0000-0000-00000000000a:inst1",
+        )]))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .and(query_param("offline", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorites"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(server)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frames_tx, mut frames_rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(text) = frames_rx.recv().await {
+            ws.send(Message::Text(text.into())).await.unwrap();
+        }
+    });
+
+    let client = Client::builder()
+        .base_url(server.uri())
+        .vault(MemoryVault::new())
+        .rate_limit(1_000.0, 100)
+        .build()
+        .unwrap();
+    let config = AppConfig {
+        client,
+        pipeline: PipelineConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            ..PipelineConfig::default()
+        },
+        data_dir: None,
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
+    };
+    let mut handle = App::spawn(config);
+    handle
+        .commands
+        .send(Command::Login {
+            username: "testuser".to_string(),
+            password: SecretString::from("synthetic password"),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Authenticated))
+    })
+    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await;
+    SocialHarness {
+        handle,
+        frames_tx,
+    }
+}
+
+#[tokio::test]
+async fn social_notifications_and_profile_commands() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/notifications"))
+        .and(query_param("n", "100"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+            fake_notification(NOTIF_ID, "friendRequest", ONLINE_ID),
+            fake_notification(
+                "not_00000000-0000-0000-0000-000000000002",
+                "invite",
+                ONLINE_ID,
+            ),
+        ]))
+        .mount(&server)
+        .await;
+    for (id, suffix) in [
+        (NOTIF_ID, "see"),
+        ("not_00000000-0000-0000-0000-000000000002", "hide"),
+    ] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/auth/user/notifications/{id}/{suffix}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("PUT"))
+        .and(path(format!("/auth/user/notifications/{FRQ_ID}/accept")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/{ONLINE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": ONLINE_ID,
+            "name": "testonline",
+            "displayName": "Test Online",
+            "bio": "Synthetic fixture.",
+            "note": "",
+            "friendRequestStatus": "none",
+            "tags": [],
+            "isFriend": true
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/user/{ONLINE_ID}/friendStatus")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "incomingRequest": false,
+            "isFriend": true,
+            "outgoingRequest": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/playermoderations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/userNotes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "note_00000000-0000-0000-0000-000000000001",
+            "createdAt": "2026-01-02T03:04:05.000Z",
+            "note": "met at the park",
+            "targetUserId": ONLINE_ID,
+            "userId": "usr_00000000-0000-0000-0000-0000000000ff"
+        })))
+        .mount(&server)
+        .await;
+
+    let SocialHarness {
+        mut handle,
+        frames_tx,
+    } = spawn_social_app(&server).await;
+
+    // Notifications list loads.
+    handle
+        .commands
+        .send(Command::RefreshNotifications)
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::NotificationsChanged)
+    })
+    .await;
+    let state = handle.state.snapshot();
+    let notifications = state.notifications.clone().unwrap();
+    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications[0].id, NOTIF_ID);
+
+    // A pipeline push upserts a third notification without a re-fetch.
+    frames_tx
+        .send(format!(
+            r#"{{"type":"notification","content":{}}}"#,
+            serde_json::to_string(&fake_notification(
+                "not_00000000-0000-0000-0000-000000000003",
+                "message",
+                ONLINE_ID
+            ))
+            .unwrap()
+        ))
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::Pipeline(ev) if matches!(&**ev, PipelineEvent::Notification { .. }))
+    })
+    .await;
+    let state = handle.state.snapshot();
+    assert_eq!(state.notifications.as_ref().unwrap().len(), 3);
+
+    // see → seen flag; hide → removed.
+    handle
+        .commands
+        .send(Command::SeeNotification {
+            id: NOTIF_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::NotificationsChanged)
+    })
+    .await;
+    let state = handle.state.snapshot();
+    assert!(state.notifications.as_ref().unwrap()[1].seen);
+
+    handle
+        .commands
+        .send(Command::HideNotification {
+            id: "not_00000000-0000-0000-0000-000000000002".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::NotificationsChanged)
+    })
+    .await;
+    let state = handle.state.snapshot();
+    assert_eq!(state.notifications.as_ref().unwrap().len(), 2);
+
+    // accept removes the frq notification (not in list anyway) and
+    // refreshes friends.
+    handle
+        .commands
+        .send(Command::AcceptNotification {
+            id: FRQ_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::NotificationsChanged)
+    })
+    .await;
+
+    // Profile load + note.
+    handle
+        .commands
+        .send(Command::LoadProfile {
+            user_id: ONLINE_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    let state = handle.state.snapshot();
+    let profile = state.profile.clone().unwrap();
+    assert_eq!(profile.user.id, ONLINE_ID);
+    assert!(profile.friend_status.is_friend);
+
+    handle
+        .commands
+        .send(Command::SetUserNote {
+            user_id: ONLINE_ID.to_string(),
+            note: "met at the park".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert_eq!(
+        handle.state.snapshot().profile.unwrap().user.note,
+        "met at the park"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn social_friend_moderation_and_invite_commands() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/user/{ONLINE_ID}/friendRequest")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_notification(
+            FRQ_ID,
+            "friendRequest",
+            ONLINE_ID,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/user/{ONLINE_ID}/friendRequest")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/auth/user/friends/{ONLINE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/{ONLINE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": ONLINE_ID,
+            "name": "testonline",
+            "displayName": "Test Online",
+            "isFriend": true,
+            "friendRequestStatus": "none"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/user/{ONLINE_ID}/friendStatus")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "incomingRequest": false,
+            "isFriend": true,
+            "outgoingRequest": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/playermoderations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/user/playermoderate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "pmod_00000000-0000-0000-0000-000000000001",
+            "created": "2026-01-02T03:04:05.000Z",
+            "sourceDisplayName": "Me",
+            "sourceUserId": "usr_00000000-0000-0000-0000-0000000000ff",
+            "targetDisplayName": "Test Online",
+            "targetUserId": ONLINE_ID,
+            "type": "block"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/auth/user/unplayermoderate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/invite/{ONLINE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_notification(
+            "not_00000000-0000-0000-0000-000000000004",
+            "invite",
+            "usr_00000000-0000-0000-0000-0000000000ff",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/requestInvite/{ONLINE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_notification(
+            "not_00000000-0000-0000-0000-000000000005",
+            "requestInvite",
+            ONLINE_ID,
+        )))
+        .mount(&server)
+        .await;
+
+    let SocialHarness { mut handle, .. } = spawn_social_app(&server).await;
+
+    // Profile first so friend/moderation state has somewhere to land.
+    handle
+        .commands
+        .send(Command::LoadProfile {
+            user_id: ONLINE_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+
+    // Friend request lifecycle.
+    handle
+        .commands
+        .send(Command::SendFriendRequest {
+            user_id: ONLINE_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert!(handle
+        .state
+        .snapshot()
+        .profile
+        .unwrap()
+        .friend_status
+        .outgoing_request);
+    handle
+        .commands
+        .send(Command::CancelFriendRequest {
+            user_id: ONLINE_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert!(!handle
+        .state
+        .snapshot()
+        .profile
+        .unwrap()
+        .friend_status
+        .outgoing_request);
+
+    // Unfriend without confirm is rejected before any request; with
+    // confirm it removes the friend.
+    handle
+        .commands
+        .send(Command::Unfriend {
+            user_id: ONLINE_ID.to_string(),
+            confirm: false,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::Error(_))).await;
+    assert!(handle.state.snapshot().friends.contains_key(ONLINE_ID));
+
+    handle
+        .commands
+        .send(Command::Unfriend {
+            user_id: ONLINE_ID.to_string(),
+            confirm: true,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert!(!handle.state.snapshot().friends.contains_key(ONLINE_ID));
+
+    // Block requires confirm; mute does not.
+    handle
+        .commands
+        .send(Command::ModerateUser {
+            user_id: ONLINE_ID.to_string(),
+            kind: PlayerModerationKind::Block,
+            confirm: false,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::Error(_))).await;
+    assert!(!handle
+        .state
+        .snapshot()
+        .profile
+        .unwrap()
+        .has_moderation(PlayerModerationKind::Block));
+
+    handle
+        .commands
+        .send(Command::ModerateUser {
+            user_id: ONLINE_ID.to_string(),
+            kind: PlayerModerationKind::Block,
+            confirm: true,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert!(handle
+        .state
+        .snapshot()
+        .profile
+        .unwrap()
+        .has_moderation(PlayerModerationKind::Block));
+
+    handle
+        .commands
+        .send(Command::UnmoderateUser {
+            user_id: ONLINE_ID.to_string(),
+            kind: PlayerModerationKind::Block,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
+    assert!(!handle
+        .state
+        .snapshot()
+        .profile
+        .unwrap()
+        .has_moderation(PlayerModerationKind::Block));
+
+    // Invites: explicit instance override (the fixture has no presence).
+    handle
+        .commands
+        .send(Command::InviteUser {
+            user_id: ONLINE_ID.to_string(),
+            instance_id: Some(INVITE_INSTANCE.to_string()),
+            message_slot: Some(2),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await;
+    handle
+        .commands
+        .send(Command::RequestInvite {
+            user_id: ONLINE_ID.to_string(),
+            request_slot: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await;
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn multi_invite_is_throttled_and_cancellable() {
+    const TARGET_A: &str = "usr_00000000-0000-0000-0000-0000000000a1";
+    const TARGET_B: &str = "usr_00000000-0000-0000-0000-0000000000b2";
+    const TARGET_C: &str = "usr_00000000-0000-0000-0000-0000000000c3";
+
+    let server = MockServer::start().await;
+    // One matcher covers every /invite/{usr_…} POST.
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"^/invite/usr_"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_notification(
+            "not_00000000-0000-0000-0000-000000000006",
+            "invite",
+            "usr_00000000-0000-0000-0000-0000000000ff",
+        )))
+        .mount(&server)
+        .await;
+
+    let SocialHarness { mut handle, .. } = spawn_social_app(&server).await;
+
+    // Two targets run to completion (~1.5 s gap).
+    handle
+        .commands
+        .send(Command::MultiInvite {
+            user_ids: vec![TARGET_A.to_string(), TARGET_B.to_string()],
+            instance_id: Some(INVITE_INSTANCE.to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_until(|| {
+            handle
+                .state
+                .snapshot()
+                .multi_invite
+                .as_ref()
+                .is_some_and(|p| !p.running)
+        })
+        .await,
+        "multi-invite never finished"
+    );
+    let progress = handle.state.snapshot().multi_invite.unwrap();
+    assert_eq!(progress.total, 2);
+    assert_eq!(progress.done, 2);
+    assert_eq!(progress.succeeded, 2);
+    assert_eq!(progress.failed, 0);
+
+    // Three targets cancelled mid-flight: at most the in-flight invite
+    // completes, the rest are skipped.
+    handle
+        .commands
+        .send(Command::MultiInvite {
+            user_ids: vec![
+                TARGET_A.to_string(),
+                TARGET_B.to_string(),
+                TARGET_C.to_string(),
+            ],
+            instance_id: Some(INVITE_INSTANCE.to_string()),
+        })
+        .await
+        .unwrap();
+    // Wait for the first invite to complete (done >= 1 while still
+    // running) — that state persists for the whole 1.5 s gap, unlike the
+    // millisecond `current` window which a 50 ms poll can miss.
+    assert!(
+        wait_until(|| {
+            handle
+                .state
+                .snapshot()
+                .multi_invite
+                .as_ref()
+                .is_some_and(|p| p.running && p.done >= 1)
+        })
+        .await,
+        "multi-invite never completed an invite"
+    );
+    handle
+        .commands
+        .send(Command::CancelMultiInvite)
+        .await
+        .unwrap();
+    assert!(
+        wait_until(|| {
+            handle
+                .state
+                .snapshot()
+                .multi_invite
+                .as_ref()
+                .is_some_and(|p| !p.running)
+        })
+        .await,
+        "cancelled multi-invite never finished"
+    );
+    let progress = handle.state.snapshot().multi_invite.unwrap();
+    assert_eq!(progress.total, 3);
+    assert!(progress.done < 3, "cancel did not stop the batch");
+    assert_eq!(progress.succeeded + progress.failed, progress.done);
+
+    // Validation errors surface as command errors without requests.
+    handle
+        .commands
+        .send(Command::MultiInvite {
+            user_ids: vec!["not_a_user".to_string()],
+            instance_id: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::Error(_))).await;
+
+    server.verify().await;
 }
