@@ -492,144 +492,18 @@ pub(crate) use vrc_core::format::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
-    use vrc_core::TimelineKind as Kind;
-    use vrc_core::{FriendEvent, FriendHistoryEntry, TimelineEntry, WorldTime};
+    use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
     fn ts() -> OffsetDateTime {
         PrimitiveDateTime::new(
-            Date::from_calendar_date(2024, Month::May, 14).unwrap(),
-            Time::from_hms(20, 45, 1).unwrap(),
+            Date::from_calendar_date(2026, Month::November, 5).unwrap(),
+            Time::from_hms(12, 0, 0).unwrap(),
         )
-        .assume_offset(UtcOffset::UTC)
+        .assume_utc()
     }
 
-    fn timeline_entry(kind: Kind) -> TimelineEntry {
-        TimelineEntry {
-            id: 1,
-            ts: ts(),
-            kind,
-            user_id: String::new(),
-            display_name: String::new(),
-            world_id: String::new(),
-            world_name: String::new(),
-            instance_id: String::new(),
-            location: String::new(),
-            detail: String::new(),
-        }
-    }
-
-    #[test]
-    fn kind_labels_cover_all_variants() {
-        for kind in [
-            None,
-            Some(Kind::JoinedWorld),
-            Some(Kind::LeftWorld),
-            Some(Kind::PlayerJoined),
-            Some(Kind::PlayerLeft),
-            Some(Kind::PhotoTaken),
-        ] {
-            assert!(!kind_label(kind).is_empty());
-        }
-        assert_eq!(kind_label(None), "All kinds");
-    }
-
-    #[test]
-    fn event_labels_cover_all_variants() {
-        for event in [
-            FriendEvent::Online,
-            FriendEvent::Active,
-            FriendEvent::Offline,
-            FriendEvent::Location,
-            FriendEvent::Added,
-            FriendEvent::Removed,
-            FriendEvent::Updated,
-        ] {
-            assert!(!event_label(event).is_empty());
-        }
-    }
-
-    #[test]
-    fn fmt_ts_renders_local_fields() {
-        assert_eq!(fmt_ts(ts()), "2024-05-14 20:45");
-    }
-
-    #[test]
-    fn format_duration_scales() {
-        assert_eq!(format_duration(0), "0s");
-        assert_eq!(format_duration(30), "30s");
-        assert_eq!(format_duration(95), "1m 35s");
-        assert_eq!(format_duration(3661), "1h 1m");
-        assert_eq!(format_duration(-5), "0s");
-    }
-
-    #[test]
-    fn timeline_summary_describes_each_kind() {
-        let base = timeline_entry(Kind::JoinedWorld);
-        assert_eq!(
-            timeline_summary(&TimelineEntry {
-                world_name: "Test World".into(),
-                ..base.clone()
-            }),
-            "Joined Test World"
-        );
-        assert_eq!(
-            timeline_summary(&TimelineEntry {
-                world_name: String::new(),
-                world_id: "wrld_x".into(),
-                ..base.clone()
-            }),
-            "Joined wrld_x"
-        );
-        assert_eq!(
-            timeline_summary(&TimelineEntry {
-                kind: Kind::PlayerJoined,
-                display_name: "Test User".into(),
-                user_id: "usr_x".into(),
-                ..base.clone()
-            }),
-            "Player joined: Test User (usr_x)"
-        );
-        assert_eq!(
-            timeline_summary(&TimelineEntry {
-                kind: Kind::PhotoTaken,
-                detail: "C:\\pics\\a.png".into(),
-                ..base.clone()
-            }),
-            "Photo: a.png"
-        );
-        assert_eq!(
-            timeline_summary(&TimelineEntry {
-                kind: Kind::LeftWorld,
-                ..base
-            }),
-            "Left world"
-        );
-    }
-
-    fn history_entry(location: &str) -> FriendHistoryEntry {
-        FriendHistoryEntry {
-            id: 1,
-            ts: ts(),
-            user_id: "usr_x".into(),
-            display_name: "Test Friend".into(),
-            event: FriendEvent::Location,
-            world_id: String::new(),
-            instance_id: String::new(),
-            location: location.to_string(),
-            platform: String::new(),
-        }
-    }
-
-    #[test]
-    fn history_location_splits_wrld_tags() {
-        assert_eq!(
-            history_location(&history_entry("wrld_x:55~region(us)")),
-            "wrld_x · 55~region(us)"
-        );
-        assert_eq!(history_location(&history_entry("private")), "private");
-        assert!(history_location(&history_entry("")).is_empty());
-    }
+    // UI-only assertions live here — the format helpers themselves are
+    // covered by crates/core/src/format.rs tests.
 
     #[test]
     fn stats_preset_ranges() {
@@ -638,21 +512,5 @@ mod tests {
         let week = StatsPreset::Last7d.range(now);
         assert_eq!(week.since.unwrap(), now - Duration::days(7));
         assert!(week.until.is_none());
-    }
-
-    #[test]
-    fn world_label_prefers_name() {
-        let world = WorldTime {
-            world_id: "wrld_x".into(),
-            world_name: "Name".into(),
-            ..WorldTime::default()
-        };
-        assert_eq!(world_label(&world), "Name");
-        let world = WorldTime {
-            world_id: "wrld_x".into(),
-            ..WorldTime::default()
-        };
-        assert_eq!(world_label(&world), "wrld_x");
-        assert_eq!(world_label(&WorldTime::default()), "a world");
     }
 }

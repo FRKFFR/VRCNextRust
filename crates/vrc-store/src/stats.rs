@@ -149,7 +149,7 @@ impl StatsRepo {
             if !session.world_name.is_empty() {
                 world.world_name = session.world_name.clone();
             }
-            if !session.world_id.is_empty() {
+            if !session.world_id.is_empty() && !session.instance_id.is_empty() {
                 session_intervals
                     .entry(key_of(&session.world_id, &session.instance_id))
                     .or_default()
@@ -286,6 +286,11 @@ fn presence_key(row: &crate::FriendHistoryEntry) -> Option<InstanceKey> {
         FriendEvent::Offline | FriendEvent::Removed => return None,
         _ => {}
     }
+    // Non-world tags (`private`, `traveling`, `offline`, empty) never
+    // count, even when the row carries a world id.
+    if !row.location.starts_with("wrld_") {
+        return None;
+    }
     let world_id = if row.world_id.is_empty() {
         world_from_location(&row.location)
     } else {
@@ -299,6 +304,10 @@ fn presence_key(row: &crate::FriendHistoryEntry) -> Option<InstanceKey> {
     } else {
         row.instance_id.as_str()
     };
+    // Without a concrete instance there is no overlap to attribute.
+    if instance_id.is_empty() {
+        return None;
+    }
     Some(key_of(world_id, instance_id))
 }
 
@@ -530,5 +539,103 @@ mod tests {
         assert_eq!(stats.session_count, 0);
         assert!(stats.top_worlds.is_empty());
         assert!(stats.top_friends.is_empty());
+    }
+
+    #[test]
+    fn private_location_with_world_id_earns_no_friend_credit() {
+        let store = Store::open_in_memory().unwrap();
+        let sessions = store.sessions();
+        let t0 = ts(1_700_000_000);
+        let id = sessions
+            .open(&NewSession {
+                started_at: t0,
+                world_id: "wrld_a".into(),
+                instance_id: "1".into(),
+                location: "wrld_a:1".into(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        sessions.close(id, t0 + Duration::seconds(100)).unwrap();
+        // The friend shares the instance id but is tagged `private` —
+        // non-world locations never earn "with friends" credit.
+        store
+            .history()
+            .insert(&NewFriendHistoryEntry {
+                ts: t0 + Duration::seconds(10),
+                user_id: "usr_friend".into(),
+                display_name: "Test Friend".into(),
+                event: FriendEvent::Location,
+                world_id: "wrld_a".into(),
+                instance_id: "1".into(),
+                location: "private".into(),
+                ..NewFriendHistoryEntry::default()
+            })
+            .unwrap();
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        assert!(stats.top_friends.iter().all(|f| f.seconds == 0));
+    }
+
+    #[test]
+    fn world_only_presence_and_instanceless_session_earn_no_credit() {
+        let store = Store::open_in_memory().unwrap();
+        let sessions = store.sessions();
+        let t0 = ts(1_700_000_000);
+        // Session with a world id but no instance id.
+        let id = sessions
+            .open(&NewSession {
+                started_at: t0,
+                world_id: "wrld_a".into(),
+                location: "wrld_a".into(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        sessions.close(id, t0 + Duration::seconds(100)).unwrap();
+        // Friend row is world-only too — no concrete instance either side.
+        store
+            .history()
+            .insert(&NewFriendHistoryEntry {
+                ts: t0 + Duration::seconds(10),
+                user_id: "usr_friend".into(),
+                display_name: "Test Friend".into(),
+                event: FriendEvent::Location,
+                world_id: "wrld_a".into(),
+                location: "wrld_a".into(),
+                ..NewFriendHistoryEntry::default()
+            })
+            .unwrap();
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        assert!(stats.top_friends.iter().all(|f| f.seconds == 0));
+    }
+
+    #[test]
+    fn same_instance_presence_is_credited() {
+        let store = Store::open_in_memory().unwrap();
+        let sessions = store.sessions();
+        let t0 = ts(1_700_000_000);
+        let id = sessions
+            .open(&NewSession {
+                started_at: t0,
+                world_id: "wrld_a".into(),
+                instance_id: "1~region(us)".into(),
+                location: "wrld_a:1~region(us)".into(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        sessions.close(id, t0 + Duration::seconds(100)).unwrap();
+        store
+            .history()
+            .insert(&NewFriendHistoryEntry {
+                ts: t0 + Duration::seconds(10),
+                user_id: "usr_friend".into(),
+                display_name: "Test Friend".into(),
+                event: FriendEvent::Location,
+                world_id: "wrld_a".into(),
+                instance_id: "1~region(us)".into(),
+                location: "wrld_a:1~region(us)".into(),
+                ..NewFriendHistoryEntry::default()
+            })
+            .unwrap();
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        assert!(stats.top_friends.iter().any(|f| f.seconds > 0));
     }
 }
