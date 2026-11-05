@@ -102,6 +102,10 @@ struct OpenSession {
     /// `started_at` of the session — used to tell a fresh join's
     /// `Entering Room:` line apart from a stale still-open session.
     started_at: OffsetDateTime,
+    /// Whether the session already carries a world id. A name-only
+    /// session (opened by `Entering Room:`) merges into the id-bearing
+    /// join that follows instead of spawning a phantom second session.
+    has_world: bool,
 }
 
 /// How long after a session opens (or a name is buffered) a world name
@@ -169,7 +173,11 @@ fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
                                     ..NewSession::default()
                                 }) {
                                     Ok(id) => {
-                                        open_session = Some(OpenSession { id, started_at: ts });
+                                        open_session = Some(OpenSession {
+                                            id,
+                                            started_at: ts,
+                                            has_world: false,
+                                        });
                                     }
                                     Err(e) => {
                                         tracing::debug!("vrc-core: session open failed: {e}");
@@ -178,6 +186,35 @@ fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
                             }
                         }
                     }
+                    continue;
+                }
+                // A name-only session opened by a fresh `Entering Room:`
+                // line belongs to this same join — adopt the world id in
+                // place instead of closing it and opening a phantom
+                // second session (empty fields keep the stored values).
+                let adoptable = open_session.as_ref().and_then(|s| {
+                    if !s.has_world && (ts - s.started_at).abs() <= SESSION_NAME_WINDOW {
+                        Some((s.id, s.started_at))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((id, started_at)) = adoptable {
+                    if let Err(e) = store.sessions().update_world(
+                        id,
+                        &world_id,
+                        &world_name,
+                        &instance_id,
+                        &location,
+                    ) {
+                        tracing::debug!("vrc-core: session adopt failed: {e}");
+                    }
+                    open_session = Some(OpenSession {
+                        id,
+                        started_at,
+                        has_world: true,
+                    });
+                    pending_name = None;
                     continue;
                 }
                 // A fresh world join retires the previous session at this
@@ -206,7 +243,13 @@ fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
                     instance_id,
                     location,
                 }) {
-                    Ok(id) => open_session = Some(OpenSession { id, started_at: ts }),
+                    Ok(id) => {
+                        open_session = Some(OpenSession {
+                            id,
+                            started_at: ts,
+                            has_world: true,
+                        })
+                    }
                     Err(e) => tracing::debug!("vrc-core: session open failed: {e}"),
                 }
             }
@@ -348,14 +391,24 @@ pub(crate) fn history_entry_for(
             entry.event = FriendEvent::Online;
             entry.user_id = pick_id(user_id, &user.id);
             entry.display_name = user.display_name.clone();
-            fill_location(&mut entry, user.location.as_str(), user.world_id.as_str());
+            fill_location(
+                &mut entry,
+                user.location.as_str(),
+                user.world_id.as_str(),
+                user.instance_id.as_str(),
+            );
             entry.platform = user.last_platform.clone();
         }
         PipelineEvent::FriendActive { user_id, user } => {
             entry.event = FriendEvent::Active;
             entry.user_id = pick_id(user_id, &user.id);
             entry.display_name = user.display_name.clone();
-            fill_location(&mut entry, user.location.as_str(), user.world_id.as_str());
+            fill_location(
+                &mut entry,
+                user.location.as_str(),
+                user.world_id.as_str(),
+                user.instance_id.as_str(),
+            );
             entry.platform = user.last_platform.clone();
         }
         PipelineEvent::FriendOffline { user_id, platform } => {
@@ -379,20 +432,31 @@ pub(crate) fn history_entry_for(
                 entry.display_name = user.display_name.clone();
                 entry.platform = user.last_platform.clone();
             }
-            fill_location(&mut entry, location, world_id);
+            let user_instance = user.as_ref().map(|u| u.instance_id.as_str()).unwrap_or("");
+            fill_location(&mut entry, location, world_id, user_instance);
         }
         PipelineEvent::FriendUpdate { user_id, user } => {
             entry.event = FriendEvent::Updated;
             entry.user_id = pick_id(user_id, &user.id);
             entry.display_name = user.display_name.clone();
-            fill_location(&mut entry, user.location.as_str(), user.world_id.as_str());
+            fill_location(
+                &mut entry,
+                user.location.as_str(),
+                user.world_id.as_str(),
+                user.instance_id.as_str(),
+            );
             entry.platform = user.last_platform.clone();
         }
         PipelineEvent::FriendAdd { user_id, user } => {
             entry.event = FriendEvent::Added;
             entry.user_id = pick_id(user_id, &user.id);
             entry.display_name = user.display_name.clone();
-            fill_location(&mut entry, user.location.as_str(), user.world_id.as_str());
+            fill_location(
+                &mut entry,
+                user.location.as_str(),
+                user.world_id.as_str(),
+                user.instance_id.as_str(),
+            );
             entry.platform = user.last_platform.clone();
         }
         PipelineEvent::FriendDelete { user_id } => {
@@ -429,7 +493,12 @@ fn pick_id(event_id: &str, user_id: &str) -> String {
 
 /// Fill `world_id`/`instance_id`/`location` on a history entry from a
 /// `wrld_…[:instance]` location tag and an optional explicit world id.
-fn fill_location(entry: &mut NewFriendHistoryEntry, location: &str, world_id: &str) {
+fn fill_location(
+    entry: &mut NewFriendHistoryEntry,
+    location: &str,
+    world_id: &str,
+    instance_id: &str,
+) {
     entry.location = location.to_string();
     let (parsed_world, parsed_instance) = split_location(location);
     entry.world_id = if !world_id.is_empty() {
@@ -437,7 +506,13 @@ fn fill_location(entry: &mut NewFriendHistoryEntry, location: &str, world_id: &s
     } else {
         parsed_world
     };
-    entry.instance_id = parsed_instance;
+    // The tag may carry no instance (`wrld_…` bare); fall back to the
+    // payload's own instance id, never inventing one.
+    entry.instance_id = if parsed_instance.is_empty() {
+        instance_id.to_string()
+    } else {
+        parsed_instance
+    };
 }
 
 /// `wrld_…:instance~…` → `(wrld_…, instance~…)`; anything else → empty.
@@ -618,5 +693,66 @@ mod tests {
         };
         assert_eq!(name_of("wrld_a"), Some("World A"));
         assert_eq!(name_of("wrld_b"), Some("World B"));
+    }
+
+    #[test]
+    fn entering_room_then_join_within_window_merges_session() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || store_loop(thread_store, rx));
+
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        let join = |ts: OffsetDateTime, world_id: &str, world_name: &str| StoreOp::WorldJoin {
+            ts,
+            world_id: world_id.to_string(),
+            world_name: world_name.to_string(),
+            instance_id: String::new(),
+            location: String::new(),
+        };
+        // `Entering Room:` opens a name-only session; the id-bearing join
+        // right after adopts the world in place — one visit, one session.
+        tx.send(join(t0, "", "Room X")).unwrap();
+        tx.send(join(t0 + Duration::seconds(5), "wrld_a", ""))
+            .unwrap();
+        drop(tx);
+        handle.join().unwrap();
+
+        let session = store.sessions().current().unwrap().unwrap();
+        assert_eq!(session.world_id, "wrld_a");
+        assert_eq!(session.world_name, "Room X");
+        assert_eq!(session.started_at, t0);
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        assert_eq!(stats.session_count, 1);
+    }
+
+    #[test]
+    fn name_only_session_outside_window_closes_before_new_join() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || store_loop(thread_store, rx));
+
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        let join = |ts: OffsetDateTime, world_id: &str, world_name: &str| StoreOp::WorldJoin {
+            ts,
+            world_id: world_id.to_string(),
+            world_name: world_name.to_string(),
+            instance_id: String::new(),
+            location: String::new(),
+        };
+        // Past the name window the stale name-only session is closed and
+        // the join opens a fresh session (existing behaviour).
+        tx.send(join(t0, "", "Room X")).unwrap();
+        tx.send(join(t0 + Duration::hours(3), "wrld_a", ""))
+            .unwrap();
+        drop(tx);
+        handle.join().unwrap();
+
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        assert_eq!(stats.session_count, 2);
+        let session = store.sessions().current().unwrap().unwrap();
+        assert_eq!(session.world_id, "wrld_a");
+        assert!(session.world_name.is_empty());
     }
 }

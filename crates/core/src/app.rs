@@ -457,6 +457,7 @@ impl Runtime {
     /// Run a timeline query on the store thread and publish the page.
     fn load_timeline(&self, page: u32, mut filter: TimelineFilter) {
         let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
             return;
         };
         filter.offset = page.saturating_mul(LOCAL_PAGE_SIZE);
@@ -489,6 +490,7 @@ impl Runtime {
     /// Run a friend-history query on the store thread and publish the page.
     fn load_friend_history(&self, page: u32, mut filter: FriendHistoryFilter) {
         let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
             return;
         };
         filter.offset = page.saturating_mul(LOCAL_PAGE_SIZE);
@@ -521,6 +523,7 @@ impl Runtime {
     /// Run a stats query on the store thread and publish the result.
     fn load_stats(&self, range: StatsRange) {
         let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
             return;
         };
         let (reply_tx, reply_rx) = oneshot::channel();
