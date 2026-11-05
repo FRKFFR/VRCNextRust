@@ -1070,10 +1070,7 @@ async fn spawn_social_app(server: &MockServer) -> SocialHarness {
     })
     .await;
     wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await;
-    SocialHarness {
-        handle,
-        frames_tx,
-    }
+    SocialHarness { handle, frames_tx }
 }
 
 #[tokio::test]
@@ -1159,10 +1156,7 @@ async fn social_notifications_and_profile_commands() {
         .send(Command::RefreshNotifications)
         .await
         .unwrap();
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::NotificationsChanged)
-    })
-    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await;
     let state = handle.state.snapshot();
     let notifications = state.notifications.clone().unwrap();
     assert_eq!(notifications.len(), 2);
@@ -1196,10 +1190,7 @@ async fn social_notifications_and_profile_commands() {
         })
         .await
         .unwrap();
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::NotificationsChanged)
-    })
-    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await;
     let state = handle.state.snapshot();
     assert!(state.notifications.as_ref().unwrap()[1].seen);
 
@@ -1210,10 +1201,7 @@ async fn social_notifications_and_profile_commands() {
         })
         .await
         .unwrap();
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::NotificationsChanged)
-    })
-    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await;
     let state = handle.state.snapshot();
     assert_eq!(state.notifications.as_ref().unwrap().len(), 2);
 
@@ -1226,10 +1214,7 @@ async fn social_notifications_and_profile_commands() {
         })
         .await
         .unwrap();
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::NotificationsChanged)
-    })
-    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await;
 
     // Profile load + note.
     handle
@@ -1367,13 +1352,15 @@ async fn social_friend_moderation_and_invite_commands() {
         .await
         .unwrap();
     wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
-    assert!(handle
-        .state
-        .snapshot()
-        .profile
-        .unwrap()
-        .friend_status
-        .outgoing_request);
+    assert!(
+        handle
+            .state
+            .snapshot()
+            .profile
+            .unwrap()
+            .friend_status
+            .outgoing_request
+    );
     handle
         .commands
         .send(Command::CancelFriendRequest {
@@ -1382,13 +1369,15 @@ async fn social_friend_moderation_and_invite_commands() {
         .await
         .unwrap();
     wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await;
-    assert!(!handle
-        .state
-        .snapshot()
-        .profile
-        .unwrap()
-        .friend_status
-        .outgoing_request);
+    assert!(
+        !handle
+            .state
+            .snapshot()
+            .profile
+            .unwrap()
+            .friend_status
+            .outgoing_request
+    );
 
     // Unfriend without confirm is rejected before any request; with
     // confirm it removes the friend.

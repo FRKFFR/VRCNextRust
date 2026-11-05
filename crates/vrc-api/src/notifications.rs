@@ -19,9 +19,7 @@ const MAX_PAGES: usize = 50;
 /// notifications and `frq_…` for friend requests (the documented id used by
 /// `…/accept`). Safe charset only, so the id can sit in a path segment.
 pub fn valid_notification_id(id: &str) -> bool {
-    let rest = id
-        .strip_prefix("not_")
-        .or_else(|| id.strip_prefix("frq_"));
+    let rest = id.strip_prefix("not_").or_else(|| id.strip_prefix("frq_"));
     rest.is_some_and(|rest| {
         !rest.is_empty()
             && rest
@@ -49,7 +47,9 @@ impl Client {
             }
             offset += len;
         }
-        tracing::warn!("notifications pagination hit the {MAX_PAGES}-page cap; returning partial list");
+        tracing::warn!(
+            "notifications pagination hit the {MAX_PAGES}-page cap; returning partial list"
+        );
         Ok(out)
     }
 
@@ -58,7 +58,8 @@ impl Client {
         if !valid_notification_id(id) {
             return Err(ApiError::InvalidId(id.chars().take(64).collect()));
         }
-        self.get_json(&format!("/auth/user/notifications/{id}")).await
+        self.get_json(&format!("/auth/user/notifications/{id}"))
+            .await
     }
 
     /// `PUT /auth/user/notifications/{id}/see` — mark as seen.
@@ -66,8 +67,12 @@ impl Client {
         if !valid_notification_id(id) {
             return Err(ApiError::InvalidId(id.chars().take(64).collect()));
         }
-        self.send_json(Method::PUT, &format!("/auth/user/notifications/{id}/see"), None)
-            .await
+        self.send_json(
+            Method::PUT,
+            &format!("/auth/user/notifications/{id}/see"),
+            None,
+        )
+        .await
     }
 
     /// `PUT /auth/user/notifications/{id}/hide` — delete/hide it.
@@ -75,18 +80,29 @@ impl Client {
         if !valid_notification_id(id) {
             return Err(ApiError::InvalidId(id.chars().take(64).collect()));
         }
-        self.send_json(Method::PUT, &format!("/auth/user/notifications/{id}/hide"), None)
-            .await
+        self.send_json(
+            Method::PUT,
+            &format!("/auth/user/notifications/{id}/hide"),
+            None,
+        )
+        .await
     }
 
     /// `PUT /auth/user/notifications/{id}/accept` — accept a friend
     /// request (the id is the `frq_…` notification id).
-    pub async fn accept_friend_request(&self, id: &str) -> Result<crate::SuccessResponse, ApiError> {
+    pub async fn accept_friend_request(
+        &self,
+        id: &str,
+    ) -> Result<crate::SuccessResponse, ApiError> {
         if !valid_notification_id(id) {
             return Err(ApiError::InvalidId(id.chars().take(64).collect()));
         }
-        self.send_json(Method::PUT, &format!("/auth/user/notifications/{id}/accept"), None)
-            .await
+        self.send_json(
+            Method::PUT,
+            &format!("/auth/user/notifications/{id}/accept"),
+            None,
+        )
+        .await
     }
 
     /// `PUT /auth/user/notifications/clear` — clear **all** notifications.
@@ -102,8 +118,12 @@ mod tests {
 
     #[test]
     fn notification_id_validation() {
-        assert!(valid_notification_id("not_00000000-0000-0000-0000-000000000001"));
-        assert!(valid_notification_id("frq_00000000-0000-0000-0000-000000000001"));
+        assert!(valid_notification_id(
+            "not_00000000-0000-0000-0000-000000000001"
+        ));
+        assert!(valid_notification_id(
+            "frq_00000000-0000-0000-0000-000000000001"
+        ));
         assert!(!valid_notification_id("not_"));
         assert!(!valid_notification_id("usr_123"));
         assert!(!valid_notification_id("not_../auth/user"));

@@ -174,11 +174,8 @@ fn instance_card(
     state: &AppState,
     instance: &vrc_core::Instance,
 ) {
-    let inside = vrc_core::friends_in_instance(
-        &state.friends,
-        &instance.world_id,
-        &instance.instance_id,
-    );
+    let inside =
+        vrc_core::friends_in_instance(&state.friends, &instance.world_id, &instance.instance_id);
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {

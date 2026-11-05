@@ -603,18 +603,14 @@ impl Runtime {
             Command::LoadProfile { user_id } => self.load_profile(&user_id).await,
             Command::SetUserNote { user_id, note } => self.set_user_note(&user_id, &note).await,
             Command::SendFriendRequest { user_id } => self.send_friend_request(&user_id).await,
-            Command::CancelFriendRequest { user_id } => {
-                self.cancel_friend_request(&user_id).await
-            }
+            Command::CancelFriendRequest { user_id } => self.cancel_friend_request(&user_id).await,
             Command::Unfriend { user_id, confirm } => self.unfriend(&user_id, confirm).await,
             Command::ModerateUser {
                 user_id,
                 kind,
                 confirm,
             } => self.moderate_user(&user_id, kind, confirm).await,
-            Command::UnmoderateUser { user_id, kind } => {
-                self.unmoderate_user(&user_id, kind).await
-            }
+            Command::UnmoderateUser { user_id, kind } => self.unmoderate_user(&user_id, kind).await,
             Command::InviteUser {
                 user_id,
                 instance_id,
@@ -627,7 +623,10 @@ impl Runtime {
             Command::RespondToInvite {
                 notification_id,
                 response_slot,
-            } => self.respond_to_invite(&notification_id, response_slot).await,
+            } => {
+                self.respond_to_invite(&notification_id, response_slot)
+                    .await
+            }
             Command::MultiInvite {
                 user_ids,
                 instance_id,
@@ -943,7 +942,11 @@ impl Runtime {
 
     /// `PUT …/see` then mark the cached entry seen.
     async fn see_notification(&mut self, id: &str) {
-        if self.attempt(self.client.clone().see_notification(id)).await.is_some() {
+        if self
+            .attempt(self.client.clone().see_notification(id))
+            .await
+            .is_some()
+        {
             if let Some(list) = self.state.write().notifications.as_mut() {
                 if let Some(n) = list.iter_mut().find(|n| n.id == id) {
                     n.seen = true;
@@ -955,7 +958,11 @@ impl Runtime {
 
     /// `PUT …/hide` then drop the cached entry.
     async fn hide_notification(&mut self, id: &str) {
-        if self.attempt(self.client.clone().hide_notification(id)).await.is_some() {
+        if self
+            .attempt(self.client.clone().hide_notification(id))
+            .await
+            .is_some()
+        {
             if let Some(list) = self.state.write().notifications.as_mut() {
                 list.retain(|n| n.id != id);
             }
@@ -1009,11 +1016,7 @@ impl Runtime {
         };
         // The companion calls are best-effort: a failure leaves defaults
         // rather than blanking the profile.
-        let friend_status = self
-            .client
-            .friend_status(user_id)
-            .await
-            .unwrap_or_default();
+        let friend_status = self.client.friend_status(user_id).await.unwrap_or_default();
         let moderations = self
             .client
             .player_moderations(Some(user_id), None)
@@ -1029,7 +1032,10 @@ impl Runtime {
 
     /// `POST /userNotes` and reflect the note into the loaded profile.
     async fn set_user_note(&mut self, user_id: &str, note: &str) {
-        let saved = match self.attempt(self.client.clone().set_user_note(user_id, note)).await {
+        let saved = match self
+            .attempt(self.client.clone().set_user_note(user_id, note))
+            .await
+        {
             Some(saved) => saved,
             None => return,
         };
@@ -1086,7 +1092,11 @@ impl Runtime {
             self.report_message("unfriend requires confirmation");
             return;
         }
-        if self.attempt(self.client.clone().unfriend(user_id)).await.is_none() {
+        if self
+            .attempt(self.client.clone().unfriend(user_id))
+            .await
+            .is_none()
+        {
             return;
         }
         let mut state = self.state.write();
@@ -1102,17 +1112,15 @@ impl Runtime {
     }
 
     /// `POST /auth/user/playermoderate` — `Block` requires `confirm`.
-    async fn moderate_user(
-        &mut self,
-        user_id: &str,
-        kind: PlayerModerationKind,
-        confirm: bool,
-    ) {
+    async fn moderate_user(&mut self, user_id: &str, kind: PlayerModerationKind, confirm: bool) {
         if kind == PlayerModerationKind::Block && !confirm {
             self.report_message("blocking a user requires confirmation");
             return;
         }
-        let created = match self.attempt(self.client.clone().moderate_user(user_id, kind)).await {
+        let created = match self
+            .attempt(self.client.clone().moderate_user(user_id, kind))
+            .await
+        {
             Some(created) => created,
             None => return,
         };
@@ -1140,9 +1148,9 @@ impl Runtime {
             return;
         }
         if let Some(profile) = self.state.write().profile.as_mut() {
-            profile.moderations.retain(|m| {
-                !(m.target_user_id == user_id && m.kind() == Some(kind))
-            });
+            profile
+                .moderations
+                .retain(|m| !(m.target_user_id == user_id && m.kind() == Some(kind)));
         }
         let _ = self.events.send(AppEvent::ProfileChanged);
     }
@@ -1167,7 +1175,11 @@ impl Runtime {
             return;
         };
         if self
-            .attempt(self.client.clone().invite_user(user_id, &instance, message_slot))
+            .attempt(
+                self.client
+                    .clone()
+                    .invite_user(user_id, &instance, message_slot),
+            )
             .await
             .is_some()
         {
@@ -1189,7 +1201,11 @@ impl Runtime {
     /// `POST /invite/{notificationId}/response`.
     async fn respond_to_invite(&mut self, notification_id: &str, response_slot: u8) {
         if self
-            .attempt(self.client.clone().respond_invite(notification_id, response_slot))
+            .attempt(
+                self.client
+                    .clone()
+                    .respond_invite(notification_id, response_slot),
+            )
             .await
             .is_some()
         {
@@ -1449,18 +1465,12 @@ impl Runtime {
                 }
             }
             PipelineEvent::NotificationV2Update { id, updates } => {
-                if let Some(existing) = state
-                    .notifications_v2
-                    .iter_mut()
-                    .find(|n| &n.id == id)
-                {
+                if let Some(existing) = state.notifications_v2.iter_mut().find(|n| &n.id == id) {
                     social::merge_notification_v2(existing, updates);
                 }
             }
             PipelineEvent::NotificationV2Delete { ids } => {
-                state
-                    .notifications_v2
-                    .retain(|n| !ids.contains(&n.id));
+                state.notifications_v2.retain(|n| !ids.contains(&n.id));
             }
             // user updates, responses and unknown frames don't alter state;
             // subscribers still see them via AppEvent::Pipeline.

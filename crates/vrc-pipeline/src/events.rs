@@ -193,12 +193,7 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
             .unwrap_or_default()
     };
     // `see`/`hide-notification` carry the id as a bare string content.
-    let bare_id = || {
-        content
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    };
+    let bare_id = || content.as_str().unwrap_or_default().to_string();
     // Decode a notification payload; a malformed one degrades to defaults
     // (same policy as `user()`).
     let notification_v1 = || {
@@ -419,10 +414,9 @@ mod tests {
                 if id == "ntf2_1" && updates["seen"] == true
         ));
 
-        let event = decode(
-            r#"{"type":"notification-v2-delete","content":{"ids":["ntf2_1","ntf2_2"]}}"#,
-        )
-        .unwrap();
+        let event =
+            decode(r#"{"type":"notification-v2-delete","content":{"ids":["ntf2_1","ntf2_2"]}}"#)
+                .unwrap();
         assert!(matches!(
             event,
             PipelineEvent::NotificationV2Delete { ref ids }

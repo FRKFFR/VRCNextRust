@@ -25,9 +25,9 @@ fn valid_instance_segment(instance_id: &str) -> bool {
     !instance_id.is_empty()
         && instance_id.len() <= 256
         && !instance_id.contains("..")
-        && instance_id.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '(' | ')' | '-' | '+')
-        })
+        && instance_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '(' | ')' | '-' | '+'))
 }
 
 impl Client {
@@ -47,9 +47,7 @@ impl Client {
     ) -> Result<Notification, ApiError> {
         check_user_id(user_id)?;
         if !valid_instance_segment(instance_id) {
-            return Err(ApiError::InvalidId(
-                instance_id.chars().take(64).collect(),
-            ));
+            return Err(ApiError::InvalidId(instance_id.chars().take(64).collect()));
         }
         if let Some(slot) = message_slot {
             if slot > 11 {
@@ -80,8 +78,12 @@ impl Client {
         let body = serde_json::json!({
             "requestSlot": request_slot.unwrap_or(0),
         });
-        self.send_json(Method::POST, &format!("/requestInvite/{user_id}"), Some(&body))
-            .await
+        self.send_json(
+            Method::POST,
+            &format!("/requestInvite/{user_id}"),
+            Some(&body),
+        )
+        .await
     }
 
     /// `POST /invite/{notificationId}/response` — reply to an invite
@@ -117,7 +119,9 @@ mod tests {
 
     #[test]
     fn instance_segment_validation() {
-        assert!(valid_instance_segment("12345~hidden(usr_x)~region(eu)~nonce(abc)"));
+        assert!(valid_instance_segment(
+            "12345~hidden(usr_x)~region(eu)~nonce(abc)"
+        ));
         assert!(valid_instance_segment("offline"));
         assert!(!valid_instance_segment(""));
         assert!(!valid_instance_segment("a/b"));

@@ -21,9 +21,9 @@ mod error;
 mod friends;
 mod instances;
 mod invites;
+pub mod models;
 mod moderation;
 mod notifications;
-pub mod models;
 mod rate_limit;
 mod users;
 mod vault;
@@ -34,8 +34,8 @@ pub use client::{Client, ClientBuilder, API_ROOT};
 pub use error::ApiError;
 pub use instances::valid_instance_id;
 pub use models::{
-    CurrentUser, CurrentUserPresence, Favorite, FriendStatus, Instance, LimitedUser,
-    Notification, NotificationV2, NotificationV2Response, PastDisplayName, PlayerModeration,
+    CurrentUser, CurrentUserPresence, Favorite, FriendStatus, Instance, LimitedUser, Notification,
+    NotificationV2, NotificationV2Response, PastDisplayName, PlayerModeration,
     PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, World,
 };
 pub use notifications::valid_notification_id;

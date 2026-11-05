@@ -181,7 +181,9 @@ mod tests {
         let out = validate_multi_invite_targets(&ids).unwrap();
         assert_eq!(out, vec![uid(1), uid(2)]);
 
-        let too_many: Vec<String> = (0..=MULTI_INVITE_MAX_TARGETS).map(|i| uid(i as u8)).collect();
+        let too_many: Vec<String> = (0..=MULTI_INVITE_MAX_TARGETS)
+            .map(|i| uid(i as u8))
+            .collect();
         assert!(validate_multi_invite_targets(&too_many).is_err());
 
         assert!(validate_multi_invite_targets(&[]).is_err());
@@ -194,44 +196,72 @@ mod tests {
         let mut state = AppState::default();
         assert_eq!(own_instance_id(&state), None);
 
-        let mut user = CurrentUser::default();
-        user.presence = Some(CurrentUserPresence {
-            instance: "12345~hidden(usr_x)~region(eu)".to_string(),
+        state.current_user = Some(CurrentUser {
+            presence: Some(CurrentUserPresence {
+                instance: "12345~hidden(usr_x)~region(eu)".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         });
-        state.current_user = Some(user);
         assert_eq!(
             own_instance_id(&state).as_deref(),
             Some("12345~hidden(usr_x)~region(eu)")
         );
 
-        state.current_user.as_mut().unwrap().presence.as_mut().unwrap().instance =
-            "offline".to_string();
+        state
+            .current_user
+            .as_mut()
+            .unwrap()
+            .presence
+            .as_mut()
+            .unwrap()
+            .instance = "offline".to_string();
         assert_eq!(own_instance_id(&state), None);
 
-        state.current_user.as_mut().unwrap().presence.as_mut().unwrap().instance =
-            "bad/id".to_string();
+        state
+            .current_user
+            .as_mut()
+            .unwrap()
+            .presence
+            .as_mut()
+            .unwrap()
+            .instance = "bad/id".to_string();
         assert_eq!(own_instance_id(&state), None);
     }
 
     #[test]
     fn friends_in_instance_matches_world_and_instance_parts() {
-        let mut friends = HashMap::new();
-        let mut a = Friend::default();
-        a.id = uid(1);
-        a.world_id = "wrld_a".to_string();
-        a.location = "wrld_a:inst_one".to_string();
-        let mut b = Friend::default();
-        b.id = uid(2);
-        b.world_id = "wrld_a".to_string();
-        b.location = "wrld_a:inst_two".to_string();
-        let mut c = Friend::default();
-        c.id = uid(3);
-        c.world_id = "wrld_b".to_string();
-        c.location = "wrld_b:inst_one".to_string();
-        friends.insert(a.id.clone(), a);
-        friends.insert(b.id.clone(), b);
-        friends.insert(c.id.clone(), c);
+        let friends: HashMap<String, Friend> = [
+            (
+                uid(1),
+                Friend {
+                    id: uid(1),
+                    world_id: "wrld_a".to_string(),
+                    location: "wrld_a:inst_one".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                uid(2),
+                Friend {
+                    id: uid(2),
+                    world_id: "wrld_a".to_string(),
+                    location: "wrld_a:inst_two".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                uid(3),
+                Friend {
+                    id: uid(3),
+                    world_id: "wrld_b".to_string(),
+                    location: "wrld_b:inst_one".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
 
         let found = friends_in_instance(&friends, "wrld_a", "inst_one");
         assert_eq!(found.len(), 1);

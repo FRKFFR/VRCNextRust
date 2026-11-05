@@ -13,9 +13,9 @@ pub fn valid_instance_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
         && !id.contains("..")
-        && id.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '(' | ')' | '-' | '+')
-        })
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '(' | ')' | '-' | '+'))
 }
 
 /// `true` for a well-formed `wrld_…` world id.
@@ -36,11 +36,7 @@ fn check_path_ids(world_id: &str, instance_id: &str) -> Result<(), ApiError> {
 impl Client {
     /// `GET /instances/{worldId}:{instanceId}` — instance details, including
     /// `users` when the instance belongs to the requesting user.
-    pub async fn instance(
-        &self,
-        world_id: &str,
-        instance_id: &str,
-    ) -> Result<Instance, ApiError> {
+    pub async fn instance(&self, world_id: &str, instance_id: &str) -> Result<Instance, ApiError> {
         check_path_ids(world_id, instance_id)?;
         self.get_json(&format!("/instances/{world_id}:{instance_id}"))
             .await
@@ -53,7 +49,9 @@ mod tests {
 
     #[test]
     fn instance_id_validation() {
-        assert!(valid_instance_id("12345~hidden(usr_x)~region(eu)~nonce(abc)"));
+        assert!(valid_instance_id(
+            "12345~hidden(usr_x)~region(eu)~nonce(abc)"
+        ));
         assert!(valid_instance_id("offline"));
         assert!(valid_instance_id("private"));
         assert!(!valid_instance_id(""));

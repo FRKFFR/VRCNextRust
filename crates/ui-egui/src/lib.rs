@@ -417,18 +417,10 @@ pub fn twofa_method_label(method: TwoFactorMethod) -> &'static str {
     }
 }
 
-/// Short timestamp for notification rows: `YYYY-MM-DD HH:MM` from an ISO
-/// string, or the raw string when it doesn't parse.
+/// Short timestamp for notification rows (shared with the CLI via
+/// `vrc_core::format`).
 pub(crate) fn fmt_short_ts(iso: &str) -> String {
-    if iso.len() >= 16 {
-        // ISO-8601 `2026-01-02T03:04:05…` → `2026-01-02 03:04`.
-        let date = &iso[..10];
-        let time = &iso[11..16];
-        if date.len() == 10 && time.len() == 5 && date.as_bytes()[4] == b'-' {
-            return format!("{date} {time}");
-        }
-    }
-    iso.to_string()
+    vrc_core::format::fmt_iso_ts(iso)
 }
 
 /// Open the "VRCNextRust" window and run the UI loop.

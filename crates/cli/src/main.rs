@@ -15,9 +15,9 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::broadcast;
 
 use vrc_core::{
-    format, sections, App, AppConfig, AppEvent, AppHandle, AuthState, Client, Command,
-    KeyringVault, MemoryVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod,
-    USER_AGENT,
+    format, friend_status_label, moderation_label, notification_kind_label, sections, App,
+    AppConfig, AppEvent, AppHandle, AuthState, Client, Command, KeyringVault, MemoryVault,
+    StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -68,6 +68,73 @@ enum Commands {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// List notifications, or act on one (see/hide/accept/clear)
+    Notifications {
+        /// Action to perform; omitted lists notifications
+        #[command(subcommand)]
+        command: Option<NotificationCommand>,
+    },
+    /// Invite a user to your current instance
+    Invite {
+        /// `usr_…` id of the user to invite
+        user_id: String,
+        /// Instance id override (default: your current instance)
+        #[arg(long)]
+        instance: Option<String>,
+        /// Custom invite message slot (0–11)
+        #[arg(long)]
+        slot: Option<u8>,
+    },
+    /// Ask a user to invite you to their instance
+    RequestInvite {
+        /// `usr_…` id of the user to ask
+        user_id: String,
+        /// Custom request message slot (0–11)
+        #[arg(long)]
+        slot: Option<u8>,
+    },
+    /// Invite several users to your instance (throttled, cancellable)
+    MultiInvite {
+        /// `usr_…` ids of the users to invite (max 50)
+        user_ids: Vec<String>,
+        /// Instance id override (default: your current instance)
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Show a user's profile, friend status, note and moderations
+    Profile {
+        /// `usr_…` id of the user to inspect
+        user_id: String,
+    },
+    /// Set your note on a user
+    Note {
+        /// `usr_…` id of the user
+        user_id: String,
+        /// Note text (multiple words are joined with spaces)
+        note: Vec<String>,
+    },
+}
+
+/// Actions for `vrcnext-cli notifications`.
+#[derive(Subcommand)]
+enum NotificationCommand {
+    /// Mark a notification as seen
+    See {
+        /// `not_…`/`frq_…` notification id
+        id: String,
+    },
+    /// Hide/delete a notification
+    Hide {
+        /// `not_…`/`frq_…` notification id
+        id: String,
+    },
+    /// Accept a friend-request notification
+    Accept {
+        /// `frq_…` friend-request notification id
+        id: String,
+    },
+    /// Clear all notifications
+    Clear,
 }
 
 /// `--kind` values for `timeline` (kebab-case on the command line).
@@ -129,6 +196,16 @@ async fn main() -> Result<()> {
         Commands::Timeline { kind, query, page } => timeline(kind, query, page).await,
         Commands::Stats { range } => stats(range).await,
         Commands::TailLogs { dir } => tail_logs(dir).await,
+        Commands::Notifications { command } => notifications(command).await,
+        Commands::Invite {
+            user_id,
+            instance,
+            slot,
+        } => invite(&user_id, instance, slot).await,
+        Commands::RequestInvite { user_id, slot } => request_invite(&user_id, slot).await,
+        Commands::MultiInvite { user_ids, instance } => multi_invite(user_ids, instance).await,
+        Commands::Profile { user_id } => profile(&user_id).await,
+        Commands::Note { user_id, note } => set_note(&user_id, note).await,
     }
 }
 
@@ -306,6 +383,11 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::TimelineLoaded) => println!("timeline loaded"),
                 Ok(AppEvent::FriendHistoryLoaded) => println!("friend history loaded"),
                 Ok(AppEvent::StatsLoaded) => println!("stats loaded"),
+                Ok(AppEvent::NotificationsChanged) => println!("notifications changed"),
+                Ok(AppEvent::ProfileChanged) => println!("profile changed"),
+                Ok(AppEvent::InstanceLoaded) => println!("instance loaded"),
+                Ok(AppEvent::InviteSent) => println!("invite sent"),
+                Ok(AppEvent::MultiInviteProgress) => println!("multi-invite progress"),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }
@@ -430,5 +512,232 @@ async fn tail_logs(dir: Option<PathBuf>) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Social actions (M4)
+// ---------------------------------------------------------------------------
+
+/// Resolve a notification sender id to a display name via the friends map.
+fn sender_name(state: &vrc_core::AppState, user_id: &str, fallback: &str) -> String {
+    if user_id.is_empty() {
+        return if fallback.is_empty() {
+            "System".to_string()
+        } else {
+            fallback.to_string()
+        };
+    }
+    if let Some(friend) = state.friends.get(user_id) {
+        return friend.display_name.clone();
+    }
+    if state.current_user.as_ref().is_some_and(|u| u.id == user_id) {
+        if let Some(user) = &state.current_user {
+            return user.display_name.clone();
+        }
+    }
+    if !fallback.is_empty() {
+        fallback.to_string()
+    } else {
+        user_id.to_string()
+    }
+}
+
+async fn notifications(command: Option<NotificationCommand>) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+
+    let command = match command {
+        Some(command) => command,
+        None => {
+            handle.commands.send(Command::RefreshNotifications).await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await?;
+            print_notifications(&handle.state.snapshot());
+            return Ok(());
+        }
+    };
+
+    let sent = match &command {
+        NotificationCommand::See { id } => Command::SeeNotification { id: id.clone() },
+        NotificationCommand::Hide { id } => Command::HideNotification { id: id.clone() },
+        NotificationCommand::Accept { id } => Command::AcceptNotification { id: id.clone() },
+        NotificationCommand::Clear => Command::ClearNotifications,
+    };
+    handle.commands.send(sent).await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::NotificationsChanged)).await?;
+    println!("Done.");
+    Ok(())
+}
+
+fn print_notifications(state: &vrc_core::AppState) {
+    let Some(list) = &state.notifications else {
+        println!("No notifications loaded.");
+        return;
+    };
+    for n in list {
+        let seen = if n.seen { " " } else { "*" };
+        println!(
+            "{seen} {:<20} {:<28} {}",
+            notification_kind_label(&n.kind),
+            sender_name(state, &n.sender_user_id, &n.sender_username),
+            n.message,
+        );
+        println!("    {}  {}", n.id, format::fmt_iso_ts(&n.created_at));
+    }
+    println!("-- {} notification(s) --", list.len());
+    for v2 in &state.notifications_v2 {
+        let seen = if v2.seen { " " } else { "*" };
+        println!(
+            "{seen} {:<20} {}",
+            notification_kind_label(&v2.kind),
+            if v2.title.is_empty() {
+                v2.message.clone()
+            } else {
+                v2.title.clone()
+            },
+        );
+        println!("    {}  {}", v2.id, format::fmt_iso_ts(&v2.created_at));
+    }
+}
+
+async fn invite(user_id: &str, instance: Option<String>, slot: Option<u8>) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::InviteUser {
+            user_id: user_id.to_string(),
+            instance_id: instance,
+            message_slot: slot,
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await?;
+    println!("Invite sent.");
+    Ok(())
+}
+
+async fn request_invite(user_id: &str, slot: Option<u8>) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::RequestInvite {
+            user_id: user_id.to_string(),
+            request_slot: slot,
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await?;
+    println!("Invite request sent.");
+    Ok(())
+}
+
+async fn multi_invite(user_ids: Vec<String>, instance: Option<String>) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::MultiInvite {
+            user_ids,
+            instance_id: instance,
+        })
+        .await?;
+
+    // Print progress as it lands; Ctrl-C cancels the batch politely.
+    let mut cancel_sent = false;
+    loop {
+        tokio::select! {
+            event = handle.events.recv() => match event {
+                Ok(AppEvent::MultiInviteProgress) => {
+                    let p = handle.state.snapshot().multi_invite;
+                    if let Some(p) = p {
+                        println!(
+                            "{}/{} — {} sent, {} failed{}",
+                            p.done,
+                            p.total,
+                            p.succeeded,
+                            p.failed,
+                            p.current
+                                .as_ref()
+                                .map(|id| format!(", inviting {id}"))
+                                .unwrap_or_default(),
+                        );
+                        if !p.running {
+                            break;
+                        }
+                    }
+                }
+                Ok(AppEvent::Error(m)) => eprintln!("error: {m}"),
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            },
+            _ = tokio::signal::ctrl_c(), if !cancel_sent => {
+                eprintln!("Cancelling after the in-flight invite…");
+                let _ = handle.commands.send(Command::CancelMultiInvite).await;
+                cancel_sent = true;
+            }
+        }
+    }
+    let p = handle.state.snapshot().multi_invite;
+    if let Some(p) = p {
+        println!(
+            "Done: {} sent, {} failed of {}",
+            p.succeeded, p.failed, p.total
+        );
+    }
+    Ok(())
+}
+
+async fn profile(user_id: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadProfile {
+            user_id: user_id.to_string(),
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await?;
+
+    let state = handle.state.snapshot();
+    let profile = state.profile.context("profile query returned nothing")?;
+    let user = &profile.user;
+    println!("{}  <{}>", user.display_name, user.username);
+    println!("  id:       {}", user.id);
+    println!(
+        "  status:   {}",
+        friend_status_label(&profile.friend_status)
+    );
+    if !user.bio.is_empty() {
+        println!("  bio:      {}", user.bio);
+    }
+    if !user.location.is_empty() {
+        println!("  location: {}", user.location);
+    }
+    if !profile.user.note.is_empty() {
+        println!("  note:     {}", profile.user.note);
+    }
+    for m in &profile.moderations {
+        println!("  moderation: {}", moderation_label(&m.kind));
+    }
+    Ok(())
+}
+
+async fn set_note(user_id: &str, note: Vec<String>) -> Result<()> {
+    let note = note.join(" ");
+    if note.trim().is_empty() {
+        bail!("note text is empty");
+    }
+    let mut handle = App::spawn(cli_config(build_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::SetUserNote {
+            user_id: user_id.to_string(),
+            note,
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await?;
+    println!("Note saved.");
     Ok(())
 }

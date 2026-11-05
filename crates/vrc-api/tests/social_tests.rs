@@ -12,7 +12,8 @@ const USER_ID: &str = "usr_00000000-0000-0000-0000-000000000001";
 const NOTIF_ID: &str = "not_00000000-0000-0000-0000-000000000001";
 const FRQ_ID: &str = "frq_00000000-0000-0000-0000-000000000001";
 const WORLD_ID: &str = "wrld_00000000-0000-0000-0000-000000000001";
-const INSTANCE_ID: &str = "12345~hidden(usr_00000000-0000-0000-0000-000000000001)~region(eu)~nonce(abc)";
+const INSTANCE_ID: &str =
+    "12345~hidden(usr_00000000-0000-0000-0000-000000000001)~region(eu)~nonce(abc)";
 
 fn test_client(server: &MockServer) -> Client {
     Client::builder()
@@ -164,13 +165,11 @@ async fn notifications_list_decodes_string_details_and_nulls() {
 #[tokio::test]
 async fn notification_actions_hit_documented_put_paths() {
     let server = MockServer::start().await;
-    for (suffix, expect_id) in [
-        ("see", NOTIF_ID),
-        ("hide", NOTIF_ID),
-        ("accept", FRQ_ID),
-    ] {
+    for (suffix, expect_id) in [("see", NOTIF_ID), ("hide", NOTIF_ID), ("accept", FRQ_ID)] {
         Mock::given(method("PUT"))
-            .and(path(format!("/auth/user/notifications/{expect_id}/{suffix}")))
+            .and(path(format!(
+                "/auth/user/notifications/{expect_id}/{suffix}"
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": {"message": "ok", "status_code": 200}
             })))
@@ -229,7 +228,9 @@ async fn user_profile_friend_status_and_note_roundtrip() {
         .await;
     Mock::given(method("POST"))
         .and(path("/userNotes"))
-        .and(body_json(json!({"targetUserId": USER_ID, "note": "hi there"})))
+        .and(body_json(
+            json!({"targetUserId": USER_ID, "note": "hi there"}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "note_00000000-0000-0000-0000-000000000001",
             "createdAt": "2026-01-02T03:04:05.000Z",
@@ -297,9 +298,24 @@ async fn user_actions_reject_bad_ids_without_request() {
         assert!(client.cancel_friend_request(bad).await.is_err(), "{bad}");
         assert!(client.unfriend(bad).await.is_err(), "{bad}");
         assert!(client.set_user_note(bad, "x").await.is_err(), "{bad}");
-        assert!(client.moderate_user(bad, PlayerModerationKind::Mute).await.is_err(), "{bad}");
-        assert!(client.unmoderate_user(bad, PlayerModerationKind::Mute).await.is_err(), "{bad}");
-        assert!(client.invite_user(bad, INSTANCE_ID, None).await.is_err(), "{bad}");
+        assert!(
+            client
+                .moderate_user(bad, PlayerModerationKind::Mute)
+                .await
+                .is_err(),
+            "{bad}"
+        );
+        assert!(
+            client
+                .unmoderate_user(bad, PlayerModerationKind::Mute)
+                .await
+                .is_err(),
+            "{bad}"
+        );
+        assert!(
+            client.invite_user(bad, INSTANCE_ID, None).await.is_err(),
+            "{bad}"
+        );
         assert!(client.request_invite(bad, None).await.is_err(), "{bad}");
     }
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -310,7 +326,9 @@ async fn invites_hit_documented_paths_with_json_bodies() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/invite/{USER_ID}")))
-        .and(body_json(json!({"instanceId": INSTANCE_ID, "messageSlot": 3})))
+        .and(body_json(
+            json!({"instanceId": INSTANCE_ID, "messageSlot": 3}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(fake_notification()))
         .expect(1)
         .mount(&server)
@@ -346,7 +364,10 @@ async fn invite_rejects_bad_ids_slots_and_instances_without_request() {
     let client = test_client(&server);
     assert!(client.invite_user(USER_ID, "a/b", None).await.is_err());
     assert!(client.invite_user(USER_ID, "a?b=c", None).await.is_err());
-    assert!(client.invite_user(USER_ID, INSTANCE_ID, Some(12)).await.is_err());
+    assert!(client
+        .invite_user(USER_ID, INSTANCE_ID, Some(12))
+        .await
+        .is_err());
     assert!(client.request_invite(USER_ID, Some(99)).await.is_err());
     assert!(client.respond_invite("usr_123", 1).await.is_err());
     assert!(client.respond_invite(NOTIF_ID, 42).await.is_err());
@@ -428,7 +449,7 @@ async fn instance_fetch_validates_ids_before_request() {
     let instance = client.instance(WORLD_ID, INSTANCE_ID).await.unwrap();
     assert_eq!(instance.instance_id, INSTANCE_ID);
     assert_eq!(instance.world.name, "synthetic_world");
-    assert!(instance.age_gate == false);
+    assert!(!instance.age_gate);
 
     // Bad ids must never reach the wire.
     for (world, inst) in [
@@ -438,7 +459,10 @@ async fn instance_fetch_validates_ids_before_request() {
         (WORLD_ID, "a..b"),
         (WORLD_ID, ""),
     ] {
-        assert!(client.instance(world, inst).await.is_err(), "{world}:{inst}");
+        assert!(
+            client.instance(world, inst).await.is_err(),
+            "{world}:{inst}"
+        );
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

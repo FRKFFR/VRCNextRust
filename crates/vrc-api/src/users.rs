@@ -39,30 +39,43 @@ impl Client {
     /// `GET /user/{userId}/friendStatus` — friend/request state vs. one user.
     pub async fn friend_status(&self, user_id: &str) -> Result<FriendStatus, ApiError> {
         check_user_id(user_id)?;
-        self.get_json(&format!("/user/{user_id}/friendStatus")).await
+        self.get_json(&format!("/user/{user_id}/friendStatus"))
+            .await
     }
 
     /// `POST /user/{userId}/friendRequest` — send a friend request; returns
     /// the created `frq_…` notification.
     pub async fn send_friend_request(&self, user_id: &str) -> Result<Notification, ApiError> {
         check_user_id(user_id)?;
-        self.send_json(Method::POST, &format!("/user/{user_id}/friendRequest"), None)
-            .await
+        self.send_json(
+            Method::POST,
+            &format!("/user/{user_id}/friendRequest"),
+            None,
+        )
+        .await
     }
 
     /// `DELETE /user/{userId}/friendRequest` — cancel an outgoing friend
     /// request.
     pub async fn cancel_friend_request(&self, user_id: &str) -> Result<SuccessResponse, ApiError> {
         check_user_id(user_id)?;
-        self.send_json(Method::DELETE, &format!("/user/{user_id}/friendRequest"), None)
-            .await
+        self.send_json(
+            Method::DELETE,
+            &format!("/user/{user_id}/friendRequest"),
+            None,
+        )
+        .await
     }
 
     /// `DELETE /auth/user/friends/{userId}` — remove a friend.
     pub async fn unfriend(&self, user_id: &str) -> Result<SuccessResponse, ApiError> {
         check_user_id(user_id)?;
-        self.send_json(Method::DELETE, &format!("/auth/user/friends/{user_id}"), None)
-            .await
+        self.send_json(
+            Method::DELETE,
+            &format!("/auth/user/friends/{user_id}"),
+            None,
+        )
+        .await
     }
 
     /// `POST /userNotes` — create/update the current user's note on `user_id`.
@@ -72,7 +85,8 @@ impl Client {
             "targetUserId": user_id,
             "note": note,
         });
-        self.send_json(Method::POST, "/userNotes", Some(&body)).await
+        self.send_json(Method::POST, "/userNotes", Some(&body))
+            .await
     }
 }
 

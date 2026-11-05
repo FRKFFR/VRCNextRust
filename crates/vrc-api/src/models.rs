@@ -464,7 +464,9 @@ where
     D: Deserializer<'de>,
 {
     match Option::<serde_json::Value>::deserialize(deserializer)? {
-        Some(serde_json::Value::String(s)) => Ok(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))),
+        Some(serde_json::Value::String(s)) => {
+            Ok(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)))
+        }
         Some(value) => Ok(value),
         None => Ok(serde_json::Value::Null),
     }

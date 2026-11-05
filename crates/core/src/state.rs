@@ -222,10 +222,9 @@ pub struct ProfileView {
 impl ProfileView {
     /// `true` when a moderation of `kind` targets this profile's user.
     pub fn has_moderation(&self, kind: vrc_api::PlayerModerationKind) -> bool {
-        self.moderations.iter().any(|m| {
-            m.target_user_id == self.user.id
-                && m.kind() == Some(kind)
-        })
+        self.moderations
+            .iter()
+            .any(|m| m.target_user_id == self.user.id && m.kind() == Some(kind))
     }
 }
 

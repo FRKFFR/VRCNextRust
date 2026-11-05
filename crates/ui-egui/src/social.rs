@@ -24,10 +24,7 @@ pub(crate) fn notifications_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: 
         }
         if ui
             .add_enabled(
-                state
-                    .notifications
-                    .as_ref()
-                    .is_some_and(|n| !n.is_empty()),
+                state.notifications.as_ref().is_some_and(|n| !n.is_empty()),
                 egui::Button::new("Clear all"),
             )
             .on_hover_text("Deletes every notification")
@@ -38,12 +35,8 @@ pub(crate) fn notifications_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: 
         ui.separator();
         ui.weak(format!(
             "{} notification{}",
-            state
-                .notifications_v2
-                .len()
-                + state.notifications.as_ref().map_or(0, Vec::len),
-            if state.notifications_v2.len() + state.notifications.as_ref().map_or(0, Vec::len)
-                == 1
+            state.notifications_v2.len() + state.notifications.as_ref().map_or(0, Vec::len),
+            if state.notifications_v2.len() + state.notifications.as_ref().map_or(0, Vec::len) == 1
             {
                 ""
             } else {
@@ -89,11 +82,7 @@ fn sender_name(state: &AppState, user_id: &str, fallback: &str) -> String {
             return profile.user.display_name.clone();
         }
     }
-    if state
-        .current_user
-        .as_ref()
-        .is_some_and(|u| u.id == user_id)
-    {
+    if state.current_user.as_ref().is_some_and(|u| u.id == user_id) {
         return state
             .current_user
             .as_ref()
@@ -159,11 +148,7 @@ fn notification_row(
                     &notification.sender_user_id,
                     &notification.sender_username,
                 );
-                if ui
-                    .link(&name)
-                    .on_hover_text("Open profile")
-                    .clicked()
-                {
+                if ui.link(&name).on_hover_text("Open profile").clicked() {
                     app.send(Command::LoadProfile {
                         user_id: notification.sender_user_id.clone(),
                     });
@@ -420,11 +405,8 @@ pub(crate) fn multi_invite_window(app: &mut VrcNextApp, ui: &mut egui::Ui, state
                 ui.separator();
             }
 
-            let mut online: Vec<&Friend> = state
-                .friends
-                .values()
-                .filter(|f| f.is_online())
-                .collect();
+            let mut online: Vec<&Friend> =
+                state.friends.values().filter(|f| f.is_online()).collect();
             online.sort_by(|a, b| a.display_name.cmp(&b.display_name));
             if online.is_empty() {
                 ui.label("No friends online.");
@@ -434,10 +416,7 @@ pub(crate) fn multi_invite_window(app: &mut VrcNextApp, ui: &mut egui::Ui, state
                     .show(ui, |ui| {
                         for friend in online {
                             let mut selected = app.multi_invite_selected.contains(&friend.id);
-                            if ui
-                                .checkbox(&mut selected, &friend.display_name)
-                                .changed()
-                            {
+                            if ui.checkbox(&mut selected, &friend.display_name).changed() {
                                 if selected {
                                     app.multi_invite_selected.insert(friend.id.clone());
                                 } else {
@@ -448,10 +427,7 @@ pub(crate) fn multi_invite_window(app: &mut VrcNextApp, ui: &mut egui::Ui, state
                     });
             }
             ui.add_space(4.0);
-            let running = state
-                .multi_invite
-                .as_ref()
-                .is_some_and(|p| p.running);
+            let running = state.multi_invite.as_ref().is_some_and(|p| p.running);
             if ui
                 .add_enabled(
                     !running && !app.multi_invite_selected.is_empty(),
