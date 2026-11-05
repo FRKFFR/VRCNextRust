@@ -1,28 +1,24 @@
 //! Application core: state, commands, events, tasks.
+//!
+//! [`App::spawn`] starts the core; front ends drive it only through
+//! [`Command`]s, [`AppEvent`]s and [`StateHandle`] snapshots (RULES.md §7).
+//! After a successful login/resume the friends list and favorites are
+//! fetched once via the rate-limited `vrc-api` client, then kept current by
+//! `vrc-pipeline` events — never re-fetched per event (RULES.md §3).
 
-pub use vrc_api::USER_AGENT;
+mod app;
+mod sections;
+mod state;
 
-/// Static configuration for [`App::spawn`].
-#[derive(Debug, Default)]
-pub struct AppConfig;
+pub use app::{App, AppConfig, AppEvent, AppHandle, Command, CommandSender, StateHandle};
+pub use sections::{search, sections, worlds_with_friends, FriendSections, WorldGroup};
+pub use state::{AppState, AuthState, Friend, PipelineStatus};
 
-/// Handle to the running application core.
-pub struct AppHandle;
-
-/// The application core; drives the leaf crates and serves front ends.
-pub struct App;
-
-impl App {
-    /// Spawn the core. Command/event plumbing arrives in later milestones.
-    pub fn spawn(_cfg: AppConfig) -> AppHandle {
-        AppHandle
-    }
-}
-
-/// Every user action is a `Command`.
-#[derive(Debug)]
-pub enum Command {}
-
-/// Events broadcast to subscribers (UI, CLI).
-#[derive(Debug)]
-pub enum AppEvent {}
+// Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
+// the leaf crates they legitimately need.
+pub use vrc_api::{
+    ApiError, Client, ClientBuilder, CookieVault, KeyringVault, LoginOutcome, MemoryVault,
+    TrustRank, TwoFactorMethod, USER_AGENT,
+};
+pub use vrc_pipeline::PipelineConfig;
+pub use vrc_pipeline::PipelineEvent;

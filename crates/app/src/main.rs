@@ -2,6 +2,17 @@
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
-    let handle = vrc_core::App::spawn(vrc_core::AppConfig);
+    // The credential store is best-effort: login still works in memory when
+    // it is unavailable (RULES.md §4: login is optional where possible).
+    let builder = vrc_core::Client::builder();
+    let client = match vrc_core::KeyringVault::new() {
+        Ok(vault) => builder.vault(vault).build(),
+        Err(e) => {
+            tracing::warn!("credential store unavailable, session not persisted: {e}");
+            builder.build()
+        }
+    }
+    .expect("REST client builds");
+    let handle = vrc_core::App::spawn(vrc_core::AppConfig::new(client));
     ui_egui::run(handle)
 }

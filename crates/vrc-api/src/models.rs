@@ -61,9 +61,10 @@ pub struct PastDisplayName {
 }
 
 /// Trust rank derived from a user's `tags` (ordered low to high).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TrustRank {
     Nuisance,
+    #[default]
     Visitor,
     NewUser,
     User,
@@ -186,6 +187,202 @@ impl CurrentUser {
     pub fn trust_rank(&self) -> TrustRank {
         TrustRank::from_tags(&self.tags)
     }
+}
+
+/// A friend-list entry (`GET /friends`) — the documented `LimitedUserFriend`
+/// shape.
+///
+/// Public profile data only; the schema carries no e-mail fields and any
+/// that appear on the wire are ignored on decode (RULES.md §4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitedUser {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub username: String,
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    #[serde(rename = "userIcon", deserialize_with = "null_to_default")]
+    pub user_icon: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub bio: String,
+    #[serde(rename = "bioLinks", deserialize_with = "null_to_default")]
+    pub bio_links: Vec<String>,
+    #[serde(rename = "friendKey", deserialize_with = "null_to_default")]
+    pub friend_key: String,
+    #[serde(rename = "friendId", deserialize_with = "null_to_default")]
+    pub friend_id: String,
+    #[serde(rename = "last_platform", deserialize_with = "null_to_default")]
+    pub last_platform: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub platform: String,
+    #[serde(rename = "currentAvatarImageUrl", deserialize_with = "null_to_default")]
+    pub current_avatar_image_url: String,
+    #[serde(
+        rename = "currentAvatarThumbnailImageUrl",
+        deserialize_with = "null_to_default"
+    )]
+    pub current_avatar_thumbnail_image_url: String,
+    #[serde(rename = "currentAvatarTags", deserialize_with = "null_to_default")]
+    pub current_avatar_tags: Vec<String>,
+    #[serde(rename = "developerType", deserialize_with = "null_to_default")]
+    pub developer_type: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub status: String,
+    #[serde(rename = "statusDescription", deserialize_with = "null_to_default")]
+    pub status_description: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub state: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub location: String,
+    #[serde(rename = "travelingToLocation", deserialize_with = "null_to_default")]
+    pub traveling_to_location: String,
+    #[serde(rename = "fallbackAvatar", deserialize_with = "null_to_default")]
+    pub fallback_avatar: String,
+    #[serde(rename = "profilePicOverride", deserialize_with = "null_to_default")]
+    pub profile_pic_override: String,
+    #[serde(
+        rename = "profilePicOverrideThumbnail",
+        deserialize_with = "null_to_default"
+    )]
+    pub profile_pic_override_thumbnail: String,
+    #[serde(rename = "isFriend", deserialize_with = "null_to_default")]
+    pub is_friend: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub last_login: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub last_activity: String,
+}
+
+impl LimitedUser {
+    /// Trust rank derived from `tags`.
+    pub fn trust_rank(&self) -> TrustRank {
+        TrustRank::from_tags(&self.tags)
+    }
+}
+
+/// A full public user object (pipeline `user` payloads, `GET /users/{id}`).
+///
+/// Public profile data only; e-mail fields are never modelled (RULES.md §4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct User {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub username: String,
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    #[serde(rename = "userIcon", deserialize_with = "null_to_default")]
+    pub user_icon: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub bio: String,
+    #[serde(rename = "bioLinks", deserialize_with = "null_to_default")]
+    pub bio_links: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub status: String,
+    #[serde(rename = "statusDescription", deserialize_with = "null_to_default")]
+    pub status_description: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub state: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub location: String,
+    #[serde(rename = "instanceId", deserialize_with = "null_to_default")]
+    pub instance_id: String,
+    #[serde(rename = "worldId", deserialize_with = "null_to_default")]
+    pub world_id: String,
+    #[serde(rename = "travelingToLocation", deserialize_with = "null_to_default")]
+    pub traveling_to_location: String,
+    #[serde(rename = "developerType", deserialize_with = "null_to_default")]
+    pub developer_type: String,
+    #[serde(rename = "last_platform", deserialize_with = "null_to_default")]
+    pub last_platform: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub last_activity: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub last_login: String,
+    #[serde(rename = "currentAvatarImageUrl", deserialize_with = "null_to_default")]
+    pub current_avatar_image_url: String,
+    #[serde(
+        rename = "currentAvatarThumbnailImageUrl",
+        deserialize_with = "null_to_default"
+    )]
+    pub current_avatar_thumbnail_image_url: String,
+    #[serde(rename = "currentAvatarTags", deserialize_with = "null_to_default")]
+    pub current_avatar_tags: Vec<String>,
+    #[serde(rename = "allowAvatarCopying", deserialize_with = "null_to_default")]
+    pub allow_avatar_copying: bool,
+    #[serde(rename = "friendKey", deserialize_with = "null_to_default")]
+    pub friend_key: String,
+    #[serde(rename = "isFriend", deserialize_with = "null_to_default")]
+    pub is_friend: bool,
+    #[serde(rename = "profilePicOverride", deserialize_with = "null_to_default")]
+    pub profile_pic_override: String,
+    #[serde(
+        rename = "profilePicOverrideThumbnail",
+        deserialize_with = "null_to_default"
+    )]
+    pub profile_pic_override_thumbnail: String,
+    #[serde(rename = "fallbackAvatar", deserialize_with = "null_to_default")]
+    pub fallback_avatar: String,
+}
+
+impl User {
+    /// Trust rank derived from `tags`.
+    pub fn trust_rank(&self) -> TrustRank {
+        TrustRank::from_tags(&self.tags)
+    }
+}
+
+/// One entry of `GET /favorites` — a pointer at a favorited object.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Favorite {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    /// Favorite group kind: `world`, `avatar` or `friend`.
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    /// Id of the favorited object (user id for `friend` favorites).
+    #[serde(rename = "favoriteId", deserialize_with = "null_to_default")]
+    pub favorite_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub visibility: String,
+}
+
+/// A `notification` pipeline message or `GET /auth/user/notifications` entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notification {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "senderUserId", deserialize_with = "null_to_default")]
+    pub sender_user_id: String,
+    #[serde(rename = "senderUsername", deserialize_with = "null_to_default")]
+    pub sender_username: String,
+    #[serde(rename = "receiverUserId", deserialize_with = "null_to_default")]
+    pub receiver_user_id: String,
+    /// Notification kind (`friendRequest`, `invite`, `votetokick`, ...).
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub message: String,
+    /// Auxiliary payload, itself a JSON-encoded string per the docs.
+    #[serde(deserialize_with = "null_to_default")]
+    pub details: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub seen: bool,
+    #[serde(rename = "created_at", deserialize_with = "null_to_default")]
+    pub created_at: String,
 }
 
 /// The `GET /auth/user` envelope while 2FA is still pending. Internal to the
