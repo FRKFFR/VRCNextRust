@@ -362,6 +362,8 @@ pub struct World {
     pub recommended_capacity: i32,
     #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
     pub image_url: String,
+    #[serde(rename = "thumbnailImageUrl", deserialize_with = "null_to_default")]
+    pub thumbnail_image_url: String,
     #[serde(deserialize_with = "null_to_default")]
     pub url: String,
     #[serde(deserialize_with = "null_to_default")]

@@ -32,7 +32,7 @@ pub struct VrcNextApp {
 
 impl VrcNextApp {
     fn new(commands: CommandSender, state: StateHandle) -> Self {
-        Self {
+        let app = Self {
             commands,
             state,
             username: String::new(),
@@ -40,7 +40,11 @@ impl VrcNextApp {
             code: String::new(),
             twofa_index: 0,
             search: String::new(),
-        }
+        };
+        // Resume a persisted session on startup. With an empty vault this
+        // resolves to `LoggedOut` without any network call (RULES.md §4).
+        app.send(Command::ResumeSession);
+        app
     }
 
     /// Queue a command; the channel is bounded and commands are cheap, so a
@@ -51,7 +55,7 @@ impl VrcNextApp {
         }
     }
 
-    fn login_ui(&mut self, ui: &mut egui::Ui) {
+    fn login_ui(&mut self, ui: &mut egui::Ui, state: &AppState) {
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
@@ -74,15 +78,20 @@ impl VrcNextApp {
                 let submit = ui.button("Log in").clicked()
                     || (enter && (user_out.response.has_focus() || pass_out.response.has_focus()));
                 if submit && !self.username.trim().is_empty() && !self.password.is_empty() {
-                    // Move the buffer into a SecretString: it is zeroized
-                    // when the command is dropped after handling.
+                    // Move both buffers out of UI state: the password becomes
+                    // a SecretString (zeroized when the command is dropped),
+                    // and the username (typically an e-mail) is cleared —
+                    // credentials live in memory only for the login call
+                    // (RULES.md §4).
+                    let username = std::mem::take(&mut self.username);
                     let password = SecretString::from(std::mem::take(&mut self.password));
                     self.send(Command::Login {
-                        username: self.username.trim().to_string(),
+                        username: username.trim().to_string(),
                         password,
                     });
                 }
 
+                error_text(ui, state);
                 ui.add_space(16.0);
                 if ui
                     .button("Resume saved session")
@@ -95,7 +104,7 @@ impl VrcNextApp {
         });
     }
 
-    fn twofa_ui(&mut self, ui: &mut egui::Ui, methods: &[TwoFactorMethod]) {
+    fn twofa_ui(&mut self, ui: &mut egui::Ui, methods: &[TwoFactorMethod], state: &AppState) {
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
@@ -137,6 +146,7 @@ impl VrcNextApp {
                     self.send(Command::Submit2fa { method, code });
                 }
 
+                error_text(ui, state);
                 ui.add_space(16.0);
                 if ui.button("Back to login").clicked() {
                     // No session exists yet; logout clears the pending 2FA
@@ -229,15 +239,18 @@ impl eframe::App for VrcNextApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state = self.state.snapshot();
         match &state.auth {
-            AuthState::LoggedOut => self.login_ui(ui),
-            AuthState::Needs2fa(methods) => self.twofa_ui(ui, methods),
+            AuthState::LoggedOut => self.login_ui(ui, &state),
+            AuthState::Needs2fa(methods) => self.twofa_ui(ui, methods, &state),
             AuthState::Authenticated => self.main_ui(ui, &state),
         }
-        // Surface backend errors that arrived without a matching event.
-        if state.last_error.is_some() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
-        }
+    }
+}
+
+/// Red error line for the auth screens; cleared by the core on the next
+/// command attempt.
+fn error_text(ui: &mut egui::Ui, state: &AppState) {
+    if let Some(error) = &state.last_error {
+        ui.colored_label(egui::Color32::LIGHT_RED, error);
     }
 }
 

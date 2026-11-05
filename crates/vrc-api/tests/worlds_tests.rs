@@ -32,6 +32,7 @@ async fn world_decodes_public_metadata() {
             "capacity": 40,
             "recommendedCapacity": 32,
             "imageUrl": "https://api.vrchat.cloud/api/1/file/file_00000000-0000-0000-0000-000000000002/1/file",
+            "thumbnailImageUrl": "https://api.vrchat.cloud/api/1/image/file_00000000-0000-0000-0000-000000000002/1/256",
             "url": "wrld_00000000-0000-0000-0000-00000000000a:1",
             "popularity": 100,
             "favorites": 5,
@@ -54,6 +55,7 @@ async fn world_decodes_public_metadata() {
     assert_eq!(world.author_name, "Test Author");
     assert_eq!(world.capacity, 40);
     assert_eq!(world.platforms, ["standalonewindows", "quest"]);
+    assert!(world.thumbnail_image_url.ends_with("/256"));
     server.verify().await;
 }
 

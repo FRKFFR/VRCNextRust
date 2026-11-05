@@ -18,7 +18,7 @@ use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, TwoFactorMethod};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
 
 use crate::sections::worlds_with_friends;
-use crate::state::{AppState, AuthState, Friend, PipelineStatus, WorldName};
+use crate::state::{valid_world_id, AppState, AuthState, Friend, PipelineStatus, WorldName};
 
 /// Static configuration for [`App::spawn`].
 #[derive(Debug)]
@@ -220,6 +220,9 @@ async fn run(
 
 impl Runtime {
     async fn handle(&mut self, command: Command) {
+        // A new attempt supersedes the previous error: clear it up front so
+        // `report` below is the only writer within this command.
+        self.state.write().last_error = None;
         match command {
             Command::Login { username, password } => {
                 match self.client.login(&username, &password).await {
@@ -361,6 +364,11 @@ impl Runtime {
         {
             let state = self.state.read();
             for group in worlds_with_friends(&state) {
+                // Remote payloads can carry arbitrary world_id strings;
+                // only plausible `wrld_…` ids become path segments.
+                if !valid_world_id(&group.world_id) {
+                    continue;
+                }
                 let needs_fetch = match state.world_names.get(&group.world_id) {
                     Some(WorldName::Known(_)) | Some(WorldName::Pending) => false,
                     Some(WorldName::Unknown { retry_at }) => *retry_at <= now,
