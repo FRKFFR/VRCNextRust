@@ -3,7 +3,7 @@
 | Milestone | State | Session | Branch / PR | Outcome | Open issues |
 |---|---|---|---|---|---|
 | Setup | done | lead | main | repo, RULES.md, architecture, orchestrator | — |
-| M1 Foundations | in review | m1a-coder | agent/m1a-workspace-skeleton-read-rules-md-fir-mw2mob17 | M1a workspace skeleton: 10 crates, toolchain pin, CI, USER_AGENT | — |
+| M1 Foundations | M1b in review | m1b-coder | agent/m1b-vrc-api-client-read-rules-md-first-m-mw3qpgur | M1b vrc-api client: auth + 2FA, CookieVault (keyring/memory), token-bucket rate limiter + retry, models, wiremock tests | — |
 | M2 Real-time | not started | | | | |
 | M3 Local data | not started | | | | agent time limit 60 min |
 | M4 Social actions | not started | | | | |
