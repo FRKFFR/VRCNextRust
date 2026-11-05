@@ -476,6 +476,11 @@ impl Runtime {
         if let Some(handle) = self.pipeline.take() {
             handle.shutdown();
         }
+        // Drop this generation's event channel so queued pipeline events —
+        // e.g. a Connected already in flight — can't resurrect the session's
+        // pipeline status or repopulate friends after teardown (same reason
+        // `after_login` installs a fresh channel).
+        self.pipeline_events = mpsc::unbounded_channel();
         let mut state = self.state.write();
         state.current_user = None;
         state.friends.clear();
