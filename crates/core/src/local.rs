@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::oneshot;
 use vrc_logs::LogEvent;
 use vrc_pipeline::PipelineEvent;
@@ -90,11 +90,33 @@ pub(crate) fn spawn_store_thread(store: Store) -> mpsc::Sender<StoreOp> {
     tx
 }
 
+/// The session row currently open, tracked here so `WorldJoin` /
+/// `WorldLeft` ops stay correctly ordered even though they were queued
+/// from different async tasks.
+struct OpenSession {
+    /// Row id in the `sessions` table.
+    id: i64,
+    /// `started_at` of the session — used to tell a fresh join's
+    /// `Entering Room:` line apart from a stale still-open session.
+    started_at: OffsetDateTime,
+}
+
+/// How long after a session opens (or a name is buffered) a world name
+/// may still be attached to it. Covers slow world loads while rejecting
+/// names that belong to an earlier visit (tailer/app start mid-session,
+/// missed `OnLeftRoom`).
+const SESSION_NAME_WINDOW: Duration = Duration::minutes(2);
+
 fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
     // The session row currently open, tracked here so `WorldJoin` /
     // `WorldLeft` ops stay correctly ordered even though they were queued
     // from different async tasks.
-    let mut open_session: Option<i64> = None;
+    let mut open_session: Option<OpenSession> = None;
+    // World name from an `Entering Room:` line that could not be attached
+    // to an open session (it arrived before `Joining wrld_…`, or while a
+    // stale session was still open); applied to the next session opened
+    // within [`SESSION_NAME_WINDOW`].
+    let mut pending_name: Option<(String, OffsetDateTime)> = None;
     while let Ok(op) = rx.recv() {
         match op {
             StoreOp::Timeline(entry) => {
@@ -114,47 +136,87 @@ fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
                 instance_id,
                 location,
             } => {
-                // `Entering Room: <name>` carries no world id and refines
-                // the session opened by the preceding `Joining wrld_…`.
-                if world_id.is_empty() && !world_name.is_empty() && open_session.is_some() {
-                    if let Some(id) = open_session {
-                        if let Err(e) = store.sessions().update_world(id, "", &world_name, "", "") {
-                            tracing::debug!("vrc-core: session name update failed: {e}");
+                if world_id.is_empty() {
+                    // Name-only `Entering Room:` line.
+                    if !world_name.is_empty() {
+                        // Rename the open session only when it was opened
+                        // recently — i.e. it belongs to this same visit.
+                        // A stale still-open session (tailer/app start
+                        // mid-world, missed `OnLeftRoom`) must not be
+                        // relabelled with the new world's name.
+                        let fresh_id = open_session
+                            .as_ref()
+                            .filter(|s| (ts - s.started_at).abs() <= SESSION_NAME_WINDOW)
+                            .map(|s| s.id);
+                        if let Some(id) = fresh_id {
+                            if let Err(e) =
+                                store.sessions().update_world(id, "", &world_name, "", "")
+                            {
+                                tracing::debug!("vrc-core: session name update failed: {e}");
+                            }
+                            pending_name = None;
+                        } else {
+                            // Buffer the name for the id-bearing join that
+                            // may follow (or already preceded) it.
+                            pending_name = Some((world_name.clone(), ts));
+                            if open_session.is_none() {
+                                match store.sessions().open(&NewSession {
+                                    started_at: ts,
+                                    world_name: world_name.clone(),
+                                    ..NewSession::default()
+                                }) {
+                                    Ok(id) => {
+                                        open_session = Some(OpenSession { id, started_at: ts });
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("vrc-core: session open failed: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                     continue;
                 }
                 // A fresh world join retires the previous session at this
                 // instant (covers the "new JoinedWorld" close rule).
-                if let Some(id) = open_session.take() {
-                    if let Err(e) = store.sessions().close(id, ts) {
+                if let Some(open) = open_session.take() {
+                    if let Err(e) = store.sessions().close(open.id, ts) {
                         tracing::debug!("vrc-core: session close failed: {e}");
                     }
                 }
-                open_session = store
-                    .sessions()
-                    .open(&NewSession {
-                        started_at: ts,
-                        world_id,
-                        world_name,
-                        instance_id,
-                        location,
-                    })
-                    .map_err(|e| {
-                        tracing::debug!("vrc-core: session open failed: {e}");
-                        e
-                    })
-                    .ok();
+                // `Joining wrld_…` lines carry no name; recover one buffered
+                // from an earlier `Entering Room:` line when still fresh.
+                let mut world_name = world_name;
+                if world_name.is_empty() {
+                    if let Some((name, name_ts)) = pending_name.take() {
+                        if (ts - name_ts).abs() <= SESSION_NAME_WINDOW {
+                            world_name = name;
+                        }
+                    }
+                } else {
+                    pending_name = None;
+                }
+                match store.sessions().open(&NewSession {
+                    started_at: ts,
+                    world_id,
+                    world_name,
+                    instance_id,
+                    location,
+                }) {
+                    Ok(id) => open_session = Some(OpenSession { id, started_at: ts }),
+                    Err(e) => tracing::debug!("vrc-core: session open failed: {e}"),
+                }
             }
             StoreOp::WorldLeft { ts } => {
-                if let Some(id) = open_session.take() {
-                    if let Err(e) = store.sessions().close(id, ts) {
+                if let Some(open) = open_session.take() {
+                    if let Err(e) = store.sessions().close(open.id, ts) {
                         tracing::debug!("vrc-core: session close failed: {e}");
                     }
                 }
             }
             StoreOp::CloseAllSessions { ts } => {
                 open_session = None;
+                pending_name = None;
                 if let Err(e) = store.sessions().close_all_open(ts) {
                     tracing::debug!("vrc-core: session cleanup failed: {e}");
                 }
@@ -509,5 +571,49 @@ mod tests {
         .unwrap();
         assert_eq!(entry.display_name, "Known Name");
         assert_eq!(entry.platform, "ios");
+    }
+
+    #[test]
+    fn name_only_join_never_relabels_a_stale_session() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || store_loop(thread_store, rx));
+
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        let join = |ts: OffsetDateTime, world_id: &str, world_name: &str| StoreOp::WorldJoin {
+            ts,
+            world_id: world_id.to_string(),
+            world_name: world_name.to_string(),
+            instance_id: String::new(),
+            location: String::new(),
+        };
+
+        // World A's session opens and stays open — its `OnLeftRoom` was
+        // missed (e.g. the tailer started mid-session).
+        tx.send(join(t0, "wrld_a", "World A")).unwrap();
+
+        // An hour later an `Entering Room:` name-only line arrives while
+        // the stale session is still open. It must not relabel session A;
+        // the name is buffered for the id-bearing join that follows.
+        let t1 = t0 + Duration::hours(1);
+        tx.send(join(t1, "", "World B")).unwrap();
+        tx.send(join(t1 + Duration::seconds(1), "wrld_b", ""))
+            .unwrap();
+        drop(tx);
+        handle.join().unwrap();
+
+        // Stats group sessions by world id: the stale session kept
+        // "World A" and the new one picked up the buffered "World B".
+        let stats = store.stats().compute(&StatsRange::default(), 10).unwrap();
+        let name_of = |id: &str| {
+            stats
+                .top_worlds
+                .iter()
+                .find(|w| w.world_id == id)
+                .map(|w| w.world_name.as_str())
+        };
+        assert_eq!(name_of("wrld_a"), Some("World A"));
+        assert_eq!(name_of("wrld_b"), Some("World B"));
     }
 }

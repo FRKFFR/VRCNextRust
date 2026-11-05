@@ -164,7 +164,7 @@ impl TimelineRepo {
             "SELECT id, ts, kind, user_id, display_name, world_id, world_name,
                     instance_id, location, detail
              FROM timeline {where_sql}
-             ORDER BY id DESC
+             ORDER BY ts DESC, id DESC
              LIMIT ? OFFSET ?"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -339,5 +339,28 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn list_orders_by_timestamp_not_insertion_order() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = store.timeline();
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        // Insert out of order so row ids disagree with timestamp order.
+        let mut ids = Vec::new();
+        for secs in [30, 10, 20] {
+            ids.push(
+                repo.insert(&entry(
+                    TimelineKind::JoinedWorld,
+                    t0 + Duration::seconds(secs),
+                    "",
+                ))
+                .unwrap(),
+            );
+        }
+        let list = repo.list(&TimelineFilter::default()).unwrap();
+        // ts DESC, id DESC: 30s (ids[0]), 20s (ids[2]), 10s (ids[1]).
+        let order: Vec<i64> = list.iter().map(|e| e.id).collect();
+        assert_eq!(order, vec![ids[0], ids[2], ids[1]]);
     }
 }

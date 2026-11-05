@@ -16,7 +16,8 @@ use tokio::sync::broadcast;
 
 use vrc_core::{
     format, sections, App, AppConfig, AppEvent, AppHandle, AuthState, Client, Command,
-    KeyringVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, USER_AGENT,
+    KeyringVault, MemoryVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod,
+    USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -136,6 +137,16 @@ fn build_client() -> Result<Client> {
     let vault = KeyringVault::new().context("opening the OS credential store")?;
     Client::builder()
         .vault(vault)
+        .build()
+        .context("building the REST client")
+}
+
+/// Client for commands that never authenticate: local data comes from the
+/// SQLite store, so an in-memory vault keeps these working on machines
+/// without an OS secret service.
+fn build_local_client() -> Result<Client> {
+    Client::builder()
+        .vault(MemoryVault::new())
         .build()
         .context("building the REST client")
 }
@@ -312,7 +323,7 @@ async fn logout() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn timeline(kind: Option<TimelineKindArg>, query: Option<String>, page: u32) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(AppConfig::new(build_local_client()?));
     let kind = kind.map(TimelineKind::from);
     let query = query.filter(|q| !q.trim().is_empty());
     handle
@@ -348,7 +359,7 @@ async fn timeline(kind: Option<TimelineKindArg>, query: Option<String>, page: u3
 }
 
 async fn stats(range: StatsRangeArg) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(AppConfig::new(build_local_client()?));
     handle
         .commands
         .send(Command::LoadStats {

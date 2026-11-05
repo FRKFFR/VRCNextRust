@@ -40,7 +40,7 @@ pub enum LogEvent {
         /// Log timestamp (local time).
         at: OffsetDateTime,
     },
-    /// The local player left the room/world (`OnPlayerLeftRoom`).
+    /// The local player left the room/world (`OnLeftRoom`).
     LeftWorld {
         /// Log timestamp (local time).
         at: OffsetDateTime,
@@ -182,10 +182,12 @@ pub fn parse_line(line: &str) -> Option<LogEvent> {
     let message = record_message(rest)?;
     let at = at.assume_offset(local_offset());
 
-    // `[Behaviour] OnPlayerLeftRoom` — the local player left the instance.
-    // Checked before the `OnPlayerLeft ` player-event patterns for clarity;
-    // the prefixes are disjoint either way (`OnPlayerLeftRoom` has no space).
-    if message == "OnPlayerLeftRoom" || message == "OnLeftRoom" {
+    // `[Behaviour] OnLeftRoom` — the local player left the instance.
+    // `OnPlayerLeftRoom` is deliberately NOT matched: it is the remote-
+    // player-left room callback (remote departures already surface as
+    // `OnPlayerLeft <name>` rows), so treating it as a world leave would
+    // close the session every time someone else exits the instance.
+    if message == "OnLeftRoom" {
         return Some(LogEvent::LeftWorld { at });
     }
 
@@ -447,7 +449,7 @@ mod tests {
     #[test]
     fn parses_left_world_and_photo_taken() {
         assert!(matches!(
-            parse_line("2023.12.13 14:19:54 Log - [Behaviour] OnPlayerLeftRoom"),
+            parse_line("2023.12.13 14:19:54 Log - [Behaviour] OnLeftRoom"),
             Some(LogEvent::LeftWorld { .. })
         ));
         let photo = parse_line(
@@ -476,6 +478,8 @@ mod tests {
             "2024.05.14 20:45:01 Log - [Behaviour] Joining friend: Test User",
             "2024.05.14 20:45:01 Log - [Behaviour] OnPlayerJoined:",
             "2024.05.14 20:45:01 Log - [Behaviour] OnPlayerJoinComplete",
+            // Remote-player room departure — NOT a world leave.
+            "2024.05.14 20:45:01 Log - [Behaviour] OnPlayerLeftRoom",
             "2024.05.14 20:45:01 Log - [Behaviour] Removed player Test User",
             "2024.05.14 20:45:01 Log - [Behaviour] Entering world",
             "2024.05.14 20:45:01 Log - [Behaviour] Destination set: wrld_00000000-0000-0000-0000-000000000001",
@@ -489,11 +493,10 @@ mod tests {
     #[test]
     fn timestamp_variants_parse() {
         // Padded level + fractional seconds.
-        let event =
-            parse_line("2024.05.14 20:45:01.123 Log        -  [Behaviour] OnPlayerLeftRoom");
+        let event = parse_line("2024.05.14 20:45:01.123 Log        -  [Behaviour] OnLeftRoom");
         assert!(matches!(event, Some(LogEvent::LeftWorld { .. })));
         // CRLF-terminated content is trimmed by the caller; trim_end here too.
-        let event = parse_line("2024.05.14 20:45:01 Log - [Behaviour] OnPlayerLeftRoom\r");
+        let event = parse_line("2024.05.14 20:45:01 Log - [Behaviour] OnLeftRoom\r");
         assert!(matches!(event, Some(LogEvent::LeftWorld { .. })));
     }
 

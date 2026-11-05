@@ -289,7 +289,7 @@ mod tests {
 
         file.write_all(b" User (usr_00000000-0000-0000-0000-000000000003)\n")
             .unwrap();
-        file.write_all(b"2024.05.14 20:45:03 Log - [Behaviour] OnPlayerLeftRoom\n")
+        file.write_all(b"2024.05.14 20:45:03 Log - [Behaviour] OnLeftRoom\n")
             .unwrap();
         file.flush().unwrap();
 

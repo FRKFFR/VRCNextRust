@@ -675,7 +675,7 @@ async fn log_tail_persists_timeline_sessions_and_stats() {
             "2024.05.14 20:45:01 Log - [Behaviour] Entering Room: Test World\n",
             "2024.05.14 20:45:10 Log - [Behaviour] OnPlayerJoined Test Friend (usr_00000000-0000-0000-0000-000000000003)\n",
             "2024.05.14 20:45:40 Log - [VRC Camera] Took screenshot to: C:\\fake\\pic.png\n",
-            "2024.05.14 20:46:00 Log - [Behaviour] OnPlayerLeftRoom\n",
+            "2024.05.14 20:46:00 Log - [Behaviour] OnLeftRoom\n",
         ),
     )
     .unwrap();
