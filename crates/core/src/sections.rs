@@ -14,26 +14,20 @@ use crate::state::{AppState, Friend};
 pub struct FriendSections {
     /// Online favorited friends (any presence other than offline).
     pub favorites: Vec<Friend>,
-    /// Non-favorite friends in an instance (incl. `private`/`traveling`).
+    /// Non-favorite friends whose `state` is `online`.
     pub in_game: Vec<Friend>,
-    /// Non-favorite friends online but not in a world (web/app).
-    pub active: Vec<Friend>,
+    /// Non-favorite friends whose `state` is `active` (web/app, not in-game).
+    pub web_active: Vec<Friend>,
     /// Friends offline (incl. favorites).
     pub offline: Vec<Friend>,
-}
-
-/// True when `location` names a real instance (`wrld_…:…`, `private`,
-/// `traveling`) rather than `""`/`offline`.
-fn in_game(location: &str) -> bool {
-    !matches!(location, "" | "offline")
 }
 
 /// Group `state.friends` into disjoint display sections, each sorted by
 /// display name (case-insensitive, then id).
 ///
-/// `favorites`: favorites that are not offline. `in_game`: online (not
-/// favorite) in a real location. `active`: not-offline, not-favorite, not
-/// in a world. `offline`: the rest.
+/// `favorites`: favorites that are not offline. `in_game`: `state ==
+/// "online"` and not favorite. `web_active`: not-offline, not-favorite, not
+/// `online`. `offline`: the rest.
 pub fn sections(state: &AppState) -> FriendSections {
     let mut out = FriendSections::default();
     for friend in state.friends.values() {
@@ -41,16 +35,16 @@ pub fn sections(state: &AppState) -> FriendSections {
             out.offline.push(friend.clone());
         } else if friend.is_favorite {
             out.favorites.push(friend.clone());
-        } else if friend.state == "online" && in_game(&friend.location) {
+        } else if friend.state == "online" {
             out.in_game.push(friend.clone());
         } else {
-            out.active.push(friend.clone());
+            out.web_active.push(friend.clone());
         }
     }
     for list in [
         &mut out.favorites,
         &mut out.in_game,
-        &mut out.active,
+        &mut out.web_active,
         &mut out.offline,
     ] {
         list.sort_by(|a, b| {
@@ -80,7 +74,7 @@ pub fn search(sections: &FriendSections, query: &str) -> FriendSections {
     FriendSections {
         favorites: hits(&sections.favorites),
         in_game: hits(&sections.in_game),
-        active: hits(&sections.active),
+        web_active: hits(&sections.web_active),
         offline: hits(&sections.offline),
     }
 }
@@ -98,11 +92,13 @@ pub struct WorldGroup {
     pub friends: Vec<Friend>,
 }
 
-/// Group in-game friends by world. Skips `private`, `offline`, `traveling`
-/// and empty locations (no world to join). Sorted by friend count
-/// descending, then world id.
+/// Group in-game friends by `(world_id, instance_id)` — one group per
+/// instance, so a dashboard can offer a join for the exact instance.
+/// Skips `private`, `offline`, `traveling` and empty locations (no world to
+/// join). Sorted by friend count descending, then world id, then instance
+/// id.
 pub fn worlds_with_friends(state: &AppState) -> Vec<WorldGroup> {
-    let mut groups: BTreeMap<String, WorldGroup> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String), WorldGroup> = BTreeMap::new();
     for friend in state.friends.values() {
         if friend.state != "online"
             || friend.world_id.is_empty()
@@ -113,15 +109,16 @@ pub fn worlds_with_friends(state: &AppState) -> Vec<WorldGroup> {
         {
             continue;
         }
+        let instance_id = friend
+            .location
+            .split_once(':')
+            .map(|(_, inst)| inst.to_string())
+            .unwrap_or_default();
         let group = groups
-            .entry(friend.world_id.clone())
+            .entry((friend.world_id.clone(), instance_id.clone()))
             .or_insert_with(|| WorldGroup {
                 world_id: friend.world_id.clone(),
-                instance_id: friend
-                    .location
-                    .split_once(':')
-                    .map(|(_, inst)| inst.to_string())
-                    .unwrap_or_default(),
+                instance_id,
                 location: friend.location.clone(),
                 friends: Vec::new(),
             });
@@ -141,6 +138,7 @@ pub fn worlds_with_friends(state: &AppState) -> Vec<WorldGroup> {
             .len()
             .cmp(&a.friends.len())
             .then_with(|| a.world_id.cmp(&b.world_id))
+            .then_with(|| a.instance_id.cmp(&b.instance_id))
     });
     out
 }
@@ -185,15 +183,16 @@ mod tests {
         ]));
         assert_eq!(s.favorites.len(), 1);
         assert_eq!(s.favorites[0].id, "usr_a");
-        assert_eq!(s.in_game.len(), 1);
-        assert_eq!(s.in_game[0].id, "usr_c");
-        // "dave" (active) and "Erin" (online, no instance) are on web/app.
-        assert_eq!(s.active.len(), 2);
+        // in_game = state "online" and not favorite, regardless of location.
+        assert_eq!(s.in_game.len(), 2);
+        // Only "dave" (state "active") is on web/app.
+        assert_eq!(s.web_active.len(), 1);
+        assert_eq!(s.web_active[0].id, "usr_d");
         // The offline favorite lands in `offline`, not `favorites`.
         assert_eq!(s.offline.len(), 2);
         assert!(s.offline.iter().any(|f| f.id == "usr_b"));
         // No friend appears twice across sections.
-        let total = s.favorites.len() + s.in_game.len() + s.active.len() + s.offline.len();
+        let total = s.favorites.len() + s.in_game.len() + s.web_active.len() + s.offline.len();
         assert_eq!(total, 6);
     }
 
@@ -206,24 +205,25 @@ mod tests {
             carol,
         ]));
         let hits = search(&s, "CAR");
-        assert_eq!(hits.active.len(), 1);
-        assert_eq!(hits.active[0].id, "usr_c");
+        assert_eq!(hits.web_active.len(), 1);
+        assert_eq!(hits.web_active[0].id, "usr_c");
         assert!(hits.in_game.is_empty());
         let hits = search(&s, "carol_vrc");
-        assert_eq!(hits.active.len(), 1);
+        assert_eq!(hits.web_active.len(), 1);
         assert_eq!(
-            search(&s, "").active.len() + search(&s, "").in_game.len(),
+            search(&s, "").web_active.len() + search(&s, "").in_game.len(),
             2
         );
         assert_eq!(search(&s, "zzz").offline.len(), 0);
     }
 
     #[test]
-    fn worlds_skip_private_offline_traveling_and_sort_by_count() {
+    fn worlds_group_per_instance_skip_sentinels_and_sort_by_count() {
         let state = app_state(vec![
             friend("usr_a", "A", "online", "wrld_one:1"),
+            // Same world, different instances: each gets its own group.
             friend("usr_b", "B", "online", "wrld_one:2"),
-            friend("usr_c", "C", "online", "wrld_two:1"),
+            friend("usr_c", "C", "online", "wrld_one:1"),
             friend("usr_d", "D", "online", "private"),
             friend("usr_e", "E", "online", "traveling"),
             friend("usr_f", "F", "online", "offline"),
@@ -232,12 +232,12 @@ mod tests {
         ]);
         let groups = worlds_with_friends(&state);
         assert_eq!(groups.len(), 2);
+        // wrld_one:1 has two friends and sorts first.
         assert_eq!(groups[0].world_id, "wrld_one");
-        // The representative instance is whichever friend the map visited
-        // first — both belong to wrld_one.
-        assert!(matches!(groups[0].instance_id.as_str(), "1" | "2"));
+        assert_eq!(groups[0].instance_id, "1");
         assert_eq!(groups[0].friends.len(), 2);
-        assert_eq!(groups[1].world_id, "wrld_two");
+        assert_eq!(groups[1].world_id, "wrld_one");
+        assert_eq!(groups[1].instance_id, "2");
         assert_eq!(groups[1].friends.len(), 1);
     }
 }

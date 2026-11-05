@@ -187,8 +187,8 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
     assert_eq!(s.in_game.len(), 1);
     assert_eq!(s.in_game[0].id, ONLINE_ID);
     // "Test Active" (no location) lands in Web/Active.
-    assert_eq!(s.active.len(), 1);
-    assert_eq!(s.active[0].id, ACTIVE_ID);
+    assert_eq!(s.web_active.len(), 1);
+    assert_eq!(s.web_active[0].id, ACTIVE_ID);
     assert_eq!(s.offline.len(), 1);
     assert_eq!(s.offline[0].id, OFFLINE_ID);
     // Sections are disjoint: the online favorite appears only in `favorites`.

@@ -290,9 +290,12 @@ fn backoff(attempt: u32, rng: &mut u64, config: &PipelineConfig) -> Duration {
     base.saturating_add(jitter).min(config.max_backoff)
 }
 
-/// Replace the secret wherever it may appear in `msg` (RULES.md §4).
+/// Replace the secret wherever it may appear in `msg` — raw *and* in the
+/// percent-encoded form the request URI carries (RULES.md §4).
 fn sanitize(msg: &str, token: &SecretString) -> String {
-    msg.replace(token.expose_secret(), "[redacted]")
+    let raw = token.expose_secret();
+    msg.replace(raw, "[redacted]")
+        .replace(&percent_encode(raw), "[redacted]")
 }
 
 /// Percent-encode for a URI query value (unreserved chars pass through).
@@ -363,6 +366,12 @@ mod tests {
         assert_eq!(
             sanitize("err wss://x/?authToken=authcookie_secret&y=1", &token),
             "err wss://x/?authToken=[redacted]&y=1"
+        );
+        // The encoded form found in the request URI is scrubbed too.
+        let token = SecretString::from("tok&en");
+        assert_eq!(
+            sanitize("err wss://x/?authToken=tok%26en", &token),
+            "err wss://x/?authToken=[redacted]"
         );
     }
 }

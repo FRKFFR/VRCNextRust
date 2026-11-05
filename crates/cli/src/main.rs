@@ -178,7 +178,7 @@ async fn friends() -> Result<()> {
     for (title, list) in [
         ("Favorites", &s.favorites),
         ("In-Game", &s.in_game),
-        ("Web/Active", &s.active),
+        ("Web/Active", &s.web_active),
         ("Offline", &s.offline),
     ] {
         println!("== {title} ({}) ==", list.len());

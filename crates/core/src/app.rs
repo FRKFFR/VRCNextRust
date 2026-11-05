@@ -73,7 +73,6 @@ pub struct AppHandle {
 }
 
 /// Every user action is a `Command` (RULES.md §7).
-#[derive(Debug)]
 pub enum Command {
     /// `GET /auth/user` with Basic credentials; on `Needs2fa` the state
     /// changes to [`AuthState::Needs2fa`].
@@ -99,6 +98,23 @@ pub enum Command {
     /// Re-fetch the friends list and favorites (the only re-fetch; pipeline
     /// events otherwise keep friends current).
     RefreshFriends,
+}
+
+impl std::fmt::Debug for Command {
+    /// Account identifiers and secrets are never printed (RULES.md §4):
+    /// `username` is typically an e-mail; `password`/`code` are
+    /// `SecretString`s.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Command::Login { .. } => "Login",
+            Command::Submit2fa { .. } => "Submit2fa",
+            Command::ResumeSession => "ResumeSession",
+            Command::Logout => "Logout",
+            Command::RefreshCurrentUser => "RefreshCurrentUser",
+            Command::RefreshFriends => "RefreshFriends",
+        };
+        f.debug_struct(name).finish_non_exhaustive()
+    }
 }
 
 /// Events broadcast to subscribers (UI, CLI).
@@ -257,6 +273,10 @@ impl Runtime {
             handle.shutdown();
         }
         if let Some(token) = self.client.auth_token() {
+            // Fresh channel per session: queued events from a previous
+            // pipeline generation cannot clobber the new connection's
+            // `Connecting` status.
+            self.pipeline_events = mpsc::unbounded_channel();
             let (handle, stream) = Pipeline::connect(self.pipeline_config.clone(), token);
             self.pipeline = Some(handle);
             self.state.write().pipeline = PipelineStatus::Connecting;
@@ -292,11 +312,17 @@ impl Runtime {
         let mut state = self.state.write();
         state.friends.clear();
         for user in &offline {
+            if user.id.is_empty() {
+                continue;
+            }
             let mut friend = Friend::from_limited(user, false);
             friend.is_favorite = favorites.contains(&friend.id);
             state.friends.insert(friend.id.clone(), friend);
         }
         for user in &online {
+            if user.id.is_empty() {
+                continue;
+            }
             let mut friend = Friend::from_limited(user, true);
             friend.is_favorite = favorites.contains(&friend.id);
             state.friends.insert(friend.id.clone(), friend);
@@ -321,11 +347,15 @@ impl Runtime {
                 } else {
                     user_id.clone()
                 };
-                let friend = state
-                    .friends
-                    .entry(key)
-                    .or_insert_with(|| Friend::from_user(user));
-                friend.apply_user(user);
+                if key.is_empty() {
+                    return;
+                }
+                let friend = state.friends.entry(key).or_default();
+                // A degraded/missing user payload (`User::default`) must not
+                // blank a known friend's fields.
+                if !user.id.is_empty() {
+                    friend.apply_user(user);
+                }
                 // The event kind is authoritative for presence: -online is
                 // in-game-eligible, -active is on web/app. An empty payload
                 // location clears the friend's stale instance.
@@ -345,13 +375,16 @@ impl Runtime {
                 } else {
                     user_id.clone()
                 };
-                let friend = state
-                    .friends
-                    .entry(key)
-                    .or_insert_with(|| Friend::from_user(user));
+                if key.is_empty() {
+                    return;
+                }
+                let friend = state.friends.entry(key).or_default();
                 // friend-add carries the friend's current `state`; an absent
-                // or offline state must not fabricate presence.
-                friend.apply_user(user);
+                // or offline state must not fabricate presence, and a
+                // degraded payload must not blank a known friend.
+                if !user.id.is_empty() {
+                    friend.apply_user(user);
+                }
             }
             PipelineEvent::FriendOffline { user_id, .. } => {
                 if let Some(friend) = state.friends.get_mut(user_id) {
@@ -376,7 +409,7 @@ impl Runtime {
                 let friend = state.friends.entry(key).or_default();
                 // Apply the user payload first — it can carry a stale
                 // location, so the event's own fields must overwrite it.
-                if let Some(user) = user {
+                if let Some(user) = user.as_ref().filter(|u| !u.id.is_empty()) {
                     friend.apply_user(user);
                 }
                 friend.location = location.clone();
@@ -397,8 +430,13 @@ impl Runtime {
                 } else {
                     user_id.clone()
                 };
+                if key.is_empty() {
+                    return;
+                }
                 let friend = state.friends.entry(key).or_default();
-                friend.apply_user(user);
+                if !user.id.is_empty() {
+                    friend.apply_user(user);
+                }
                 if friend.state == "offline" {
                     friend.mark_offline();
                 }
