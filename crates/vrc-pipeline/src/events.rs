@@ -259,8 +259,10 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
             id: str_field("id"),
             updates: content.get("updates").cloned().unwrap_or(Value::Null),
         },
-        "notification-v2-delete" => PipelineEvent::NotificationV2Delete {
-            ids: content
+        "notification-v2-delete" => {
+            // Documented content is `{id, version}` — one id per event.
+            // An `ids` array is tolerated in case a batch shape appears.
+            let mut ids: Vec<String> = content
                 .get("ids")
                 .and_then(Value::as_array)
                 .map(|ids| {
@@ -268,8 +270,14 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
                         .filter_map(|v| v.as_str().map(str::to_string))
                         .collect()
                 })
-                .unwrap_or_default(),
-        },
+                .unwrap_or_default();
+            if ids.is_empty() {
+                if let Some(id) = content.get("id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+            PipelineEvent::NotificationV2Delete { ids }
+        }
         "user-update" => PipelineEvent::UserUpdate {
             user_id: user_id(),
             user: user(),
@@ -414,6 +422,16 @@ mod tests {
                 if id == "ntf2_1" && updates["seen"] == true
         ));
 
+        // Documented shape: `{id, version}` — a single id per event.
+        let event =
+            decode(r#"{"type":"notification-v2-delete","content":{"id":"ntf2_1","version":3}}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::NotificationV2Delete { ref ids }
+                if ids == &["ntf2_1".to_string()]
+        ));
+        // An `ids` array is still tolerated.
         let event =
             decode(r#"{"type":"notification-v2-delete","content":{"ids":["ntf2_1","ntf2_2"]}}"#)
                 .unwrap();

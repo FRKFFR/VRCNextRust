@@ -203,7 +203,7 @@ pub enum Command {
         /// Must be `true`; anything else is rejected without an API call.
         confirm: bool,
     },
-    /// `POST /auth/user/playermoderate` — block/mute/etc. `Block` is
+    /// `POST /auth/user/playermoderations` — block/mute/etc. `Block` is
     /// destructive and requires `confirm: true`; the other kinds do not.
     ModerateUser {
         /// `usr_…` target id.
@@ -391,6 +391,10 @@ struct Runtime {
     /// Cancellation flag for the running multi-invite batch; `None` when
     /// no batch is active.
     multi_invite_cancel: Option<Arc<AtomicBool>>,
+    /// Detached tasks (multi-invite) report a dead session here; the
+    /// command loop performs the actual teardown.
+    session_expired_tx: mpsc::UnboundedSender<()>,
+    session_expired_rx: mpsc::UnboundedReceiver<()>,
 }
 
 async fn run(
@@ -453,6 +457,7 @@ async fn run(
         None
     };
 
+    let (session_expired_tx, session_expired_rx) = mpsc::unbounded_channel();
     let mut rt = Runtime {
         commands,
         events,
@@ -467,6 +472,8 @@ async fn run(
         log_events,
         local_writes: config.local_writes,
         multi_invite_cancel: None,
+        session_expired_tx,
+        session_expired_rx,
     };
     rt.state.write().log_tail_active = rt.log_events.is_some();
     loop {
@@ -481,6 +488,11 @@ async fn run(
                     rt.apply_pipeline_event(&event);
                     rt.ensure_world_names();
                     let _ = rt.events.send(AppEvent::Pipeline(Box::new(event)));
+                }
+            }
+            expired = rt.session_expired_rx.recv() => {
+                if expired.is_some() {
+                    rt.session_expired();
                 }
             }
             log = async {
@@ -1014,14 +1026,30 @@ impl Runtime {
             Some(user) => user,
             None => return,
         };
-        // The companion calls are best-effort: a failure leaves defaults
-        // rather than blanking the profile.
-        let friend_status = self.client.friend_status(user_id).await.unwrap_or_default();
-        let moderations = self
+        // The companion calls are best-effort — a failure leaves defaults
+        // rather than blanking the profile — but a rejected session still
+        // tears down like every other authenticated call.
+        let friend_status = match self.client.clone().friend_status(user_id).await {
+            Ok(status) => status,
+            Err(ApiError::Unauthorized) => {
+                self.session_expired();
+                return;
+            }
+            Err(_) => Default::default(),
+        };
+        let moderations = match self
             .client
+            .clone()
             .player_moderations(Some(user_id), None)
             .await
-            .unwrap_or_default();
+        {
+            Ok(list) => list,
+            Err(ApiError::Unauthorized) => {
+                self.session_expired();
+                return;
+            }
+            Err(_) => Vec::new(),
+        };
         self.state.write().profile = Some(ProfileView {
             user,
             friend_status,
@@ -1111,7 +1139,7 @@ impl Runtime {
         let _ = self.events.send(AppEvent::ProfileChanged);
     }
 
-    /// `POST /auth/user/playermoderate` — `Block` requires `confirm`.
+    /// `POST /auth/user/playermoderations` — `Block` requires `confirm`.
     async fn moderate_user(&mut self, user_id: &str, kind: PlayerModerationKind, confirm: bool) {
         if kind == PlayerModerationKind::Block && !confirm {
             self.report_message("blocking a user requires confirmation");
@@ -1125,13 +1153,16 @@ impl Runtime {
             None => return,
         };
         if let Some(profile) = self.state.write().profile.as_mut() {
-            if profile.user.id == user_id
-                && !profile
-                    .moderations
-                    .iter()
-                    .any(|m| m.id == created.id && !created.id.is_empty())
-            {
-                profile.moderations.push(created);
+            if profile.user.id == user_id {
+                // Dedupe on the moderation id when present, else on
+                // target+kind so an id-less response can't stack copies.
+                let duplicate = profile.moderations.iter().any(|m| {
+                    (!created.id.is_empty() && m.id == created.id)
+                        || (m.target_user_id == user_id && m.kind() == Some(kind))
+                });
+                if !duplicate {
+                    profile.moderations.push(created);
+                }
             }
         }
         let _ = self.events.send(AppEvent::ProfileChanged);
@@ -1253,6 +1284,7 @@ impl Runtime {
         let client = self.client.clone();
         let state = self.state.clone();
         let events = self.events.clone();
+        let session_expired_tx = self.session_expired_tx.clone();
         tokio::spawn(async move {
             let mut progress = MultiInviteProgress {
                 total,
@@ -1260,7 +1292,15 @@ impl Runtime {
                 ..Default::default()
             };
             let publish = |progress: &MultiInviteProgress| {
-                state.write().multi_invite = Some(progress.clone());
+                // Teardown (logout/401) clears the slot; keep emitting the
+                // event so waiters still see the batch end, but never
+                // resurrect session state afterwards.
+                {
+                    let mut guard = state.write();
+                    if guard.multi_invite.is_some() {
+                        guard.multi_invite = Some(progress.clone());
+                    }
+                }
                 let _ = events.send(AppEvent::MultiInviteProgress);
             };
             for target in targets {
@@ -1271,6 +1311,16 @@ impl Runtime {
                 publish(&progress);
                 match client.invite_user(&target, &instance, None).await {
                     Ok(_) => progress.succeeded += 1,
+                    Err(ApiError::Unauthorized) => {
+                        // The session is dead: count the attempt, stop the
+                        // batch and let the command loop tear the session
+                        // down — remaining targets are skipped.
+                        progress.failed += 1;
+                        progress.done += 1;
+                        progress.current = None;
+                        let _ = session_expired_tx.send(());
+                        break;
+                    }
                     Err(e) => {
                         progress.failed += 1;
                         state.write().last_error = Some(format!("invite {target}: {e}"));

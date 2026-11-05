@@ -241,6 +241,14 @@ async fn user_profile_friend_status_and_note_roundtrip() {
         .expect(1)
         .mount(&server)
         .await;
+    // Clearing a note returns a bare string, not a UserNote object.
+    Mock::given(method("POST"))
+        .and(path("/userNotes"))
+        .and(body_json(json!({"targetUserId": USER_ID, "note": ""})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!("User note cleared.")))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let client = test_client(&server);
     let user = client.user(USER_ID).await.unwrap();
@@ -250,6 +258,9 @@ async fn user_profile_friend_status_and_note_roundtrip() {
     assert!(status.is_friend);
     let note = client.set_user_note(USER_ID, "hi there").await.unwrap();
     assert_eq!(note.note, "hi there");
+    let cleared = client.set_user_note(USER_ID, "").await.unwrap();
+    assert_eq!(cleared.target_user_id, USER_ID);
+    assert!(cleared.note.is_empty());
     server.verify().await;
 }
 
@@ -393,7 +404,7 @@ async fn moderation_paths_use_documented_kinds() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/auth/user/playermoderate"))
+        .and(path("/auth/user/playermoderations"))
         .and(body_json(json!({"moderated": USER_ID, "type": "block"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "pmod_00000000-0000-0000-0000-000000000002",

@@ -79,15 +79,38 @@ impl Client {
     }
 
     /// `POST /userNotes` — create/update the current user's note on `user_id`.
+    ///
+    /// The documented response is `UserNote | string`: an empty `note`
+    /// clears the entry and the API answers with a plain string instead.
     pub async fn set_user_note(&self, user_id: &str, note: &str) -> Result<UserNote, ApiError> {
         check_user_id(user_id)?;
         let body = serde_json::json!({
             "targetUserId": user_id,
             "note": note,
         });
-        self.send_json(Method::POST, "/userNotes", Some(&body))
-            .await
+        let response: UserNoteResponse = self
+            .send_json(Method::POST, "/userNotes", Some(&body))
+            .await?;
+        Ok(match response {
+            UserNoteResponse::Note(note) => note,
+            UserNoteResponse::Cleared(message) => {
+                tracing::debug!("user note cleared: {message}");
+                UserNote {
+                    target_user_id: user_id.to_string(),
+                    ..UserNote::default()
+                }
+            }
+        })
     }
+}
+
+/// `UpdateUserNoteResponse` — `oneOf [UserNote, string]`; the string case
+/// is the "note cleared" acknowledgement.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum UserNoteResponse {
+    Note(UserNote),
+    Cleared(String),
 }
 
 #[cfg(test)]

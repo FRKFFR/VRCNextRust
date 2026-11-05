@@ -223,6 +223,17 @@ fn instance_card(
                             });
                             app.tab = Tab::Profile;
                         }
+                        if ui
+                            .small_button("invite")
+                            .on_hover_text("Invite to your instance")
+                            .clicked()
+                        {
+                            app.send(Command::InviteUser {
+                                user_id: friend.id.clone(),
+                                instance_id: None,
+                                message_slot: None,
+                            });
+                        }
                     });
                 }
             }
@@ -265,6 +276,17 @@ fn world_card(app: &mut VrcNextApp, ui: &mut egui::Ui, entry: &vrc_core::Dashboa
                             .size(12.0),
                     );
                     ui.label(&friend.display_name);
+                    if ui
+                        .small_button("invite")
+                        .on_hover_text("Invite to your instance")
+                        .clicked()
+                    {
+                        app.send(Command::InviteUser {
+                            user_id: friend.id.clone(),
+                            instance_id: None,
+                            message_slot: None,
+                        });
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (_, label) = crate::trust_badge(friend.trust_rank);
                         ui.weak(label);

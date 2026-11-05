@@ -46,12 +46,15 @@ pub(crate) fn notifications_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: 
     });
     ui.separator();
 
-    let Some(notifications) = &state.notifications else {
-        ui.label("No notifications loaded yet.");
-        return;
-    };
+    // v2 pushes can arrive before the first REST fetch; render whatever
+    // exists instead of hiding them behind the `None` early-return.
+    let notifications: &[vrc_core::Notification] = state.notifications.as_deref().unwrap_or(&[]);
     if notifications.is_empty() && state.notifications_v2.is_empty() {
-        ui.label("No notifications.");
+        ui.label(if state.notifications.is_none() {
+            "No notifications loaded yet."
+        } else {
+            "No notifications."
+        });
         return;
     }
 
@@ -216,6 +219,8 @@ pub(crate) fn profile_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSt
         if !profile.user.username.is_empty() {
             ui.label(format!("<{}>", profile.user.username));
         }
+        let (color, label) = crate::trust_badge(profile.user.trust_rank());
+        ui.colored_label(color, label);
         ui.separator();
         ui.strong(friend_status_label(&profile.friend_status));
     });

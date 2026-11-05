@@ -74,13 +74,13 @@ enum Commands {
         #[command(subcommand)]
         command: Option<NotificationCommand>,
     },
-    /// Invite a user to your current instance
+    /// Invite a user to an instance
     Invite {
         /// `usr_…` id of the user to invite
         user_id: String,
-        /// Instance id override (default: your current instance)
-        #[arg(long)]
-        instance: Option<String>,
+        /// Instance to invite to: `wrld_…:instanceId` or a bare instance id
+        /// (default: your current instance)
+        location: Option<String>,
         /// Custom invite message slot (0–11)
         #[arg(long)]
         slot: Option<u8>,
@@ -97,9 +97,10 @@ enum Commands {
     MultiInvite {
         /// `usr_…` ids of the users to invite (max 50)
         user_ids: Vec<String>,
-        /// Instance id override (default: your current instance)
+        /// Instance to invite to: `wrld_…:instanceId` or a bare instance id
+        /// (default: your current instance)
         #[arg(long)]
-        instance: Option<String>,
+        location: Option<String>,
     },
     /// Show a user's profile, friend status, note and moderations
     Profile {
@@ -199,11 +200,13 @@ async fn main() -> Result<()> {
         Commands::Notifications { command } => notifications(command).await,
         Commands::Invite {
             user_id,
-            instance,
+            location,
             slot,
-        } => invite(&user_id, instance, slot).await,
+        } => invite(&user_id, location.as_deref(), slot).await,
         Commands::RequestInvite { user_id, slot } => request_invite(&user_id, slot).await,
-        Commands::MultiInvite { user_ids, instance } => multi_invite(user_ids, instance).await,
+        Commands::MultiInvite { user_ids, location } => {
+            multi_invite(user_ids, location.as_deref()).await
+        }
         Commands::Profile { user_id } => profile(&user_id).await,
         Commands::Note { user_id, note } => set_note(&user_id, note).await,
     }
@@ -600,14 +603,23 @@ fn print_notifications(state: &vrc_core::AppState) {
     }
 }
 
-async fn invite(user_id: &str, instance: Option<String>, slot: Option<u8>) -> Result<()> {
+/// A `wrld_…:instanceId` location reduces to the bare instance id the
+/// invite endpoints want; a bare instance id passes through unchanged.
+fn instance_id_from_location(location: &str) -> &str {
+    location
+        .split_once(':')
+        .map(|(_, instance)| instance)
+        .unwrap_or(location)
+}
+
+async fn invite(user_id: &str, location: Option<&str>, slot: Option<u8>) -> Result<()> {
     let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
         .send(Command::InviteUser {
             user_id: user_id.to_string(),
-            instance_id: instance,
+            instance_id: location.map(|l| instance_id_from_location(l).to_string()),
             message_slot: slot,
         })
         .await?;
@@ -631,25 +643,25 @@ async fn request_invite(user_id: &str, slot: Option<u8>) -> Result<()> {
     Ok(())
 }
 
-async fn multi_invite(user_ids: Vec<String>, instance: Option<String>) -> Result<()> {
+async fn multi_invite(user_ids: Vec<String>, location: Option<&str>) -> Result<()> {
     let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
         .send(Command::MultiInvite {
             user_ids,
-            instance_id: instance,
+            instance_id: location.map(|l| instance_id_from_location(l).to_string()),
         })
         .await?;
 
-    // Print progress as it lands; Ctrl-C cancels the batch politely.
+    // Print progress as it lands; first Ctrl-C cancels the batch politely,
+    // a second one gives up waiting.
     let mut cancel_sent = false;
     loop {
         tokio::select! {
             event = handle.events.recv() => match event {
-                Ok(AppEvent::MultiInviteProgress) => {
-                    let p = handle.state.snapshot().multi_invite;
-                    if let Some(p) = p {
+                Ok(AppEvent::MultiInviteProgress) => match handle.state.snapshot().multi_invite {
+                    Some(p) => {
                         println!(
                             "{}/{} — {} sent, {} failed{}",
                             p.done,
@@ -665,14 +677,37 @@ async fn multi_invite(user_ids: Vec<String>, instance: Option<String>) -> Result
                             break;
                         }
                     }
+                    // The batch slot is gone — torn down mid-run.
+                    None => break,
+                },
+                // A command-level failure (bad ids, no instance) emits
+                // Error without ever publishing progress — bail instead
+                // of spinning forever. Mid-batch invite failures only
+                // update progress counters, they don't emit Error.
+                Ok(AppEvent::Error(m)) => {
+                    let running = handle
+                        .state
+                        .snapshot()
+                        .multi_invite
+                        .as_ref()
+                        .is_some_and(|p| p.running);
+                    if running {
+                        eprintln!("error: {m}");
+                    } else {
+                        bail!("multi-invite failed: {m}");
+                    }
                 }
-                Ok(AppEvent::Error(m)) => eprintln!("error: {m}"),
+                Ok(AppEvent::AuthChanged(AuthState::LoggedOut)) => break,
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break,
             },
-            _ = tokio::signal::ctrl_c(), if !cancel_sent => {
-                eprintln!("Cancelling after the in-flight invite…");
+            _ = tokio::signal::ctrl_c() => {
+                if cancel_sent {
+                    eprintln!("Giving up wait — the batch may still be running.");
+                    break;
+                }
+                eprintln!("Cancelling after the in-flight invite… (Ctrl-C again to quit)");
                 let _ = handle.commands.send(Command::CancelMultiInvite).await;
                 cancel_sent = true;
             }

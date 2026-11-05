@@ -1295,7 +1295,7 @@ async fn social_friend_moderation_and_invite_commands() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/auth/user/playermoderate"))
+        .and(path("/auth/user/playermoderations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "pmod_00000000-0000-0000-0000-000000000001",
             "created": "2026-01-02T03:04:05.000Z",

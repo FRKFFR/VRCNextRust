@@ -451,9 +451,10 @@ pub struct Notification {
 
 impl Notification {
     /// `true` for incoming friend requests (accepted via
-    /// `PUT …/notifications/{id}/accept`).
+    /// `PUT …/notifications/{id}/accept`). REST reports `friendRequest`;
+    /// pipeline pushes may use the kebab-case spelling.
     pub fn is_friend_request(&self) -> bool {
-        self.kind == "friendRequest"
+        matches!(self.kind.as_str(), "friendRequest" | "friend-request")
     }
 }
 

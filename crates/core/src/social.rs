@@ -114,17 +114,20 @@ pub fn merge_notification_v2(existing: &mut NotificationV2, updates: &Value) {
     }
 }
 
-/// Short label for a notification `type` value (v1 kinds plus common v2
-/// categories); unknown kinds render as-is.
+/// Short label for a notification `type` value. REST uses camelCase
+/// (`friendRequest`, `inviteResponse`, …) while pipeline pushes use the
+/// documented kebab-case spellings (`invite-response`, `vote-to-kick`, …);
+/// both map to the same label. Unknown kinds render as-is.
 pub fn notification_kind_label(kind: &str) -> &'static str {
     match kind {
-        "friendRequest" => "Friend request",
+        "friendRequest" | "friend-request" => "Friend request",
         "invite" => "Invite",
-        "inviteResponse" => "Invite response",
+        "inviteResponse" | "invite-response" => "Invite response",
         "message" => "Message",
-        "requestInvite" => "Invite request",
-        "requestInviteResponse" => "Invite request response",
-        "votetokick" => "Vote to kick",
+        "requestInvite" | "request-invite" => "Invite request",
+        "requestInviteResponse" | "request-invite-response" => "Invite request response",
+        "votetokick" | "vote-to-kick" => "Vote to kick",
+        "boop" => "Boop",
         "groupAnnouncement" => "Group announcement",
         "groupJoinRequest" => "Group join request",
         "groupJoinResponse" => "Group join response",
@@ -289,6 +292,28 @@ mod tests {
         // Non-object updates are ignored.
         merge_notification_v2(&mut v2, &serde_json::json!("nope"));
         assert_eq!(v2.title, "Updated");
+    }
+
+    #[test]
+    fn notification_kind_labels_cover_rest_and_pipeline_spellings() {
+        // REST camelCase and pipeline kebab-case spellings share labels.
+        assert_eq!(notification_kind_label("friendRequest"), "Friend request");
+        assert_eq!(notification_kind_label("friend-request"), "Friend request");
+        assert_eq!(
+            notification_kind_label("invite-response"),
+            "Invite response"
+        );
+        assert_eq!(notification_kind_label("request-invite"), "Invite request");
+        assert_eq!(
+            notification_kind_label("request-invite-response"),
+            "Invite request response"
+        );
+        assert_eq!(notification_kind_label("vote-to-kick"), "Vote to kick");
+        assert_eq!(
+            notification_kind_label("groupAnnouncement"),
+            "Group announcement"
+        );
+        assert_eq!(notification_kind_label("something-else"), "Notification");
     }
 
     #[test]

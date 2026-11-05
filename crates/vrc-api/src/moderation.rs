@@ -1,5 +1,5 @@
-//! Player-moderation endpoints: `GET /auth/user/playermoderations`,
-//! `POST /auth/user/playermoderate`, `PUT /auth/user/unplayermoderate`.
+//! Player-moderation endpoints: `GET`/`POST /auth/user/playermoderations`,
+//! `PUT /auth/user/unplayermoderate`.
 //!
 //! These cover block/unblock, mute/unmute and the avatar/interact toggles.
 
@@ -40,8 +40,8 @@ impl Client {
             .await
     }
 
-    /// `POST /auth/user/playermoderate` — apply a moderation (`{"moderated":
-    /// userId, "type": kind}`).
+    /// `POST /auth/user/playermoderations` — apply a moderation
+    /// (`{"moderated": userId, "type": kind}`).
     pub async fn moderate_user(
         &self,
         user_id: &str,
@@ -52,7 +52,7 @@ impl Client {
             "moderated": user_id,
             "type": kind.as_str(),
         });
-        self.send_json(Method::POST, "/auth/user/playermoderate", Some(&body))
+        self.send_json(Method::POST, "/auth/user/playermoderations", Some(&body))
             .await
     }
 

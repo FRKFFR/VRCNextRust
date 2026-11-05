@@ -75,8 +75,9 @@ impl Client {
         .await
     }
 
-    /// `PUT /auth/user/notifications/{id}/hide` — delete/hide it.
-    pub async fn hide_notification(&self, id: &str) -> Result<Notification, ApiError> {
+    /// `PUT /auth/user/notifications/{id}/hide` — delete/hide it; returns
+    /// the `Success` envelope like the other mutating actions.
+    pub async fn hide_notification(&self, id: &str) -> Result<crate::SuccessResponse, ApiError> {
         if !valid_notification_id(id) {
             return Err(ApiError::InvalidId(id.chars().take(64).collect()));
         }
