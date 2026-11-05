@@ -6,15 +6,18 @@
 //! of the login call only.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use secrecy::SecretString;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::broadcast;
 
 use vrc_core::{
-    sections, App, AppConfig, AppEvent, AppHandle, AuthState, Client, Command, KeyringVault,
-    TwoFactorMethod, USER_AGENT,
+    format, sections, App, AppConfig, AppEvent, AppHandle, AuthState, Client, Command,
+    KeyringVault, MemoryVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod,
+    USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -41,6 +44,74 @@ enum Commands {
     Watch,
     /// Log out and clear stored session cookies
     Logout,
+    /// Show the personal timeline parsed from VRChat output logs
+    Timeline {
+        /// Restrict to one event kind
+        #[arg(long, value_enum)]
+        kind: Option<TimelineKindArg>,
+        /// Case-insensitive text filter (name, world, location, path)
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based page index (50 rows per page)
+        #[arg(long, default_value_t = 0)]
+        page: u32,
+    },
+    /// Show time-spent statistics (worlds, friends)
+    Stats {
+        /// Time range to cover
+        #[arg(long, value_enum, default_value_t = StatsRangeArg::AllTime)]
+        range: StatsRangeArg,
+    },
+    /// Stream parsed VRChat log events until Ctrl-C (no login needed)
+    TailLogs {
+        /// Log directory override (default: the platform VRChat log dir)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// `--kind` values for `timeline` (kebab-case on the command line).
+#[derive(Clone, Copy, ValueEnum)]
+enum TimelineKindArg {
+    JoinedWorld,
+    LeftWorld,
+    PlayerJoined,
+    PlayerLeft,
+    PhotoTaken,
+}
+
+impl From<TimelineKindArg> for TimelineKind {
+    fn from(arg: TimelineKindArg) -> Self {
+        match arg {
+            TimelineKindArg::JoinedWorld => TimelineKind::JoinedWorld,
+            TimelineKindArg::LeftWorld => TimelineKind::LeftWorld,
+            TimelineKindArg::PlayerJoined => TimelineKind::PlayerJoined,
+            TimelineKindArg::PlayerLeft => TimelineKind::PlayerLeft,
+            TimelineKindArg::PhotoTaken => TimelineKind::PhotoTaken,
+        }
+    }
+}
+
+/// `--range` values for `stats` (mirrors the UI presets).
+#[derive(Clone, Copy, ValueEnum)]
+enum StatsRangeArg {
+    AllTime,
+    Last24h,
+    Last7d,
+    Last30d,
+}
+
+impl StatsRangeArg {
+    fn range(self) -> StatsRange {
+        let now = OffsetDateTime::now_utc();
+        let since = match self {
+            Self::AllTime => None,
+            Self::Last24h => Some(now - Duration::hours(24)),
+            Self::Last7d => Some(now - Duration::days(7)),
+            Self::Last30d => Some(now - Duration::days(30)),
+        };
+        StatsRange { since, until: None }
+    }
 }
 
 #[tokio::main]
@@ -55,6 +126,9 @@ async fn main() -> Result<()> {
         Commands::Friends => friends().await,
         Commands::Watch => watch().await,
         Commands::Logout => logout().await,
+        Commands::Timeline { kind, query, page } => timeline(kind, query, page).await,
+        Commands::Stats { range } => stats(range).await,
+        Commands::TailLogs { dir } => tail_logs(dir).await,
     }
 }
 
@@ -65,6 +139,27 @@ fn build_client() -> Result<Client> {
         .vault(vault)
         .build()
         .context("building the REST client")
+}
+
+/// Client for commands that never authenticate: local data comes from the
+/// SQLite store, so an in-memory vault keeps these working on machines
+/// without an OS secret service.
+fn build_local_client() -> Result<Client> {
+    Client::builder()
+        .vault(MemoryVault::new())
+        .build()
+        .context("building the REST client")
+}
+
+/// App config for every CLI command. The CLI shares `vrc.db` and the log
+/// directory with the desktop app, so it must not tail logs, persist
+/// events, or run session cleanup — a second writer would close live
+/// sessions and duplicate rows.
+fn cli_config(client: Client) -> AppConfig {
+    AppConfig {
+        local_writes: false,
+        ..AppConfig::new(client)
+    }
 }
 
 /// Wait for the next event matching `wanted`; errors abort the command.
@@ -99,7 +194,7 @@ async fn ensure_session(handle: &mut AppHandle) -> Result<()> {
 }
 
 async fn login(username: Option<String>) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
 
     let username = match username {
         Some(username) => username,
@@ -158,7 +253,7 @@ async fn login(username: Option<String>) -> Result<()> {
 }
 
 async fn me() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     let state = handle.state.snapshot();
     let user = state.current_user.context("no user despite session")?;
@@ -170,7 +265,7 @@ async fn me() -> Result<()> {
 }
 
 async fn friends() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await?;
     let state = handle.state.snapshot();
@@ -195,7 +290,7 @@ async fn friends() -> Result<()> {
 }
 
 async fn watch() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     println!("Watching pipeline events (Ctrl-C to stop)…");
     loop {
@@ -208,6 +303,9 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::WorldNameResolved { world_id }) => {
                     println!("world name resolved: {world_id}")
                 }
+                Ok(AppEvent::TimelineLoaded) => println!("timeline loaded"),
+                Ok(AppEvent::FriendHistoryLoaded) => println!("friend history loaded"),
+                Ok(AppEvent::StatsLoaded) => println!("stats loaded"),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }
@@ -220,12 +318,117 @@ async fn watch() -> Result<()> {
 }
 
 async fn logout() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     handle.commands.send(Command::Logout).await?;
     wait_for(&mut handle, |e| {
         matches!(e, AppEvent::AuthChanged(AuthState::LoggedOut))
     })
     .await?;
     println!("Logged out.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local data (M3): no login required — everything comes from the SQLite
+// store the core keeps under the platform data directory.
+// ---------------------------------------------------------------------------
+
+async fn timeline(kind: Option<TimelineKindArg>, query: Option<String>, page: u32) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    let kind = kind.map(TimelineKind::from);
+    let query = query.filter(|q| !q.trim().is_empty());
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page,
+            filter: TimelineFilter {
+                kind,
+                query,
+                ..TimelineFilter::default()
+            },
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await?;
+
+    let state = handle.state.snapshot();
+    let loaded = state.timeline.context("timeline query returned nothing")?;
+    for entry in &loaded.entries {
+        println!(
+            "{}  {:<14} {}",
+            format::fmt_ts(entry.ts),
+            format::kind_label(Some(entry.kind)),
+            format::timeline_summary(entry)
+        );
+    }
+    println!(
+        "-- page {} · {} of {} row(s) --",
+        page,
+        loaded.entries.len(),
+        loaded.total
+    );
+    Ok(())
+}
+
+async fn stats(range: StatsRangeArg) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::LoadStats {
+            range: range.range(),
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::StatsLoaded)).await?;
+
+    let state = handle.state.snapshot();
+    let stats = state.stats.context("stats query returned nothing")?;
+    println!(
+        "Total: {} across {} session(s)",
+        format::format_duration(stats.total_seconds),
+        stats.session_count
+    );
+    println!("Top worlds:");
+    if stats.top_worlds.is_empty() {
+        println!("  —");
+    }
+    for world in &stats.top_worlds {
+        println!(
+            "  {} — {} ({} session(s))",
+            format::world_label(world),
+            format::format_duration(world.seconds),
+            world.sessions
+        );
+    }
+    println!("Time with friends:");
+    if stats.top_friends.is_empty() {
+        println!("  —");
+    }
+    for friend in &stats.top_friends {
+        println!(
+            "  {} — {}",
+            friend.display_name,
+            format::format_duration(friend.seconds)
+        );
+    }
+    Ok(())
+}
+
+async fn tail_logs(dir: Option<PathBuf>) -> Result<()> {
+    let dir = dir
+        .or_else(vrc_core::default_log_dir)
+        .context("no VRChat log directory found; pass --dir")?;
+    if !dir.is_dir() {
+        bail!("log directory does not exist: {}", dir.display());
+    }
+    println!("Tailing {} (Ctrl-C to stop)", dir.display());
+    let mut events = vrc_core::LogTailer::watch(dir);
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => println!("{event}"),
+                None => break,
+            },
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
     Ok(())
 }

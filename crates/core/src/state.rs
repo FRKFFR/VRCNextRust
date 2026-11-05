@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use vrc_api::{CurrentUser, LimitedUser, TrustRank, TwoFactorMethod, User};
+use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
 /// Whether a session exists and in what stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,6 +203,24 @@ impl Default for WorldName {
     }
 }
 
+/// One page of personal-timeline rows plus the total match count.
+#[derive(Debug, Clone, Default)]
+pub struct TimelinePage {
+    /// Rows on this page (newest first).
+    pub entries: Vec<TimelineEntry>,
+    /// Total rows matching the query's filters.
+    pub total: u64,
+}
+
+/// One page of friend-history rows plus the total match count.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPage {
+    /// Rows on this page (newest first).
+    pub entries: Vec<FriendHistoryEntry>,
+    /// Total rows matching the query's filters.
+    pub total: u64,
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -218,6 +237,15 @@ pub struct AppState {
     /// World display names keyed by `wrld_…` id, resolved lazily by the
     /// dashboard's name-resolution task.
     pub world_names: HashMap<String, WorldName>,
+    /// Latest timeline page loaded via `LoadTimeline` (`None` until the
+    /// first query completes).
+    pub timeline: Option<TimelinePage>,
+    /// Latest friend-history page loaded via `LoadFriendHistory`.
+    pub friend_history: Option<HistoryPage>,
+    /// Latest statistics loaded via `LoadStats`.
+    pub stats: Option<Stats>,
+    /// Whether the VRChat output-log tailer is running.
+    pub log_tail_active: bool,
 }
 
 #[cfg(test)]

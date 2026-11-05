@@ -15,8 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vrc_core::{
     dashboard, search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle,
-    AppState, AuthState, Client, Command, MemoryVault, PipelineConfig, PipelineEvent,
-    PipelineStatus, TwoFactorMethod, WorldName,
+    AppState, AuthState, Client, Command, FriendHistoryFilter, MemoryVault, NewSession,
+    PipelineConfig, PipelineEvent, PipelineStatus, StatsRange, TimelineFilter, TimelineKind,
+    TwoFactorMethod, WorldName,
 };
 
 const CURRENT_USER: &str = include_str!("../../vrc-api/tests/fixtures/current_user.json");
@@ -159,6 +160,11 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
             url: format!("ws://127.0.0.1:{port}"),
             ..PipelineConfig::default()
         },
+        data_dir: None,
+        // Headless tests never touch the real log dir or data dir.
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -373,6 +379,11 @@ async fn login_needs_2fa_then_submit_2fa_authenticates() {
             url: format!("ws://127.0.0.1:{port}"),
             ..PipelineConfig::default()
         },
+        data_dir: None,
+        // Headless tests never touch the real log dir or data dir.
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -452,6 +463,11 @@ async fn unauthorized_on_refresh_tears_down_session() {
             url: format!("ws://127.0.0.1:{port}"),
             ..PipelineConfig::default()
         },
+        data_dir: None,
+        // Headless tests never touch the real log dir or data dir.
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -555,6 +571,11 @@ async fn dashboard_world_names_resolve_once_and_failures_are_cached() {
             url: format!("ws://127.0.0.1:{port}"),
             ..PipelineConfig::default()
         },
+        data_dir: None,
+        // Headless tests never touch the real log dir or data dir.
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -609,4 +630,339 @@ async fn dashboard_world_names_resolve_once_and_failures_are_cached() {
     assert_eq!(vrc_core::world_title(named), "Test World Name");
 
     server.verify().await;
+}
+
+/// Poll `cond` until it holds or ~10s elapse.
+async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A headless app with an in-memory store and a (possibly empty) log dir.
+fn headless_config(log_dir: std::path::PathBuf) -> (AppConfig, vrc_core::Store) {
+    let store = vrc_core::Store::open_in_memory().unwrap();
+    let config = AppConfig {
+        client: Client::builder()
+            .base_url("http://127.0.0.1:1")
+            .vault(MemoryVault::new())
+            .rate_limit(1_000.0, 100)
+            .build()
+            .unwrap(),
+        pipeline: PipelineConfig::default(),
+        data_dir: None,
+        log_dir: Some(log_dir),
+        store: Some(store.clone()),
+        local_writes: true,
+    };
+    (config, store)
+}
+
+#[tokio::test]
+async fn log_tail_persists_timeline_sessions_and_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, store) = headless_config(dir.path().to_path_buf());
+    let mut handle = App::spawn(config);
+    // `log_tail_active` is set once the core thread finishes startup.
+    assert!(wait_until(|| handle.state.snapshot().log_tail_active).await);
+
+    // Let the tailer's first directory scan complete so the file we write
+    // next counts as "new" (read from the start, not tailed-from-end).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    std::fs::write(
+        dir.path().join("output_log_2024-05-14_20-45-00.txt"),
+        concat!(
+            "2024.05.14 20:45:00 Log - [Behaviour] Joining wrld_00000000-0000-0000-0000-00000000000a:1234~region(us)\n",
+            "2024.05.14 20:45:01 Log - [Behaviour] Entering Room: Test World\n",
+            "2024.05.14 20:45:10 Log - [Behaviour] OnPlayerJoined Test Friend (usr_00000000-0000-0000-0000-000000000003)\n",
+            "2024.05.14 20:45:40 Log - [VRC Camera] Took screenshot to: C:\\fake\\pic.png\n",
+            "2024.05.14 20:46:00 Log - [Behaviour] OnLeftRoom\n",
+        ),
+    )
+    .unwrap();
+
+    // The store is shared with the test: wait until all five events landed.
+    assert!(
+        wait_until(|| {
+            store
+                .timeline()
+                .count(&TimelineFilter::default())
+                .unwrap_or(0)
+                == 5
+        })
+        .await,
+        "timeline rows never arrived"
+    );
+
+    // Commands surface the same rows through AppState.
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page: 0,
+            filter: TimelineFilter::default(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
+    let page = handle.state.snapshot().timeline.unwrap();
+    assert_eq!(page.total, 5);
+    assert_eq!(page.entries.len(), 5);
+    // Newest first: LeftWorld is the last log line.
+    assert_eq!(page.entries[0].kind, TimelineKind::LeftWorld);
+    assert!(page
+        .entries
+        .iter()
+        .any(|e| e.kind == TimelineKind::PhotoTaken && e.detail.contains("pic.png")));
+
+    // Kind filter narrows the page.
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page: 0,
+            filter: TimelineFilter {
+                kind: Some(TimelineKind::PlayerJoined),
+                ..TimelineFilter::default()
+            },
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
+    let page = handle.state.snapshot().timeline.unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.entries[0].display_name, "Test Friend");
+    assert_eq!(
+        page.entries[0].user_id,
+        "usr_00000000-0000-0000-0000-000000000003"
+    );
+
+    // The Joining/Entering pair produced ONE 60-second session named
+    // "Test World"; LeftWorld closed it.
+    handle
+        .commands
+        .send(Command::LoadStats {
+            range: StatsRange::default(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::StatsLoaded)).await;
+    let stats = handle.state.snapshot().stats.unwrap();
+    assert_eq!(stats.session_count, 1);
+    assert_eq!(stats.total_seconds, 60);
+    assert_eq!(stats.top_worlds.len(), 1);
+    assert_eq!(
+        stats.top_worlds[0].world_id,
+        "wrld_00000000-0000-0000-0000-00000000000a"
+    );
+    assert_eq!(stats.top_worlds[0].world_name, "Test World");
+    assert!(store.sessions().current().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn pipeline_events_persist_friend_history() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CURRENT_USER, "application/json")
+                .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorites"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frames_tx, mut frames_rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(text) = frames_rx.recv().await {
+            ws.send(Message::Text(text.into())).await.unwrap();
+        }
+    });
+
+    let store = vrc_core::Store::open_in_memory().unwrap();
+    let store_for_wait = store.clone();
+    let config = AppConfig {
+        client: Client::builder()
+            .base_url(server.uri())
+            .vault(MemoryVault::new())
+            .rate_limit(1_000.0, 100)
+            .build()
+            .unwrap(),
+        pipeline: PipelineConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            ..PipelineConfig::default()
+        },
+        data_dir: None,
+        log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
+        store: Some(store),
+        local_writes: true,
+    };
+    let mut handle = App::spawn(config);
+
+    handle
+        .commands
+        .send(Command::Login {
+            username: "testuser".to_string(),
+            password: SecretString::from("synthetic password"),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Authenticated))
+    })
+    .await;
+
+    frames_tx
+        .send(format!(
+            r#"{{"type":"friend-location","content":{{"userId":"{ONLINE_ID}","location":"wrld_00000000-0000-0000-0000-00000000000d:55~region(us)","worldId":"wrld_00000000-0000-0000-0000-00000000000d","user":{}}}}}"#,
+            pipeline_user(
+                ONLINE_ID,
+                "Test Online",
+                "wrld_00000000-0000-0000-0000-00000000000d:55~region(us)",
+                "online"
+            )
+        ))
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::Pipeline(ev) if matches!(&**ev, PipelineEvent::FriendLocation { .. }))
+    })
+    .await;
+
+    // The pipeline event was persisted through the store thread.
+    assert!(
+        wait_until(|| {
+            store_for_wait
+                .history()
+                .count(&FriendHistoryFilter::default())
+                .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "friend-history row never arrived"
+    );
+    let rows = store_for_wait
+        .history()
+        .list(&FriendHistoryFilter {
+            user_id: Some(ONLINE_ID.to_string()),
+            ..FriendHistoryFilter::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].user_id, ONLINE_ID);
+    assert_eq!(rows[0].display_name, "Test Online");
+    assert_eq!(
+        rows[0].world_id,
+        "wrld_00000000-0000-0000-0000-00000000000d"
+    );
+    assert_eq!(rows[0].instance_id, "55~region(us)");
+
+    // And queryable through the command path.
+    handle
+        .commands
+        .send(Command::LoadFriendHistory {
+            page: 0,
+            filter: FriendHistoryFilter {
+                user_id: Some(ONLINE_ID.to_string()),
+                ..FriendHistoryFilter::default()
+            },
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::FriendHistoryLoaded)).await;
+    let page = handle.state.snapshot().friend_history.unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.entries[0].user_id, ONLINE_ID);
+}
+
+#[tokio::test]
+async fn missing_log_dir_and_empty_store_start_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-dir");
+    let (config, _store) = headless_config(missing);
+    let mut handle = App::spawn(config);
+    assert!(!handle.state.snapshot().log_tail_active);
+
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page: 0,
+            filter: TimelineFilter::default(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
+    let page = handle.state.snapshot().timeline.unwrap();
+    assert_eq!(page.total, 0);
+    assert!(page.entries.is_empty());
+}
+
+/// A read-only instance (CLI `timeline`/`stats`) shares `vrc.db` with the
+/// desktop app: it must not tail logs, persist rows, or run
+/// `CloseAllSessions` over sessions the primary instance owns — while
+/// store queries keep working.
+#[tokio::test]
+async fn read_only_instance_neither_tails_nor_touches_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, store) = headless_config(dir.path().to_path_buf());
+    config.local_writes = false;
+
+    // Seed an open session the way a previous writer would leave it.
+    store
+        .sessions()
+        .open(&NewSession {
+            started_at: time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+            world_id: "wrld_seed".into(),
+            ..NewSession::default()
+        })
+        .unwrap();
+
+    let mut handle = App::spawn(config);
+    // Let the core thread finish startup (open store, build runtime).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The seeded session survived: no CloseAllSessions ran.
+    assert!(store.sessions().current().unwrap().is_some());
+    // No tailer was started.
+    assert!(!handle.state.snapshot().log_tail_active);
+
+    // Log lines written now produce no timeline rows.
+    std::fs::write(
+        dir.path().join("output_log_2024-05-14_20-45-00.txt"),
+        "2024.05.14 20:45:00 Log - [Behaviour] Joining wrld_00000000-0000-0000-0000-00000000000a:1~region(us)\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        store.timeline().count(&TimelineFilter::default()).unwrap(),
+        0
+    );
+
+    // Queries still work — this is the CLI read path.
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page: 0,
+            filter: TimelineFilter::default(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
+    assert_eq!(handle.state.snapshot().timeline.unwrap().total, 0);
 }

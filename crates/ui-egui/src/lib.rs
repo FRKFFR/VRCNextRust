@@ -6,13 +6,15 @@
 //! local form buffers, are moved into `SecretString`s on submit, and are
 //! never stored in `AppState` or logged (RULES.md §4).
 
+mod tabs;
+
 use eframe::egui;
 use secrecy::SecretString;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TrySendError;
 use vrc_core::{
-    dashboard, search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
-    PipelineStatus, StateHandle, TrustRank, TwoFactorMethod,
+    search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
+    PipelineStatus, StateHandle, TimelineKind, TrustRank, TwoFactorMethod,
 };
 
 /// Root eframe application.
@@ -28,6 +30,18 @@ pub struct VrcNextApp {
     twofa_index: usize,
     /// Live friend search query.
     search: String,
+    /// Active central-panel tab.
+    tab: tabs::Tab,
+    /// Timeline tab filter state.
+    timeline_kind: Option<TimelineKind>,
+    timeline_query: String,
+    timeline_page: u32,
+    /// Friend-history tab filter state (`history_user` = one `usr_…` id).
+    history_user: Option<String>,
+    history_query: String,
+    history_page: u32,
+    /// Stats tab range preset.
+    stats_preset: tabs::StatsPreset,
 }
 
 impl VrcNextApp {
@@ -40,6 +54,14 @@ impl VrcNextApp {
             code: String::new(),
             twofa_index: 0,
             search: String::new(),
+            tab: tabs::Tab::Dashboard,
+            timeline_kind: None,
+            timeline_query: String::new(),
+            timeline_page: 0,
+            history_user: None,
+            history_query: String::new(),
+            history_page: 0,
+            stats_preset: tabs::StatsPreset::AllTime,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).
@@ -205,33 +227,10 @@ impl VrcNextApp {
             });
     }
 
-    fn dashboard_panel(&self, ui: &mut egui::Ui, state: &AppState) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Friends' worlds");
-            ui.separator();
-            let entries = dashboard(state);
-            if entries.is_empty() {
-                ui.label("No friends in a world right now.");
-                return;
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("worlds_grid")
-                    .num_columns(2)
-                    .spacing(egui::vec2(12.0, 12.0))
-                    .show(ui, |ui| {
-                        for entry in &entries {
-                            world_card(ui, entry);
-                            ui.end_row();
-                        }
-                    });
-            });
-        });
-    }
-
     fn main_ui(&mut self, ui: &mut egui::Ui, state: &AppState) {
         self.top_bar(ui, state);
         self.friends_panel(ui, state);
-        self.dashboard_panel(ui, state);
+        tabs::central_panel(self, ui, state);
     }
 }
 
@@ -294,50 +293,6 @@ fn friend_row(ui: &mut egui::Ui, friend: &Friend) {
             ui.weak(detail);
         });
     });
-}
-
-/// One dashboard card: world name (or id while loading), instance id,
-/// friend count and the friends inside.
-fn world_card(ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_min_width(220.0);
-            ui.horizontal(|ui| {
-                ui.strong(vrc_core::world_title(entry));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!(
-                        "{} friend{}",
-                        entry.friends.len(),
-                        plural(entry.friends.len())
-                    ));
-                });
-            });
-            ui.small(egui::RichText::new(&entry.instance_id).monospace().weak());
-            ui.separator();
-            for friend in &entry.friends {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("●")
-                            .color(presence_color(friend))
-                            .size(12.0),
-                    );
-                    ui.label(&friend.display_name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (_, label) = trust_badge(friend.trust_rank);
-                        ui.weak(label);
-                    });
-                });
-            }
-        });
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
 }
 
 /// Trust rank → display label (low to high, matching `TrustRank` order).
@@ -493,12 +448,5 @@ mod tests {
         ] {
             assert!(!twofa_method_label(method).is_empty());
         }
-    }
-
-    #[test]
-    fn plural_only_for_non_one() {
-        assert_eq!(plural(0), "s");
-        assert_eq!(plural(1), "");
-        assert_eq!(plural(2), "s");
     }
 }

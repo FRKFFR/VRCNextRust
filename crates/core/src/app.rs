@@ -8,15 +8,20 @@
 //! (RULES.md §3). Secrets live only as `SecretString` inside commands and
 //! are never logged (RULES.md §4).
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use secrecy::SecretString;
-use tokio::sync::{broadcast, mpsc};
+use time::OffsetDateTime;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, TwoFactorMethod};
+use vrc_logs::{LogEvent, LogTailer};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
+use vrc_store::{FriendHistoryFilter, StatsRange, Store, TimelineFilter};
 
+use crate::local::{self, StoreOp};
 use crate::sections::worlds_with_friends;
 use crate::state::{valid_world_id, AppState, AuthState, Friend, PipelineStatus, WorldName};
 
@@ -27,6 +32,24 @@ pub struct AppConfig {
     pub client: Client,
     /// Pipeline connection tuning; override `url` in tests.
     pub pipeline: PipelineConfig,
+    /// Directory that holds `vrc.db`; `None` → the platform default data
+    /// directory (`directories`, application name `VRCNextRust`).
+    pub data_dir: Option<PathBuf>,
+    /// VRChat `output_log_*.txt` directory to tail; `None` →
+    /// [`vrc_logs::default_log_dir`]. A path that does not exist disables
+    /// tailing (used by headless tests).
+    pub log_dir: Option<PathBuf>,
+    /// A ready-made store — tests inject `Store::open_in_memory()`; `None`
+    /// → open `<data_dir>/vrc.db`.
+    pub store: Option<Store>,
+    /// Whether this instance owns local-data writes: it tails the VRChat
+    /// log, persists timeline/session/friend-history rows, and retires
+    /// orphaned sessions at startup.
+    ///
+    /// `false` for short-lived CLI instances sharing `vrc.db` with the
+    /// desktop app — a second writer would close sessions owned by the
+    /// primary instance and duplicate every row it parses.
+    pub local_writes: bool,
 }
 
 impl AppConfig {
@@ -34,6 +57,10 @@ impl AppConfig {
         Self {
             client,
             pipeline: PipelineConfig::default(),
+            data_dir: None,
+            log_dir: None,
+            store: None,
+            local_writes: true,
         }
     }
 }
@@ -100,6 +127,27 @@ pub enum Command {
     /// Re-fetch the friends list and favorites (the only re-fetch; pipeline
     /// events otherwise keep friends current).
     RefreshFriends,
+    /// Load a page of the personal timeline (parsed log events) into
+    /// `AppState.timeline`.
+    LoadTimeline {
+        /// Zero-based page index (multiplied by the page size).
+        page: u32,
+        /// Kind/text filters; the paging fields are derived from `page`.
+        filter: TimelineFilter,
+    },
+    /// Load a page of friend history (pipeline events) into
+    /// `AppState.friend_history`.
+    LoadFriendHistory {
+        /// Zero-based page index (multiplied by the page size).
+        page: u32,
+        /// Friend/text filters (`user_id` selects one friend).
+        filter: FriendHistoryFilter,
+    },
+    /// Compute time-spent statistics into `AppState.stats`.
+    LoadStats {
+        /// Time bounds; `StatsRange::default()` covers all time.
+        range: StatsRange,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -114,6 +162,9 @@ impl std::fmt::Debug for Command {
             Command::Logout => "Logout",
             Command::RefreshCurrentUser => "RefreshCurrentUser",
             Command::RefreshFriends => "RefreshFriends",
+            Command::LoadTimeline { .. } => "LoadTimeline",
+            Command::LoadFriendHistory { .. } => "LoadFriendHistory",
+            Command::LoadStats { .. } => "LoadStats",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -132,12 +183,21 @@ pub enum AppEvent {
     /// A world's display name finished resolving (success or failure);
     /// `AppState.world_names` was updated.
     WorldNameResolved { world_id: String },
+    /// `AppState.timeline` was updated by `LoadTimeline`.
+    TimelineLoaded,
+    /// `AppState.friend_history` was updated by `LoadFriendHistory`.
+    FriendHistoryLoaded,
+    /// `AppState.stats` was updated by `LoadStats`.
+    StatsLoaded,
     /// A command failed (message carries no secrets).
     Error(String),
 }
 
 /// How long a failed world-name lookup is cached before retrying.
 const WORLD_NAME_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// Rows per page for the timeline / friend-history queries.
+pub const LOCAL_PAGE_SIZE: u32 = 50;
 
 /// The application core; drives the leaf crates and serves front ends.
 pub struct App;
@@ -181,6 +241,13 @@ struct Runtime {
         mpsc::UnboundedSender<PipelineEvent>,
         mpsc::UnboundedReceiver<PipelineEvent>,
     ),
+    /// Sender into the dedicated store thread; `None` when no store could
+    /// be opened (local data features degrade to no-ops).
+    store_tx: Option<std::sync::mpsc::Sender<StoreOp>>,
+    /// Parsed VRChat log events; `None` once the tailer has ended.
+    log_events: Option<mpsc::UnboundedReceiver<LogEvent>>,
+    /// `AppConfig::local_writes` — gates store writes (queries still work).
+    local_writes: bool,
 }
 
 async fn run(
@@ -189,15 +256,75 @@ async fn run(
     events: broadcast::Sender<AppEvent>,
     state: Arc<RwLock<AppState>>,
 ) {
+    // The log directory feeds both orphan-session cleanup (its newest
+    // file's mtime bounds when VRChat was last alive) and the tailer.
+    let log_dir = resolve_log_dir(&config).filter(|dir| dir.is_dir());
+
+    // Resolve + open the local store before building the runtime so a
+    // broken database degrades to "no local data" instead of killing the
+    // app (headless tests inject `config.store` directly).
+    let store_tx = match open_store(&config) {
+        Ok(Some(store)) => {
+            let tx = local::spawn_store_thread(store);
+            if config.local_writes {
+                // Retire sessions orphaned by a previous run (tailer
+                // restart / app restart) before any new session ops
+                // arrive. They ended when VRChat last wrote its log —
+                // closing them at app-start `now` would credit the whole
+                // downtime gap (e.g. after a crash) to the session.
+                let orphan_end = log_dir
+                    .as_deref()
+                    .and_then(vrc_logs::newest_log_mtime)
+                    .map(OffsetDateTime::from)
+                    .map(|mtime| mtime.min(OffsetDateTime::now_utc()))
+                    .unwrap_or_else(OffsetDateTime::now_utc);
+                let _ = tx.send(StoreOp::CloseAllSessions { ts: orphan_end });
+            }
+            Some(tx)
+        }
+        Ok(None) => None,
+        Err(message) => {
+            tracing::warn!("vrc-core: local store unavailable: {message}");
+            state.write().unwrap_or_else(|e| e.into_inner()).last_error = Some(message.clone());
+            let _ = events.send(AppEvent::Error(message));
+            None
+        }
+    };
+
+    // Start the VRChat log tailer only when this instance writes local
+    // data and the directory exists.
+    let log_events = if config.local_writes {
+        log_dir.map(|dir| {
+            let (tx, rx) = mpsc::unbounded_channel::<LogEvent>();
+            tokio::spawn(async move {
+                let mut stream = LogTailer::watch(dir);
+                while let Some(event) = stream.recv().await {
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            rx
+        })
+    } else {
+        None
+    };
+
     let mut rt = Runtime {
         commands,
         events,
-        state: StateHandle { inner: state },
+        state: StateHandle {
+            inner: state.clone(),
+        },
         client: config.client,
         pipeline_config: config.pipeline,
         pipeline: None,
         pipeline_events: mpsc::unbounded_channel(),
+        store_tx,
+        log_events,
+        local_writes: config.local_writes,
     };
+    rt.state.write().log_tail_active = rt.log_events.is_some();
     loop {
         tokio::select! {
             cmd = rt.commands.recv() => match cmd {
@@ -206,9 +333,22 @@ async fn run(
             },
             ev = rt.pipeline_events.1.recv() => {
                 if let Some(event) = ev {
+                    rt.persist_pipeline_event(&event);
                     rt.apply_pipeline_event(&event);
                     rt.ensure_world_names();
                     let _ = rt.events.send(AppEvent::Pipeline(Box::new(event)));
+                }
+            }
+            log = async {
+                match rt.log_events.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match log {
+                    Some(event) => rt.apply_log_event(&event),
+                    // The tailer stopped for good; disable this branch.
+                    None => rt.log_events = None,
                 }
             }
         }
@@ -216,6 +356,46 @@ async fn run(
     if let Some(handle) = rt.pipeline.take() {
         handle.shutdown();
     }
+}
+
+/// The configured store, or `None` when `AppConfig.store` is unset and no
+/// data directory can be resolved.
+fn open_store(config: &AppConfig) -> Result<Option<Store>, String> {
+    if let Some(store) = &config.store {
+        return Ok(Some(store.clone()));
+    }
+    let Some(dir) = config.data_dir.clone().or_else(default_data_dir) else {
+        return Ok(None);
+    };
+    Store::open(&dir.join("vrc.db"))
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Platform default data directory (`%APPDATA%\VRCNextRust\data` on
+/// Windows, XDG data dir on Linux, …).
+fn default_data_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "VRCNextRust").map(|dirs| dirs.data_dir().to_path_buf())
+}
+
+/// The log directory to tail: explicit config wins, otherwise the
+/// platform default (`vrc_logs::default_log_dir`).
+fn resolve_log_dir(config: &AppConfig) -> Option<PathBuf> {
+    config.log_dir.clone().or_else(vrc_logs::default_log_dir)
+}
+
+/// Surface a local-store failure like a command error: `last_error` for
+/// the UI's error line and `AppEvent::Error` so CLI `wait_for` callers
+/// see the real SQLite error instead of a bare timeout.
+fn report_store_error(
+    state: &StateHandle,
+    events: &broadcast::Sender<AppEvent>,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    tracing::debug!("vrc-core: local store query failed: {message}");
+    state.write().last_error = Some(message.clone());
+    let _ = events.send(AppEvent::Error(message));
 }
 
 impl Runtime {
@@ -268,6 +448,136 @@ impl Runtime {
                 Err(ApiError::Unauthorized) => self.session_expired(),
                 Err(e) => self.report(e),
             },
+            Command::LoadTimeline { page, filter } => self.load_timeline(page, filter),
+            Command::LoadFriendHistory { page, filter } => self.load_friend_history(page, filter),
+            Command::LoadStats { range } => self.load_stats(range),
+        }
+    }
+
+    /// Run a timeline query on the store thread and publish the page.
+    fn load_timeline(&self, page: u32, mut filter: TimelineFilter) {
+        let Some(tx) = self.store_tx.clone() else {
+            return;
+        };
+        filter.offset = page.saturating_mul(LOCAL_PAGE_SIZE);
+        filter.limit = LOCAL_PAGE_SIZE;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(StoreOp::QueryTimeline {
+                filter,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            report_store_error(&self.state, &self.events, "local store is not running");
+            return;
+        }
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok(page)) => {
+                    state.write().timeline = Some(page);
+                    let _ = events.send(AppEvent::TimelineLoaded);
+                }
+                Ok(Err(message)) => report_store_error(&state, &events, message),
+                Err(_) => report_store_error(&state, &events, "local store stopped responding"),
+            }
+        });
+    }
+
+    /// Run a friend-history query on the store thread and publish the page.
+    fn load_friend_history(&self, page: u32, mut filter: FriendHistoryFilter) {
+        let Some(tx) = self.store_tx.clone() else {
+            return;
+        };
+        filter.offset = page.saturating_mul(LOCAL_PAGE_SIZE);
+        filter.limit = LOCAL_PAGE_SIZE;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(StoreOp::QueryHistory {
+                filter,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            report_store_error(&self.state, &self.events, "local store is not running");
+            return;
+        }
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok(page)) => {
+                    state.write().friend_history = Some(page);
+                    let _ = events.send(AppEvent::FriendHistoryLoaded);
+                }
+                Ok(Err(message)) => report_store_error(&state, &events, message),
+                Err(_) => report_store_error(&state, &events, "local store stopped responding"),
+            }
+        });
+    }
+
+    /// Run a stats query on the store thread and publish the result.
+    fn load_stats(&self, range: StatsRange) {
+        let Some(tx) = self.store_tx.clone() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(StoreOp::QueryStats {
+                range,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            report_store_error(&self.state, &self.events, "local store is not running");
+            return;
+        }
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok(stats)) => {
+                    state.write().stats = Some(stats);
+                    let _ = events.send(AppEvent::StatsLoaded);
+                }
+                Ok(Err(message)) => report_store_error(&state, &events, message),
+                Err(_) => report_store_error(&state, &events, "local store stopped responding"),
+            }
+        });
+    }
+
+    /// Queue a friend-history row for a pipeline event (no-op without a
+    /// store or when this instance doesn't own local-data writes). Runs
+    /// *before* [`Self::apply_pipeline_event`] so the friends map still
+    /// holds pre-event names for degraded payloads.
+    fn persist_pipeline_event(&self, event: &PipelineEvent) {
+        if !self.local_writes {
+            return;
+        }
+        let Some(tx) = &self.store_tx else {
+            return;
+        };
+        let state = self.state.read();
+        let Some(entry) = local::history_entry_for(event, &state.friends) else {
+            return;
+        };
+        drop(state);
+        let _ = tx.send(StoreOp::History(entry));
+    }
+
+    /// Queue the store ops a parsed log event implies (timeline row +
+    /// session bookkeeping).
+    fn apply_log_event(&self, event: &LogEvent) {
+        if !self.local_writes {
+            return;
+        }
+        let Some(tx) = &self.store_tx else {
+            return;
+        };
+        for op in local::ops_for_log_event(event) {
+            let _ = tx.send(op);
         }
     }
 
