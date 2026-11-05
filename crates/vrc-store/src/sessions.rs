@@ -128,12 +128,14 @@ impl SessionRepo {
     }
 
     /// Close every still-open session at `ended_at` — used at startup to
-    /// retire sessions orphaned by a previous app run.
+    /// retire sessions orphaned by a previous app run. `ended_at` is
+    /// clamped to `started_at` so clock skew can't produce negative
+    /// durations.
     /// Returns the number of sessions closed.
     pub fn close_all_open(&self, ended_at: OffsetDateTime) -> Result<u64, StoreError> {
         let conn = lock(&self.conn);
         let changed = conn.execute(
-            "UPDATE sessions SET ended_at = ?1 WHERE ended_at IS NULL",
+            "UPDATE sessions SET ended_at = MAX(?1, started_at) WHERE ended_at IS NULL",
             params![ts_to_i64(ended_at)],
         )?;
         Ok(changed as u64)
@@ -225,6 +227,24 @@ mod tests {
         assert!(repo.current().unwrap().is_none());
         // Closing twice is a no-op.
         repo.close(id, t0 + Duration::seconds(90)).unwrap();
+    }
+
+    #[test]
+    fn close_all_open_clamps_end_to_start() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = store.sessions();
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        repo.open(&NewSession {
+            started_at: t0,
+            ..NewSession::default()
+        })
+        .unwrap();
+        // An end bound before the session start clamps to started_at.
+        repo.close_all_open(t0 - Duration::hours(1)).unwrap();
+        let conn = lock(&repo.conn);
+        let rows = sessions_in_range(&conn, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ended_at, Some(t0));
     }
 
     #[test]

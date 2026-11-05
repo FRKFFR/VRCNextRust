@@ -13,7 +13,8 @@ use vrc_core::{
 
 use crate::VrcNextApp;
 
-/// Command dispatch for the data tabs: (re)load page 0 of the active view.
+/// Command dispatch for the data tabs: (re)load the current page of the
+/// active view.
 impl VrcNextApp {
     pub(crate) fn reload_timeline(&self) {
         self.send(Command::LoadTimeline {
@@ -84,7 +85,7 @@ impl StatsPreset {
     }
 }
 
-/// Switch tabs; entering a data tab (re)loads its first page.
+/// Switch tabs; entering a data tab (re)loads its current page.
 pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
     if app.tab == tab {
         return;
@@ -279,11 +280,18 @@ fn history_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
         // Friend picker: all friends + "All friends".
         let mut friends: Vec<_> = state.friends.values().collect();
         friends.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        // A `history_user` whose friend was removed still filters the
+        // query — show the raw id rather than the misleading "All friends".
         let selected = app
             .history_user
             .as_ref()
-            .and_then(|id| friends.iter().find(|f| &f.id == id))
-            .map(|f| f.display_name.clone())
+            .map(|id| {
+                friends
+                    .iter()
+                    .find(|f| &f.id == id)
+                    .map(|f| f.display_name.clone())
+                    .unwrap_or_else(|| id.clone())
+            })
             .unwrap_or_else(|| "All friends".to_string());
         egui::ComboBox::from_label("Friend")
             .selected_text(selected)

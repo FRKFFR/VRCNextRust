@@ -10,7 +10,7 @@
 
 mod tail;
 
-pub use tail::{LogEvents, LogTailer};
+pub use tail::{newest_log_mtime, LogEvents, LogTailer};
 
 use std::fmt;
 use std::path::PathBuf;

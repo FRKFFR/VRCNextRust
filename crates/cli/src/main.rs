@@ -151,6 +151,17 @@ fn build_local_client() -> Result<Client> {
         .context("building the REST client")
 }
 
+/// App config for every CLI command. The CLI shares `vrc.db` and the log
+/// directory with the desktop app, so it must not tail logs, persist
+/// events, or run session cleanup — a second writer would close live
+/// sessions and duplicate rows.
+fn cli_config(client: Client) -> AppConfig {
+    AppConfig {
+        local_writes: false,
+        ..AppConfig::new(client)
+    }
+}
+
 /// Wait for the next event matching `wanted`; errors abort the command.
 /// Times out rather than hanging forever.
 async fn wait_for(handle: &mut AppHandle, wanted: impl Fn(&AppEvent) -> bool) -> Result<AppEvent> {
@@ -183,7 +194,7 @@ async fn ensure_session(handle: &mut AppHandle) -> Result<()> {
 }
 
 async fn login(username: Option<String>) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
 
     let username = match username {
         Some(username) => username,
@@ -242,7 +253,7 @@ async fn login(username: Option<String>) -> Result<()> {
 }
 
 async fn me() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     let state = handle.state.snapshot();
     let user = state.current_user.context("no user despite session")?;
@@ -254,7 +265,7 @@ async fn me() -> Result<()> {
 }
 
 async fn friends() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await?;
     let state = handle.state.snapshot();
@@ -279,7 +290,7 @@ async fn friends() -> Result<()> {
 }
 
 async fn watch() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     ensure_session(&mut handle).await?;
     println!("Watching pipeline events (Ctrl-C to stop)…");
     loop {
@@ -307,7 +318,7 @@ async fn watch() -> Result<()> {
 }
 
 async fn logout() -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_client()?));
+    let mut handle = App::spawn(cli_config(build_client()?));
     handle.commands.send(Command::Logout).await?;
     wait_for(&mut handle, |e| {
         matches!(e, AppEvent::AuthChanged(AuthState::LoggedOut))
@@ -323,7 +334,7 @@ async fn logout() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn timeline(kind: Option<TimelineKindArg>, query: Option<String>, page: u32) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_local_client()?));
+    let mut handle = App::spawn(cli_config(build_local_client()?));
     let kind = kind.map(TimelineKind::from);
     let query = query.filter(|q| !q.trim().is_empty());
     handle
@@ -359,7 +370,7 @@ async fn timeline(kind: Option<TimelineKindArg>, query: Option<String>, page: u3
 }
 
 async fn stats(range: StatsRangeArg) -> Result<()> {
-    let mut handle = App::spawn(AppConfig::new(build_local_client()?));
+    let mut handle = App::spawn(cli_config(build_local_client()?));
     handle
         .commands
         .send(Command::LoadStats {

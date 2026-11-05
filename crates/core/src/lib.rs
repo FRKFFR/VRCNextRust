@@ -32,6 +32,6 @@ pub use vrc_logs::{default_log_dir, LogEvent, LogTailer};
 pub use vrc_pipeline::PipelineConfig;
 pub use vrc_pipeline::PipelineEvent;
 pub use vrc_store::{
-    FriendEvent, FriendHistoryEntry, FriendHistoryFilter, FriendTime, Stats, StatsRange, Store,
-    TimelineEntry, TimelineFilter, TimelineKind, WorldTime,
+    FriendEvent, FriendHistoryEntry, FriendHistoryFilter, FriendTime, NewSession, Stats,
+    StatsRange, Store, TimelineEntry, TimelineFilter, TimelineKind, WorldTime,
 };

@@ -176,6 +176,15 @@ fn newest_log(dir: &Path) -> Option<(PathBuf, SystemTime)> {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
 }
 
+/// Modification time of the newest `output_log*.txt` in `dir`, if any.
+///
+/// The file's last write is the best available "VRChat was last alive"
+/// timestamp — callers use it to bound orphaned-session cleanup instead
+/// of the (much later) app-start time.
+pub fn newest_log_mtime(dir: &Path) -> Option<SystemTime> {
+    newest_log(dir).map(|(_, modified)| modified)
+}
+
 /// Open `path` for tailing. Pre-existing files start at their end (only
 /// appended bytes are read); new files start at 0 so their whole content —
 /// written between creation and our next poll — is not lost.
@@ -355,5 +364,22 @@ mod tests {
         assert!(!is_log_file(Path::new("output_log_2024.txt.bak")));
         assert!(!is_log_file(Path::new("config.json")));
         assert!(!is_log_file(Path::new("player.log")));
+    }
+
+    #[test]
+    fn newest_log_mtime_tracks_latest_write() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(newest_log_mtime(dir.path()).is_none());
+        let a = dir.path().join("output_log_a.txt");
+        let b = dir.path().join("output_log_b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        // Non-log files are ignored.
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        let mtime = newest_log_mtime(dir.path()).expect("a log file exists");
+        for file in [&a, &b] {
+            let file_mtime = std::fs::metadata(file).unwrap().modified().unwrap();
+            assert!(mtime >= file_mtime);
+        }
     }
 }

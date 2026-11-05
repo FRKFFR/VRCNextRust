@@ -15,9 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vrc_core::{
     dashboard, search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle,
-    AppState, AuthState, Client, Command, FriendHistoryFilter, MemoryVault, PipelineConfig,
-    PipelineEvent, PipelineStatus, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod,
-    WorldName,
+    AppState, AuthState, Client, Command, FriendHistoryFilter, MemoryVault, NewSession,
+    PipelineConfig, PipelineEvent, PipelineStatus, StatsRange, TimelineFilter, TimelineKind,
+    TwoFactorMethod, WorldName,
 };
 
 const CURRENT_USER: &str = include_str!("../../vrc-api/tests/fixtures/current_user.json");
@@ -164,6 +164,7 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
         // Headless tests never touch the real log dir or data dir.
         log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
         store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -382,6 +383,7 @@ async fn login_needs_2fa_then_submit_2fa_authenticates() {
         // Headless tests never touch the real log dir or data dir.
         log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
         store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -465,6 +467,7 @@ async fn unauthorized_on_refresh_tears_down_session() {
         // Headless tests never touch the real log dir or data dir.
         log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
         store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -572,6 +575,7 @@ async fn dashboard_world_names_resolve_once_and_failures_are_cached() {
         // Headless tests never touch the real log dir or data dir.
         log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
         store: Some(vrc_core::Store::open_in_memory().unwrap()),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -653,6 +657,7 @@ fn headless_config(log_dir: std::path::PathBuf) -> (AppConfig, vrc_core::Store) 
         data_dir: None,
         log_dir: Some(log_dir),
         store: Some(store.clone()),
+        local_writes: true,
     };
     (config, store)
 }
@@ -806,6 +811,7 @@ async fn pipeline_events_persist_friend_history() {
         data_dir: None,
         log_dir: Some(std::path::PathBuf::from("vrc-core-test-no-such-log-dir")),
         store: Some(store),
+        local_writes: true,
     };
     let mut handle = App::spawn(config);
 
@@ -905,4 +911,58 @@ async fn missing_log_dir_and_empty_store_start_cleanly() {
     let page = handle.state.snapshot().timeline.unwrap();
     assert_eq!(page.total, 0);
     assert!(page.entries.is_empty());
+}
+
+/// A read-only instance (CLI `timeline`/`stats`) shares `vrc.db` with the
+/// desktop app: it must not tail logs, persist rows, or run
+/// `CloseAllSessions` over sessions the primary instance owns — while
+/// store queries keep working.
+#[tokio::test]
+async fn read_only_instance_neither_tails_nor_touches_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, store) = headless_config(dir.path().to_path_buf());
+    config.local_writes = false;
+
+    // Seed an open session the way a previous writer would leave it.
+    store
+        .sessions()
+        .open(&NewSession {
+            started_at: time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+            world_id: "wrld_seed".into(),
+            ..NewSession::default()
+        })
+        .unwrap();
+
+    let mut handle = App::spawn(config);
+    // Let the core thread finish startup (open store, build runtime).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The seeded session survived: no CloseAllSessions ran.
+    assert!(store.sessions().current().unwrap().is_some());
+    // No tailer was started.
+    assert!(!handle.state.snapshot().log_tail_active);
+
+    // Log lines written now produce no timeline rows.
+    std::fs::write(
+        dir.path().join("output_log_2024-05-14_20-45-00.txt"),
+        "2024.05.14 20:45:00 Log - [Behaviour] Joining wrld_00000000-0000-0000-0000-00000000000a:1~region(us)\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        store.timeline().count(&TimelineFilter::default()).unwrap(),
+        0
+    );
+
+    // Queries still work — this is the CLI read path.
+    handle
+        .commands
+        .send(Command::LoadTimeline {
+            page: 0,
+            filter: TimelineFilter::default(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| matches!(e, AppEvent::TimelineLoaded)).await;
+    assert_eq!(handle.state.snapshot().timeline.unwrap().total, 0);
 }

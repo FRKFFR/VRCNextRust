@@ -5,6 +5,9 @@
 //! open/close ordering is preserved and the Tokio runtime is never blocked.
 //! The thread owns the "currently open world session" so `JoinedWorld` /
 //! `LeftWorld` pairs from the log tailer can never interleave incorrectly.
+//! A single consumer thread is used instead of per-call `spawn_blocking`
+//! because store ops must be applied strictly in arrival order — parallel
+//! blocking tasks could reorder a session close ahead of its join.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
