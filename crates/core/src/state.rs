@@ -64,18 +64,35 @@ pub struct Friend {
     pub developer_type: String,
     /// `bio`.
     pub bio: String,
-    /// Currently online or active (set by the friends fetch and by
-    /// presence events — not recomputed per render).
-    pub is_online: bool,
+    /// Presence state — `online` (in-game), `active` (web/app) or `offline`
+    /// — set by the friends fetch and kept current by presence events (not
+    /// recomputed per render).
+    pub state: String,
     /// Present in the `type=friend` favorites list.
     pub is_favorite: bool,
 }
 
 impl Friend {
-    /// Build a `Friend` from a `GET /friends` entry. `is_online` reflects
-    /// which variant of the endpoint produced the entry.
+    /// True while the friend is online or active (`state != "offline"`).
+    /// An unset/unknown state counts as offline.
+    pub fn is_online(&self) -> bool {
+        matches!(self.state.as_str(), "online" | "active")
+    }
+
+    /// Build a `Friend` from a `GET /auth/user/friends` entry. `online`
+    /// reflects which variant of the endpoint produced the entry.
     pub fn from_limited(user: &LimitedUser, online: bool) -> Self {
-        let mut friend = Self {
+        let state = if !online || user.location == "offline" {
+            "offline".to_string()
+        } else if !user.state.is_empty() {
+            user.state.clone()
+        } else if user.location.is_empty() {
+            // On the friends list without an instance — on web/app.
+            "active".to_string()
+        } else {
+            "online".to_string()
+        };
+        Self {
             id: user.id.clone(),
             display_name: user.display_name.clone(),
             username: user.username.clone(),
@@ -94,19 +111,15 @@ impl Friend {
             trust_rank: user.trust_rank(),
             developer_type: user.developer_type.clone(),
             bio: user.bio.clone(),
-            is_online: online,
+            state,
             is_favorite: false,
-        };
-        friend.is_online = online && !matches!(friend.location.as_str(), "offline");
-        friend
+        }
     }
 
-    /// Build a `Friend` from a pipeline `user` object (seen only while the
-    /// friend is online).
+    /// Build a `Friend` from a pipeline `user` object.
     pub fn from_user(user: &User) -> Self {
         let mut friend = Self::default();
         friend.apply_user(user);
-        friend.is_online = true;
         friend
     }
 
@@ -136,11 +149,14 @@ impl Friend {
         self.trust_rank = user.trust_rank();
         self.developer_type = user.developer_type.clone();
         self.bio = user.bio.clone();
+        if !user.state.is_empty() {
+            self.state = user.state.clone();
+        }
     }
 
     /// Mark offline: clear presence fields.
     pub fn mark_offline(&mut self) {
-        self.is_online = false;
+        self.state = "offline".to_string();
         self.location.clear();
         self.world_id.clear();
     }

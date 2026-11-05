@@ -175,7 +175,10 @@ async fn connect_loop(
             result = timeout(CONNECT_TIMEOUT, handshake(&config.url, &token)) => match result {
                 Ok(Ok(stream)) => Some(stream),
                 Ok(Err(e)) => {
-                    tracing::debug!("pipeline: handshake failed: {e}");
+                    // Error text could echo the request URI (which contains
+                    // the token) — strip it before logging (RULES.md §4).
+                    let message = sanitize(&e.to_string(), &token);
+                    tracing::debug!("pipeline: handshake failed: {message}");
                     let _ = tx
                         .send(PipelineEvent::Disconnected {
                             reason: "handshake failed".to_string(),
@@ -269,7 +272,7 @@ async fn handshake(
     let uri = format!(
         "{}/?authToken={}",
         url.trim_end_matches('/'),
-        token.expose_secret()
+        percent_encode(token.expose_secret())
     );
     let mut request = uri.into_client_request()?;
     request
@@ -285,6 +288,30 @@ fn backoff(attempt: u32, rng: &mut u64, config: &PipelineConfig) -> Duration {
     let base = config.min_backoff.saturating_mul(1u32 << attempt.min(9));
     let jitter = Duration::from_millis(next_u64(rng) % 500);
     base.saturating_add(jitter).min(config.max_backoff)
+}
+
+/// Replace the secret wherever it may appear in `msg` (RULES.md §4).
+fn sanitize(msg: &str, token: &SecretString) -> String {
+    msg.replace(token.expose_secret(), "[redacted]")
+}
+
+/// Percent-encode for a URI query value (unreserved chars pass through).
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 fn rng_seed() -> u64 {
@@ -327,5 +354,15 @@ mod tests {
         assert_eq!(config.min_backoff, Duration::from_secs(1));
         assert_eq!(config.max_backoff, Duration::from_secs(300));
         assert!(!format!("{config:?}").contains("pipeline.vrchat"));
+    }
+
+    #[test]
+    fn tokens_are_percent_encoded_and_sanitized_from_messages() {
+        assert_eq!(percent_encode("a&b=c"), "a%26b%3Dc");
+        let token = SecretString::from("authcookie_secret");
+        assert_eq!(
+            sanitize("err wss://x/?authToken=authcookie_secret&y=1", &token),
+            "err wss://x/?authToken=[redacted]&y=1"
+        );
     }
 }

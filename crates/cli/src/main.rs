@@ -29,7 +29,10 @@ enum Commands {
     /// Print the HTTP User-Agent used for all API requests
     Version,
     /// Log in with username/e-mail + password (and 2FA when required)
-    Login,
+    Login {
+        /// Account username or e-mail; prompted interactively when omitted
+        username: Option<String>,
+    },
     /// Show the currently logged-in user
     Me,
     /// List friends grouped by section (favorites, in-game, active, offline)
@@ -47,7 +50,7 @@ async fn main() -> Result<()> {
             println!("{USER_AGENT}");
             Ok(())
         }
-        Commands::Login => login().await,
+        Commands::Login { username } => login(username).await,
         Commands::Me => me().await,
         Commands::Friends => friends().await,
         Commands::Watch => watch().await,
@@ -65,9 +68,14 @@ fn build_client() -> Result<Client> {
 }
 
 /// Wait for the next event matching `wanted`; errors abort the command.
+/// Times out rather than hanging forever.
 async fn wait_for(handle: &mut AppHandle, wanted: impl Fn(&AppEvent) -> bool) -> Result<AppEvent> {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
     loop {
-        match handle.events.recv().await {
+        let next = tokio::time::timeout(WAIT, handle.events.recv())
+            .await
+            .context("timed out waiting for app event")?;
+        match next {
             Ok(event) if wanted(&event) => return Ok(event),
             Ok(AppEvent::Error(message)) => bail!(message),
             Ok(_) => {}
@@ -90,24 +98,27 @@ async fn ensure_session(handle: &mut AppHandle) -> Result<()> {
     }
 }
 
-async fn login() -> Result<()> {
+async fn login(username: Option<String>) -> Result<()> {
     let mut handle = App::spawn(AppConfig::new(build_client()?));
 
-    print!("Username or e-mail: ");
-    std::io::stdout().flush()?;
-    let mut username = String::new();
-    std::io::stdin()
-        .read_line(&mut username)
-        .context("reading username")?;
+    let username = match username {
+        Some(username) => username,
+        None => {
+            print!("Username or e-mail: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .context("reading username")?;
+            input.trim().to_string()
+        }
+    };
     let password =
         SecretString::from(rpassword::prompt_password("Password: ").context("reading password")?);
 
     handle
         .commands
-        .send(Command::Login {
-            username: username.trim().to_string(),
-            password,
-        })
+        .send(Command::Login { username, password })
         .await?;
 
     match wait_for(&mut handle, |e| matches!(e, AppEvent::AuthChanged(_))).await? {

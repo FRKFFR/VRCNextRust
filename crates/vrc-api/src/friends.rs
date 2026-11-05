@@ -12,7 +12,8 @@ use crate::{ApiError, Client};
 const PAGE_SIZE: usize = 100;
 
 impl Client {
-    /// `GET /friends?offline={offline}` — every page merged into one list.
+    /// `GET /auth/user/friends?offline={offline}` — every page merged into
+    /// one list.
     ///
     /// `offline = false` returns friends currently online or active;
     /// `offline = true` returns the rest. Pagination continues until a short
@@ -23,7 +24,7 @@ impl Client {
         loop {
             let page: Vec<LimitedUser> = self
                 .get_json(&format!(
-                    "/friends?offline={offline}&n={PAGE_SIZE}&offset={offset}"
+                    "/auth/user/friends?offline={offline}&n={PAGE_SIZE}&offset={offset}"
                 ))
                 .await?;
             let len = page.len();

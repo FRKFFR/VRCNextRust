@@ -54,7 +54,7 @@ async fn friends_paginates_until_short_page() {
     let server = MockServer::start().await;
     // Full first page forces one more request; the short second page ends it.
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "false"))
         .and(query_param("n", "100"))
         .and(query_param("offset", "0"))
@@ -63,7 +63,7 @@ async fn friends_paginates_until_short_page() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "false"))
         .and(query_param("n", "100"))
         .and(query_param("offset", "100"))
@@ -88,7 +88,7 @@ async fn friends_offline_flag_and_null_tolerant_decode() {
     body["userIcon"] = Value::Null;
     body["tags"] = Value::Null;
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "true"))
         .and(query_param("n", "100"))
         .and(query_param("offset", "0"))
@@ -108,7 +108,7 @@ async fn friends_offline_flag_and_null_tolerant_decode() {
 async fn friends_empty_first_page_stops_immediately() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<Value>::new()))
         .expect(1)

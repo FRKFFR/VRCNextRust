@@ -315,8 +315,7 @@ impl Runtime {
                 state.pipeline = PipelineStatus::Disconnected;
             }
             PipelineEvent::FriendOnline { user_id, user }
-            | PipelineEvent::FriendActive { user_id, user }
-            | PipelineEvent::FriendAdd { user_id, user } => {
+            | PipelineEvent::FriendActive { user_id, user } => {
                 let key = if user_id.is_empty() {
                     user.id.clone()
                 } else {
@@ -327,7 +326,32 @@ impl Runtime {
                     .entry(key)
                     .or_insert_with(|| Friend::from_user(user));
                 friend.apply_user(user);
-                friend.is_online = true;
+                // The event kind is authoritative for presence: -online is
+                // in-game-eligible, -active is on web/app. An empty payload
+                // location clears the friend's stale instance.
+                friend.state = if matches!(event, PipelineEvent::FriendOnline { .. }) {
+                    "online".to_string()
+                } else {
+                    "active".to_string()
+                };
+                if user.location.is_empty() {
+                    friend.location.clear();
+                    friend.world_id.clear();
+                }
+            }
+            PipelineEvent::FriendAdd { user_id, user } => {
+                let key = if user_id.is_empty() {
+                    user.id.clone()
+                } else {
+                    user_id.clone()
+                };
+                let friend = state
+                    .friends
+                    .entry(key)
+                    .or_insert_with(|| Friend::from_user(user));
+                // friend-add carries the friend's current `state`; an absent
+                // or offline state must not fabricate presence.
+                friend.apply_user(user);
             }
             PipelineEvent::FriendOffline { user_id, .. } => {
                 if let Some(friend) = state.friends.get_mut(user_id) {
@@ -350,16 +374,22 @@ impl Runtime {
                     return;
                 }
                 let friend = state.friends.entry(key).or_default();
+                // Apply the user payload first — it can carry a stale
+                // location, so the event's own fields must overwrite it.
+                if let Some(user) = user {
+                    friend.apply_user(user);
+                }
                 friend.location = location.clone();
                 friend.world_id = if world_id.is_empty() {
                     crate::state::world_id_from(location)
                 } else {
                     world_id.clone()
                 };
-                friend.is_online = !location.is_empty() && location != "offline";
-                if let Some(user) = user {
-                    friend.apply_user(user);
-                }
+                friend.state = if location.is_empty() || location == "offline" {
+                    "offline".to_string()
+                } else {
+                    "online".to_string()
+                };
             }
             PipelineEvent::FriendUpdate { user_id, user } => {
                 let key = if user_id.is_empty() {
@@ -369,7 +399,7 @@ impl Runtime {
                 };
                 let friend = state.friends.entry(key).or_default();
                 friend.apply_user(user);
-                if user.state == "offline" {
+                if friend.state == "offline" {
                     friend.mark_offline();
                 }
             }

@@ -23,6 +23,7 @@ const FAKE_COOKIE: &str = "authcookie_00000000000000000000000000000000";
 const ONLINE_ID: &str = "usr_00000000-0000-0000-0000-000000000002";
 const ACTIVE_ID: &str = "usr_00000000-0000-0000-0000-000000000003";
 const OFFLINE_ID: &str = "usr_00000000-0000-0000-0000-000000000004";
+const FAV_ID: &str = "usr_00000000-0000-0000-0000-000000000005";
 const WAIT: Duration = Duration::from_secs(15);
 
 fn fake_friend(id: &str, name: &str, location: &str) -> serde_json::Value {
@@ -94,7 +95,7 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
         .await;
     // Each list endpoint must be hit exactly once per refresh (RULES.md §3).
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(vec![
             fake_friend(
@@ -103,12 +104,13 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
                 "wrld_00000000-0000-0000-0000-00000000000a:inst1",
             ),
             fake_friend(ACTIVE_ID, "Test Active", ""),
+            fake_friend(FAV_ID, "Test Favorite", ""),
         ]))
         .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/friends"))
+        .and(path("/auth/user/friends"))
         .and(query_param("offline", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_friend(
             OFFLINE_ID,
@@ -124,7 +126,7 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
         .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
             "id": "fv_00000000-0000-0000-0000-000000000001",
             "type": "friend",
-            "favoriteId": ONLINE_ID,
+            "favoriteId": FAV_ID,
             "tags": [],
             "visibility": "friends"
         })]))
@@ -180,17 +182,25 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
     .await;
 
     let state: AppState = handle.state.snapshot();
-    assert_eq!(state.friends.len(), 3);
+    assert_eq!(state.friends.len(), 4);
     let s = sections(&state);
     assert_eq!(s.in_game.len(), 1);
+    assert_eq!(s.in_game[0].id, ONLINE_ID);
+    // "Test Active" (no location) lands in Web/Active.
     assert_eq!(s.active.len(), 1);
+    assert_eq!(s.active[0].id, ACTIVE_ID);
     assert_eq!(s.offline.len(), 1);
+    assert_eq!(s.offline[0].id, OFFLINE_ID);
+    // Sections are disjoint: the online favorite appears only in `favorites`.
     assert_eq!(s.favorites.len(), 1);
-    assert_eq!(s.favorites[0].id, ONLINE_ID);
+    assert_eq!(s.favorites[0].id, FAV_ID);
 
-    // Case-insensitive live search over the loaded list.
-    assert_eq!(search(&state, "test on").len(), 1);
-    assert_eq!(search(&state, "TEST OFFLINE")[0].id, OFFLINE_ID);
+    // Case-insensitive live search keeps the section grouping.
+    let hits = search(&s, "test on");
+    assert_eq!(hits.in_game.len(), 1);
+    assert_eq!(hits.in_game[0].id, ONLINE_ID);
+    let hits = search(&s, "TEST OFFLINE");
+    assert_eq!(hits.offline[0].id, OFFLINE_ID);
 
     // friend-offline moves the friend between sections — no re-fetch.
     frames_tx
@@ -204,7 +214,8 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
     })
     .await;
     let state = handle.state.snapshot();
-    assert!(!state.friends[ONLINE_ID].is_online);
+    assert!(!state.friends[ONLINE_ID].is_online());
+    assert_eq!(state.friends[ONLINE_ID].state, "offline");
     let s = sections(&state);
     assert_eq!(s.in_game.len(), 0);
     assert_eq!(s.offline.len(), 2);
