@@ -15,7 +15,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vrc_core::{
     search, sections, worlds_with_friends, App, AppConfig, AppEvent, AppHandle, AppState,
-    AuthState, Client, Command, MemoryVault, PipelineConfig, PipelineEvent,
+    AuthState, Client, Command, MemoryVault, PipelineConfig, PipelineEvent, PipelineStatus,
+    TwoFactorMethod,
 };
 
 const CURRENT_USER: &str = include_str!("../../vrc-api/tests/fixtures/current_user.json");
@@ -250,6 +251,231 @@ async fn login_fetches_friends_once_and_events_update_state_incrementally() {
     );
     assert_eq!(groups[0].friends.len(), 1);
 
+    // friend-online for a favorite keeps it in `favorites`, never in_game,
+    // and puts it on the worlds dashboard.
+    frames_tx
+        .send(format!(
+            r#"{{"type":"friend-online","content":{{"userId":"{FAV_ID}","user":{}}}}}"#,
+            pipeline_user(
+                FAV_ID,
+                "Test Favorite",
+                "wrld_00000000-0000-0000-0000-00000000000c:inst7",
+                "online"
+            )
+        ))
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::Pipeline(ev) if matches!(&**ev, PipelineEvent::FriendOnline { .. }))
+    })
+    .await;
+    let state = handle.state.snapshot();
+    let s = sections(&state);
+    assert!(s.favorites.iter().any(|f| f.id == FAV_ID));
+    assert!(s.in_game.iter().all(|f| f.id != FAV_ID));
+    let groups = worlds_with_friends(&state);
+    assert!(groups
+        .iter()
+        .any(|g| g.friends.iter().any(|f| f.id == FAV_ID)));
+
+    // friend-add inserts a brand-new friend; friend-delete removes it —
+    // still no REST round trip.
+    const NEW_ID: &str = "usr_00000000-0000-0000-0000-000000000006";
+    frames_tx
+        .send(format!(
+            r#"{{"type":"friend-add","content":{{"userId":"{NEW_ID}","user":{}}}}}"#,
+            pipeline_user(NEW_ID, "Test Newcomer", "", "active")
+        ))
+        .await
+        .unwrap();
+    wait_for(
+        &mut handle,
+        |e| matches!(e, AppEvent::Pipeline(ev) if matches!(&**ev, PipelineEvent::FriendAdd { .. })),
+    )
+    .await;
+    let state = handle.state.snapshot();
+    assert_eq!(state.friends[NEW_ID].display_name, "Test Newcomer");
+    assert!(sections(&state).web_active.iter().any(|f| f.id == NEW_ID));
+
+    frames_tx
+        .send(format!(
+            r#"{{"type":"friend-delete","content":{{"userId":"{NEW_ID}"}}}}"#
+        ))
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::Pipeline(ev) if matches!(&**ev, PipelineEvent::FriendDelete { .. }))
+    })
+    .await;
+    assert!(!handle.state.snapshot().friends.contains_key(NEW_ID));
+
     // The event stream is live state — no extra REST calls happened.
     server.verify().await;
+}
+
+#[tokio::test]
+async fn login_needs_2fa_then_submit_2fa_authenticates() {
+    let server = MockServer::start().await;
+    // First login attempt: credentials accepted but a second factor is due.
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "requiresTwoFactorAuth": ["totp", "emailOtp"]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // After verification the same endpoint returns the full user + cookie.
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CURRENT_USER, "application/json")
+                .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/twofactorauth/totp/verify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "verified": true })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorites"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+        .mount(&server)
+        .await;
+
+    // A local socket to hold the post-login pipeline connection.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let client = Client::builder()
+        .base_url(server.uri())
+        .vault(MemoryVault::new())
+        .rate_limit(1_000.0, 100)
+        .build()
+        .unwrap();
+    let config = AppConfig {
+        client,
+        pipeline: PipelineConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            ..PipelineConfig::default()
+        },
+    };
+    let mut handle = App::spawn(config);
+
+    handle
+        .commands
+        .send(Command::Login {
+            username: "testuser".to_string(),
+            password: SecretString::from("synthetic password"),
+        })
+        .await
+        .unwrap();
+    let ev = wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Needs2fa(_)))
+    })
+    .await;
+    let AppEvent::AuthChanged(AuthState::Needs2fa(methods)) = ev else {
+        unreachable!()
+    };
+    assert!(methods.contains(&TwoFactorMethod::Totp));
+
+    handle
+        .commands
+        .send(Command::Submit2fa {
+            method: TwoFactorMethod::Totp,
+            code: SecretString::from("000000"),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Authenticated))
+    })
+    .await;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await;
+
+    let state = handle.state.snapshot();
+    assert_eq!(state.auth, AuthState::Authenticated);
+    assert!(state.current_user.is_some());
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn unauthorized_on_refresh_tears_down_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(CURRENT_USER, "application/json")
+                .insert_header("set-cookie", format!("auth={FAKE_COOKIE}; Path=/")),
+        )
+        .mount(&server)
+        .await;
+    // The session died server-side: the post-login friends fetch is rejected.
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let client = Client::builder()
+        .base_url(server.uri())
+        .vault(MemoryVault::new())
+        .rate_limit(1_000.0, 100)
+        .build()
+        .unwrap();
+    let config = AppConfig {
+        client,
+        pipeline: PipelineConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            ..PipelineConfig::default()
+        },
+    };
+    let mut handle = App::spawn(config);
+
+    handle
+        .commands
+        .send(Command::Login {
+            username: "testuser".to_string(),
+            password: SecretString::from("synthetic password"),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::Authenticated))
+    })
+    .await;
+    // The 401 during the login-time friends refresh tears the session down.
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::LoggedOut))
+    })
+    .await;
+
+    let state = handle.state.snapshot();
+    assert_eq!(state.auth, AuthState::LoggedOut);
+    assert!(state.current_user.is_none());
+    assert!(state.friends.is_empty());
+    assert_eq!(state.pipeline, PipelineStatus::Disconnected);
 }

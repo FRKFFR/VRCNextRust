@@ -7,7 +7,7 @@
 //! [`PipelineEvent::Unknown`].
 
 use serde_json::Value;
-use vrc_api::models::{Notification, User};
+use vrc_api::models::User;
 
 /// Events pushed by the VRChat WebSocket pipeline.
 #[derive(Debug, Clone)]
@@ -75,8 +75,9 @@ pub enum PipelineEvent {
         /// `userId` of the removed friend.
         user_id: String,
     },
-    /// `notification`: a notification was pushed.
-    Notification(Notification),
+    /// `notification`: a notification was pushed; carried as the raw JSON
+    /// payload for now.
+    Notification(Value),
     /// `user-update`: the current user's profile changed.
     UserUpdate {
         /// `userId` (the current user).
@@ -179,13 +180,7 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
             user: user(),
         },
         "friend-delete" => PipelineEvent::FriendDelete { user_id: user_id() },
-        "notification" => match serde_json::from_value::<Notification>(content.clone()) {
-            Ok(notification) => PipelineEvent::Notification(notification),
-            Err(e) => {
-                tracing::warn!("pipeline: bad notification payload: {e}");
-                unknown()
-            }
-        },
+        "notification" => PipelineEvent::Notification(content.clone()),
         "user-update" => PipelineEvent::UserUpdate {
             user_id: user_id(),
             user: user(),
@@ -265,6 +260,21 @@ mod tests {
             PipelineEvent::Unknown { kind, raw } => {
                 assert_eq!(kind, "tacos");
                 assert!(raw.contains("tacos"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notification_carries_raw_json() {
+        let event = decode(
+            r#"{"type":"notification","content":{"id":"not_1","type":"friendRequest","senderUserId":"usr_x"}}"#,
+        )
+        .unwrap();
+        match event {
+            PipelineEvent::Notification(raw) => {
+                assert_eq!(raw["type"], "friendRequest");
+                assert_eq!(raw["senderUserId"], "usr_x");
             }
             other => panic!("unexpected event: {other:?}"),
         }

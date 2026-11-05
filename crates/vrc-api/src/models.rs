@@ -357,34 +357,6 @@ pub struct Favorite {
     pub visibility: String,
 }
 
-/// A `notification` pipeline message or `GET /auth/user/notifications` entry.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Notification {
-    #[serde(deserialize_with = "null_to_default")]
-    pub id: String,
-    #[serde(rename = "senderUserId", deserialize_with = "null_to_default")]
-    pub sender_user_id: String,
-    #[serde(rename = "senderUsername", deserialize_with = "null_to_default")]
-    pub sender_username: String,
-    #[serde(rename = "receiverUserId", deserialize_with = "null_to_default")]
-    pub receiver_user_id: String,
-    /// Notification kind (`friendRequest`, `invite`, `votetokick`, ...).
-    #[serde(rename = "type", deserialize_with = "null_to_default")]
-    pub kind: String,
-    #[serde(deserialize_with = "null_to_default")]
-    pub message: String,
-    /// Auxiliary payload, itself a JSON-encoded string per the docs.
-    #[serde(deserialize_with = "null_to_default")]
-    pub details: String,
-    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
-    pub image_url: String,
-    #[serde(deserialize_with = "null_to_default")]
-    pub seen: bool,
-    #[serde(rename = "created_at", deserialize_with = "null_to_default")]
-    pub created_at: String,
-}
-
 /// The `GET /auth/user` envelope while 2FA is still pending. Internal to the
 /// crate.
 #[derive(Debug, Deserialize)]

@@ -205,6 +205,10 @@ async fn connect_loop(
             match read_loop(&mut ws, &tx, &mut shutdown).await {
                 ReadEnd::Shutdown => return,
                 ReadEnd::Dropped(reason) => {
+                    // Server close reasons and tungstenite errors can echo
+                    // the request URI — strip the token before the reason
+                    // reaches logs or subscribers (RULES.md §4).
+                    let reason = sanitize(&reason, &token);
                     tracing::debug!("pipeline: disconnected ({reason})");
                     let _ = tx.send(PipelineEvent::Disconnected { reason }).await;
                 }
@@ -291,9 +295,13 @@ fn backoff(attempt: u32, rng: &mut u64, config: &PipelineConfig) -> Duration {
 }
 
 /// Replace the secret wherever it may appear in `msg` — raw *and* in the
-/// percent-encoded form the request URI carries (RULES.md §4).
+/// percent-encoded form the request URI carries (RULES.md §4). An empty
+/// token matches everywhere, so the message passes through unchanged.
 fn sanitize(msg: &str, token: &SecretString) -> String {
     let raw = token.expose_secret();
+    if raw.is_empty() {
+        return msg.to_string();
+    }
     msg.replace(raw, "[redacted]")
         .replace(&percent_encode(raw), "[redacted]")
 }
@@ -373,5 +381,11 @@ mod tests {
             sanitize("err wss://x/?authToken=tok%26en", &token),
             "err wss://x/?authToken=[redacted]"
         );
+    }
+
+    #[test]
+    fn sanitize_leaves_message_alone_when_token_is_empty() {
+        let msg = "closed by server: going away";
+        assert_eq!(sanitize(msg, &SecretString::from("")), msg);
     }
 }

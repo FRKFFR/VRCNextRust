@@ -57,17 +57,13 @@ pub fn sections(state: &AppState) -> FriendSections {
     out
 }
 
-/// Case-insensitive live filter over `display_name` and `username`,
-/// preserving the section grouping a front end renders.
+/// Case-insensitive live filter over `display_name` only, preserving the
+/// section grouping a front end renders.
 pub fn search(sections: &FriendSections, query: &str) -> FriendSections {
     let needle = query.trim().to_lowercase();
     let hits = |list: &[Friend]| -> Vec<Friend> {
         list.iter()
-            .filter(|f| {
-                needle.is_empty()
-                    || f.display_name.to_lowercase().contains(&needle)
-                    || f.username.to_lowercase().contains(&needle)
-            })
+            .filter(|f| needle.is_empty() || f.display_name.to_lowercase().contains(&needle))
             .cloned()
             .collect()
     };
@@ -208,8 +204,9 @@ mod tests {
         assert_eq!(hits.web_active.len(), 1);
         assert_eq!(hits.web_active[0].id, "usr_c");
         assert!(hits.in_game.is_empty());
+        // Search matches the display name only — a username is not a hit.
         let hits = search(&s, "carol_vrc");
-        assert_eq!(hits.web_active.len(), 1);
+        assert!(hits.web_active.is_empty());
         assert_eq!(
             search(&s, "").web_active.len() + search(&s, "").in_game.len(),
             2

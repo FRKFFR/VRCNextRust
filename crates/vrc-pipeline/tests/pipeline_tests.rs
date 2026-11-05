@@ -212,3 +212,44 @@ fn secrets_never_appear_in_debug() {
     assert!(!debug.contains(FAKE_TOKEN));
     assert!(!debug.contains("authToken"));
 }
+
+#[tokio::test]
+async fn server_close_reason_is_sanitized() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (hs_tx, _hs_rx) = mpsc::channel(4);
+    // Close with a reason echoing the token: it must be scrubbed before the
+    // Disconnected reason reaches subscribers (RULES.md §4).
+    let server = tokio::spawn(async move {
+        let mut ws = accept_one(&listener, hs_tx).await;
+        ws.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+            reason: format!("banned authToken={FAKE_TOKEN}").into(),
+        }))
+        .await
+        .unwrap();
+    });
+
+    let (handle, mut events) = Pipeline::connect(test_config(port), SecretString::from(FAKE_TOKEN));
+    assert!(matches!(
+        timeout(WAIT, events.next()).await.unwrap().unwrap(),
+        PipelineEvent::Connected
+    ));
+    let mut reason = String::new();
+    for _ in 0..4 {
+        if let PipelineEvent::Disconnected { reason: r } =
+            timeout(WAIT, events.next()).await.unwrap().unwrap()
+        {
+            reason = r;
+            break;
+        }
+    }
+    handle.shutdown();
+    server.abort();
+    assert!(!reason.is_empty(), "expected a Disconnected event");
+    assert!(
+        reason.contains("[redacted]"),
+        "reason not sanitized: {reason}"
+    );
+    assert!(!reason.contains(FAKE_TOKEN), "token leaked: {reason}");
+}

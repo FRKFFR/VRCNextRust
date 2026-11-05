@@ -167,3 +167,19 @@ async fn favorite_friend_ids_collects_friend_type_entries() {
     );
     server.verify().await;
 }
+
+#[tokio::test]
+async fn friends_pagination_stops_at_page_cap() {
+    let server = MockServer::start().await;
+    // An endpoint that always returns a full page would loop forever
+    // without the page cap.
+    Mock::given(method("GET"))
+        .and(path("/auth/user/friends"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_friends(0..100)))
+        .mount(&server)
+        .await;
+
+    let friends = test_client(&server).friends(false).await.unwrap();
+    assert_eq!(friends.len(), 50 * 100);
+    assert_eq!(server.received_requests().await.unwrap().len(), 50);
+}

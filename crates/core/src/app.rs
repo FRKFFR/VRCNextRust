@@ -246,13 +246,16 @@ impl Runtime {
                 Ok(user) => {
                     self.state.write().current_user = Some(user);
                 }
+                // A rejected session means every authenticated call fails;
+                // drop it like an explicit logout.
+                Err(ApiError::Unauthorized) => self.session_expired(),
                 Err(e) => self.report(e),
             },
-            Command::RefreshFriends => {
-                if let Err(e) = self.refresh_friends().await {
-                    self.report(e);
-                }
-            }
+            Command::RefreshFriends => match self.refresh_friends().await {
+                Ok(()) => {}
+                Err(ApiError::Unauthorized) => self.session_expired(),
+                Err(e) => self.report(e),
+            },
         }
     }
 
@@ -292,7 +295,11 @@ impl Runtime {
         }
 
         if let Err(e) = self.refresh_friends().await {
-            self.report(e);
+            if matches!(e, ApiError::Unauthorized) {
+                self.session_expired();
+            } else {
+                self.report(e);
+            }
         }
     }
 
@@ -450,6 +457,13 @@ impl Runtime {
             | PipelineEvent::UserUpdate { .. }
             | PipelineEvent::Unknown { .. } => {}
         }
+    }
+
+    /// The API rejected the session (401): tear it down and tell
+    /// subscribers we're logged out.
+    fn session_expired(&mut self) {
+        self.teardown_session();
+        self.set_auth(AuthState::LoggedOut);
     }
 
     fn set_auth(&mut self, auth: AuthState) {
