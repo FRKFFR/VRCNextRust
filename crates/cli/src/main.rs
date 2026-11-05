@@ -205,6 +205,9 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::AuthChanged(a)) => println!("auth: {a:?}"),
                 Ok(AppEvent::Error(m)) => println!("error: {m}"),
                 Ok(AppEvent::FriendsRefreshed) => println!("friends refreshed"),
+                Ok(AppEvent::WorldNameResolved { world_id }) => {
+                    println!("world name resolved: {world_id}")
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }

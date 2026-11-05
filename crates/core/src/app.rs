@@ -9,6 +9,7 @@
 //! are never logged (RULES.md §4).
 
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use secrecy::SecretString;
@@ -16,7 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, TwoFactorMethod};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
 
-use crate::state::{AppState, AuthState, Friend, PipelineStatus};
+use crate::sections::worlds_with_friends;
+use crate::state::{valid_world_id, AppState, AuthState, Friend, PipelineStatus, WorldName};
 
 /// Static configuration for [`App::spawn`].
 #[derive(Debug)]
@@ -127,9 +129,15 @@ pub enum AppEvent {
     /// A raw pipeline event; `AppState` was already updated.
     /// Boxed — `PipelineEvent` is large compared to the other variants.
     Pipeline(Box<PipelineEvent>),
+    /// A world's display name finished resolving (success or failure);
+    /// `AppState.world_names` was updated.
+    WorldNameResolved { world_id: String },
     /// A command failed (message carries no secrets).
     Error(String),
 }
+
+/// How long a failed world-name lookup is cached before retrying.
+const WORLD_NAME_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// The application core; drives the leaf crates and serves front ends.
 pub struct App;
@@ -199,6 +207,7 @@ async fn run(
             ev = rt.pipeline_events.1.recv() => {
                 if let Some(event) = ev {
                     rt.apply_pipeline_event(&event);
+                    rt.ensure_world_names();
                     let _ = rt.events.send(AppEvent::Pipeline(Box::new(event)));
                 }
             }
@@ -211,6 +220,9 @@ async fn run(
 
 impl Runtime {
     async fn handle(&mut self, command: Command) {
+        // A new attempt supersedes the previous error: clear it up front so
+        // `report` below is the only writer within this command.
+        self.state.write().last_error = None;
         match command {
             Command::Login { username, password } => {
                 match self.client.login(&username, &password).await {
@@ -336,7 +348,63 @@ impl Runtime {
         }
         drop(state);
         let _ = self.events.send(AppEvent::FriendsRefreshed);
+        self.ensure_world_names();
         Ok(())
+    }
+
+    /// Kick off `GET /worlds/{id}` for every world on the friends' worlds
+    /// dashboard whose name isn't cached yet. Dedup happens through
+    /// [`AppState::world_names`]: `Pending`/`Known`/recently-`Unknown`
+    /// entries are skipped, so pipeline events and refreshes never
+    /// double-fetch (RULES.md §3). Failures are retried after
+    /// [`WORLD_NAME_RETRY`].
+    fn ensure_world_names(&mut self) {
+        let now = Instant::now();
+        let mut wanted: Vec<String> = Vec::new();
+        {
+            let state = self.state.read();
+            for group in worlds_with_friends(&state) {
+                // Remote payloads can carry arbitrary world_id strings;
+                // only plausible `wrld_…` ids become path segments.
+                if !valid_world_id(&group.world_id) {
+                    continue;
+                }
+                let needs_fetch = match state.world_names.get(&group.world_id) {
+                    Some(WorldName::Known(_)) | Some(WorldName::Pending) => false,
+                    Some(WorldName::Unknown { retry_at }) => *retry_at <= now,
+                    None => true,
+                };
+                if needs_fetch && !wanted.contains(&group.world_id) {
+                    wanted.push(group.world_id);
+                }
+            }
+        }
+        for id in wanted {
+            self.state
+                .write()
+                .world_names
+                .insert(id.clone(), WorldName::Pending);
+            let client = self.client.clone();
+            let events = self.events.clone();
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let name = match client.world(&id).await {
+                    Ok(world) if !world.name.is_empty() => WorldName::Known(world.name),
+                    _ => WorldName::Unknown {
+                        retry_at: Instant::now() + WORLD_NAME_RETRY,
+                    },
+                };
+                // A task finishing after logout must not resurrect session
+                // data; teardown_session already cleared the cache.
+                let mut state = state.write();
+                if state.auth != AuthState::Authenticated {
+                    return;
+                }
+                state.world_names.insert(id.clone(), name);
+                drop(state);
+                let _ = events.send(AppEvent::WorldNameResolved { world_id: id });
+            });
+        }
     }
 
     /// Merge one pipeline event into `AppState` (never re-fetches).
@@ -485,6 +553,7 @@ impl Runtime {
         state.current_user = None;
         state.friends.clear();
         state.pipeline = PipelineStatus::Disconnected;
+        state.world_names.clear();
     }
 
     fn report(&mut self, error: ApiError) {

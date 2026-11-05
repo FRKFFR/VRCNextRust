@@ -38,4 +38,8 @@ pub enum ApiError {
     /// Reading or writing the cookie vault failed.
     #[error("cookie vault error: {0}")]
     Vault(String),
+
+    /// A caller-supplied id was malformed; no request was sent.
+    #[error("invalid id: {0}")]
+    InvalidId(String),
 }

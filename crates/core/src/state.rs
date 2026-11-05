@@ -5,6 +5,7 @@
 //! per event (RULES.md §3).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use vrc_api::{CurrentUser, LimitedUser, TrustRank, TwoFactorMethod, User};
 
@@ -172,6 +173,35 @@ pub(crate) fn world_id_from(location: &str) -> String {
         .to_string()
 }
 
+/// True when `id` is a plausible `wrld_…` world id, safe to interpolate
+/// into a `/worlds/{id}` path segment. Pipeline payloads are remote data,
+/// so ids that bypassed [`world_id_from`] are re-validated here.
+pub(crate) use vrc_api::valid_world_id;
+
+/// Resolution state of a world's display name (`GET /worlds/{id}`),
+/// fetched once per world id and cached here (RULES.md §3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorldName {
+    /// A `GET /worlds/{id}` request is in flight for this world.
+    Pending,
+    /// The world's display name.
+    Known(String),
+    /// Resolution failed; don't retry before `retry_at`.
+    Unknown {
+        /// Earliest instant a retry is allowed.
+        retry_at: Instant,
+    },
+}
+
+impl Default for WorldName {
+    /// Treated like a fresh `Unknown`: eligible for an immediate fetch.
+    fn default() -> Self {
+        Self::Unknown {
+            retry_at: Instant::now(),
+        }
+    }
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -185,4 +215,31 @@ pub struct AppState {
     pub pipeline: PipelineStatus,
     /// Most recent command error, if any (never secret material).
     pub last_error: Option<String>,
+    /// World display names keyed by `wrld_…` id, resolved lazily by the
+    /// dashboard's name-resolution task.
+    pub world_names: HashMap<String, WorldName>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_id_from_extracts_wrld_head_only() {
+        assert_eq!(world_id_from("wrld_abc:12345"), "wrld_abc");
+        assert_eq!(world_id_from("wrld_abc"), "wrld_abc");
+        assert_eq!(world_id_from("private"), "");
+        assert_eq!(world_id_from(""), "");
+    }
+
+    #[test]
+    fn valid_world_id_accepts_only_safe_wrld_ids() {
+        assert!(valid_world_id("wrld_00000000-0000-0000-0000-00000000000a"));
+        assert!(!valid_world_id("wrld_"));
+        assert!(!valid_world_id("usr_00000000-0000-0000-0000-000000000001"));
+        assert!(!valid_world_id("private"));
+        assert!(!valid_world_id("wrld_x/../auth/user"));
+        assert!(!valid_world_id("wrld_x?y=1"));
+        assert!(!valid_world_id("wrld_x y"));
+    }
 }
