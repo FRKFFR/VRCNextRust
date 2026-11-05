@@ -2,16 +2,23 @@
 //! world display names from [`AppState::world_names`]. Pure view functions;
 //! no I/O.
 
-use crate::sections::{worlds_with_friends, WorldGroup};
+use crate::sections::worlds_with_friends;
 use crate::state::{AppState, Friend, WorldName};
 
 /// One card on the friends' worlds dashboard.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DashboardEntry {
-    /// The underlying world/instance group (friends, location, ids).
-    pub group: WorldGroup,
-    /// Resolved display name, while a resolution is pending, or unknown.
-    pub world_name: WorldName,
+    /// `wrld_…` world id.
+    pub world_id: String,
+    /// Resolved world display name; `None` while resolution is pending or
+    /// after a failure (front ends fall back to `world_id`).
+    pub world_name: Option<String>,
+    /// Instance id part of the location (may be empty for bare `wrld_…`).
+    pub instance_id: String,
+    /// Representative full location of the group (`world:instance`).
+    pub location: String,
+    /// Friends currently in this world/instance.
+    pub friends: Vec<Friend>,
 }
 
 /// Build the dashboard: every world populated by friends, enriched with
@@ -20,41 +27,33 @@ pub struct DashboardEntry {
 pub fn dashboard(state: &AppState) -> Vec<DashboardEntry> {
     worlds_with_friends(state)
         .into_iter()
-        .map(|group| DashboardEntry {
-            world_name: state
-                .world_names
-                .get(&group.world_id)
-                .cloned()
-                .unwrap_or_default(),
-            group,
+        .map(|group| {
+            let world_name = match state.world_names.get(&group.world_id) {
+                Some(WorldName::Known(name)) if !name.is_empty() => Some(name.clone()),
+                _ => None,
+            };
+            DashboardEntry {
+                world_id: group.world_id,
+                world_name,
+                instance_id: group.instance_id,
+                location: group.location,
+                friends: group.friends,
+            }
         })
         .collect()
 }
 
-/// Human-facing world name for a dashboard entry: the resolved name, an
-/// ellipsis while pending, or the world id when unknown.
-pub fn world_name_label(entry: &DashboardEntry) -> &str {
-    match &entry.world_name {
-        WorldName::Known(name) => name,
-        WorldName::Pending => "…",
-        WorldName::Unknown { .. } => &entry.group.world_id,
-    }
-}
-
-/// Names of the friends in a dashboard group, for compact card rendering.
-pub fn friend_names(entry: &DashboardEntry) -> Vec<&str> {
-    entry
-        .group
-        .friends
-        .iter()
-        .map(|f: &Friend| f.display_name.as_str())
-        .collect()
+/// Display title for a dashboard card: the resolved world name, or the
+/// world id while the name is still loading or unknown.
+pub fn world_title(entry: &DashboardEntry) -> &str {
+    entry.world_name.as_deref().unwrap_or(&entry.world_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::Friend;
+    use std::time::Instant;
     use vrc_api::TrustRank;
 
     fn friend(id: &str, name: &str, location: &str) -> Friend {
@@ -94,26 +93,37 @@ mod tests {
         let entries = dashboard(&state);
         assert_eq!(entries.len(), 2);
         // Sorted by friend count: wrld_one (2 friends) first.
-        assert_eq!(entries[0].group.world_id, "wrld_one");
-        assert_eq!(
-            entries[0].world_name,
-            WorldName::Known("Test World One".into())
-        );
-        assert_eq!(world_name_label(&entries[0]), "Test World One");
+        assert_eq!(entries[0].world_id, "wrld_one");
+        assert_eq!(entries[0].world_name.as_deref(), Some("Test World One"));
+        assert_eq!(entries[0].instance_id, "1");
+        assert_eq!(world_title(&entries[0]), "Test World One");
+        assert_eq!(entries[0].friends.len(), 2);
 
-        assert_eq!(entries[1].group.world_id, "wrld_two");
-        assert_eq!(entries[1].world_name, WorldName::Pending);
-        assert_eq!(world_name_label(&entries[1]), "…");
-        assert_eq!(friend_names(&entries[1]), vec!["C"]);
+        assert_eq!(entries[1].world_id, "wrld_two");
+        // While pending the world id is the display title.
+        assert_eq!(entries[1].world_name, None);
+        assert_eq!(world_title(&entries[1]), "wrld_two");
+        assert_eq!(entries[1].friends.len(), 1);
     }
 
     #[test]
-    fn unresolved_world_defaults_to_unknown_with_world_id_label() {
-        let state = state_with(vec![friend("usr_a", "A", "wrld_zzz:1")]);
+    fn unresolved_and_failed_worlds_fall_back_to_world_id() {
+        let mut state = state_with(vec![
+            friend("usr_a", "A", "wrld_zzz:1"),
+            friend("usr_b", "B", "wrld_yyy:2"),
+        ]);
+        state.world_names.insert(
+            "wrld_yyy".to_string(),
+            WorldName::Unknown {
+                retry_at: Instant::now() + std::time::Duration::from_secs(60),
+            },
+        );
         let entries = dashboard(&state);
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].world_name, WorldName::Unknown { .. }));
-        assert_eq!(world_name_label(&entries[0]), "wrld_zzz");
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(entry.world_name, None);
+            assert_eq!(world_title(entry), entry.world_id.as_str());
+        }
     }
 
     #[test]

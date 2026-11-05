@@ -270,7 +270,7 @@ fn friend_section(ui: &mut egui::Ui, title: &str, friends: &[Friend]) {
     ui.add_space(4.0);
 }
 
-/// A single friend row: presence dot, name, trust badge, location/status.
+/// A single friend row: presence dot, name, trust badge, status/location.
 fn friend_row(ui: &mut egui::Ui, friend: &Friend) {
     ui.horizontal(|ui| {
         ui.label(
@@ -282,39 +282,40 @@ fn friend_row(ui: &mut egui::Ui, friend: &Friend) {
         let (color, label) = trust_badge(friend.trust_rank);
         ui.colored_label(color, label);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let detail = if friend.location.is_empty() {
-                friend.status.clone()
-            } else {
+            // Status description first (the user's own status text), then
+            // the location tag, then the presence status as last resort.
+            let detail = if !friend.status_description.is_empty() {
+                friend.status_description.clone()
+            } else if !friend.location.is_empty() {
                 friend.location.clone()
+            } else {
+                friend.status.clone()
             };
             ui.weak(detail);
         });
     });
 }
 
-/// One dashboard card: world name, friend count and the friends inside.
+/// One dashboard card: world name (or id while loading), instance id,
+/// friend count and the friends inside.
 fn world_card(ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.set_min_width(220.0);
             ui.horizontal(|ui| {
-                ui.strong(vrc_core::world_name_label(entry));
+                ui.strong(vrc_core::world_title(entry));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(format!(
                         "{} friend{}",
-                        entry.group.friends.len(),
-                        plural(entry.group.friends.len())
+                        entry.friends.len(),
+                        plural(entry.friends.len())
                     ));
                 });
             });
-            ui.small(
-                egui::RichText::new(&entry.group.location)
-                    .monospace()
-                    .weak(),
-            );
+            ui.small(egui::RichText::new(&entry.location).monospace().weak());
             ui.separator();
-            for friend in &entry.group.friends {
+            for friend in &entry.friends {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("●")

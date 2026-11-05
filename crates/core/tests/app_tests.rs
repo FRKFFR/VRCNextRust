@@ -603,9 +603,10 @@ async fn dashboard_world_names_resolve_once_and_failures_are_cached() {
     assert_eq!(entries.len(), 2);
     let named = entries
         .iter()
-        .find(|e| e.group.world_id == WORLD_OK)
+        .find(|e| e.world_id == WORLD_OK)
         .expect("dashboard entry for resolved world");
-    assert_eq!(vrc_core::world_name_label(named), "Test World Name");
+    assert_eq!(named.world_name.as_deref(), Some("Test World Name"));
+    assert_eq!(vrc_core::world_title(named), "Test World Name");
 
     server.verify().await;
 }

@@ -12,7 +12,7 @@ mod sections;
 mod state;
 
 pub use app::{App, AppConfig, AppEvent, AppHandle, Command, CommandSender, StateHandle};
-pub use dashboard::{dashboard, friend_names, world_name_label, DashboardEntry};
+pub use dashboard::{dashboard, world_title, DashboardEntry};
 pub use sections::{search, sections, worlds_with_friends, FriendSections, WorldGroup};
 pub use state::{AppState, AuthState, Friend, PipelineStatus, WorldName};
 
