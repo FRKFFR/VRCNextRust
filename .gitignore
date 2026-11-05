@@ -5,3 +5,4 @@
 .devin/mcp_config.local.json
 *.db
 *.sqlite
+.orch-state.json
