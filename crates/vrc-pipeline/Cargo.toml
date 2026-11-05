@@ -6,3 +6,14 @@ license.workspace = true
 
 [dependencies]
 vrc-api.workspace = true
+futures-util.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -18,6 +18,7 @@ pub const USER_AGENT: &str = concat!(
 mod auth;
 mod client;
 mod error;
+mod friends;
 pub mod models;
 mod rate_limit;
 mod vault;
@@ -25,7 +26,9 @@ mod vault;
 pub use auth::LoginOutcome;
 pub use client::{Client, ClientBuilder, API_ROOT};
 pub use error::ApiError;
-pub use models::{CurrentUser, PastDisplayName, TrustRank, TwoFactorMethod};
+pub use models::{
+    CurrentUser, Favorite, LimitedUser, PastDisplayName, TrustRank, TwoFactorMethod, User,
+};
 pub use rate_limit::RateLimiter;
 pub use vault::{CookieVault, KeyringVault, MemoryVault};
 
