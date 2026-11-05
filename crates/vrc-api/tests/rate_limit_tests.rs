@@ -278,6 +278,53 @@ async fn every_request_sends_user_agent() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn post_5xx_is_never_retried() {
+    // A 500 on POST may mean the API already consumed the single-use 2FA
+    // code — the error must surface after exactly one attempt.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/twofactorauth/totp/verify"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(
+            serde_json::json!({ "error": { "message": "synthetic outage", "status_code": 500 } }),
+        ))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server, 1_000.0, 100);
+    let err = client
+        .verify_2fa(
+            vrc_api::TwoFactorMethod::Totp,
+            &SecretString::from("000000"),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ApiError::Http { status, message } => {
+            assert_eq!(status, 500);
+            assert_eq!(message, "synthetic outage");
+        }
+        other => panic!("expected Http error, got {other:?}"),
+    }
+    assert_eq!(request_count(&server).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_5xx_is_retried() {
+    // Idempotent methods keep the capped retry behaviour.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/user"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server, 1_000.0, 100);
+    let err = client.current_user().await.unwrap_err();
+    assert!(matches!(err, ApiError::Http { status: 500, .. }));
+    assert_eq!(request_count(&server).await, 4); // 1 attempt + 3 retries
+}
+
+#[tokio::test(start_paused = true)]
 async fn post_goes_through_same_send_path() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

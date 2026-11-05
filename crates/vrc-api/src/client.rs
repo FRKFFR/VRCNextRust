@@ -2,8 +2,9 @@
 //!
 //! Every request goes through [`Client::send`], which applies the shared
 //! [`RateLimiter`], retries 429/5xx/network failures with capped exponential
-//! backoff, honours `Retry-After`, clears auth state on 401 and never retries
-//! other 4xx responses (RULES.md §3, §4).
+//! backoff only where a replay cannot double-apply work (idempotent methods,
+//! or connect errors where nothing was sent), honours `Retry-After`, clears
+//! auth state on 401 and never retries other 4xx responses (RULES.md §3, §4).
 
 use std::fmt;
 use std::sync::{Arc, MutexGuard};
@@ -148,7 +149,9 @@ impl Client {
     /// `GET path` and decode the JSON body into `T`.
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
         let url = self.url(path);
-        let resp = self.send(|http| http.request(Method::GET, &url)).await?;
+        let resp = self
+            .send(Method::GET, |http| http.request(Method::GET, &url))
+            .await?;
         self.decode(resp).await
     }
 
@@ -161,7 +164,7 @@ impl Client {
     ) -> Result<T, ApiError> {
         let url = self.url(path);
         let resp = self
-            .send(|http| {
+            .send(Method::POST, |http| {
                 http.request(Method::POST, &url)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(body.expose_secret().to_string())
@@ -172,9 +175,13 @@ impl Client {
 
     /// Single send path for every request: rate limit, retry, 401 handling.
     ///
-    /// `make` rebuilds the [`reqwest::RequestBuilder`] on each attempt.
+    /// `make` rebuilds the [`reqwest::RequestBuilder`] on each attempt. Retries
+    /// are only safe when the API cannot have processed the request: 429s are
+    /// rejections, and 5xx/transport errors are only replayed for idempotent
+    /// methods (or connect failures, where nothing was sent).
     pub(crate) async fn send(
         &self,
+        method: Method,
         make: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Response, ApiError> {
         let mut retries = 0;
@@ -207,7 +214,9 @@ impl Client {
                         return Err(ApiError::Unauthorized);
                     }
                     if status.is_server_error() {
-                        if retries >= MAX_RETRIES {
+                        // A 5xx may mean the request was already processed —
+                        // replaying a POST could burn a single-use 2FA code.
+                        if retries >= MAX_RETRIES || !method.is_idempotent() {
                             let message = error_body(resp).await;
                             return Err(ApiError::Http {
                                 status: status.as_u16(),
@@ -223,7 +232,14 @@ impl Client {
                     return Ok(resp);
                 }
                 Err(e) => {
-                    if e.is_builder() || retries >= MAX_RETRIES {
+                    // A transport error may have happened after the request
+                    // was sent. Only idempotent methods can be replayed
+                    // unconditionally; a connect error proves nothing left
+                    // this machine, so even a POST is safe to retry.
+                    if e.is_builder()
+                        || retries >= MAX_RETRIES
+                        || !(method.is_idempotent() || e.is_connect())
+                    {
                         return Err(ApiError::Network(e));
                     }
                     sleep(self.retry_delay(retries)).await;

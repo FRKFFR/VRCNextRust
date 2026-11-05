@@ -6,6 +6,7 @@
 //! Passwords and 2FA codes are [`SecretString`]s held only for the duration
 //! of a call; only auth cookies are persisted (RULES.md §4).
 
+use reqwest::Method;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 
@@ -40,7 +41,7 @@ impl Client {
         // moment reqwest consumes it.
         let password = SecretString::from(form_encode(password.expose_secret()));
         let resp = self
-            .send(|http| {
+            .send(Method::GET, |http| {
                 http.get(&url)
                     .basic_auth(&username, Some(password.expose_secret()))
             })
@@ -127,7 +128,7 @@ impl Client {
     /// session counts as a successful logout.
     pub async fn logout(&self) -> Result<(), ApiError> {
         let url = self.url("/logout");
-        let result = self.send(|http| http.put(&url)).await;
+        let result = self.send(Method::PUT, |http| http.put(&url)).await;
         self.clear_auth_state();
         match result {
             Ok(_) | Err(ApiError::Unauthorized) => Ok(()),
