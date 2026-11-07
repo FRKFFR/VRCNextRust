@@ -296,9 +296,19 @@ pub(crate) async fn run_media_scan(
                     })
                     .is_ok()
                 {
-                    if let Ok(Ok(sync)) = reply_rx.await {
-                        outcome.upserted += sync.upserted;
-                        outcome.removed += sync.removed;
+                    match reply_rx.await {
+                        Ok(Ok(sync)) => {
+                            outcome.upserted += sync.upserted;
+                            outcome.removed += sync.removed;
+                        }
+                        Ok(Err(e)) => {
+                            outcome.errors += 1;
+                            tracing::debug!("media sync of {folder} failed: {e}");
+                        }
+                        Err(_) => {
+                            outcome.errors += 1;
+                            tracing::debug!("media sync of {folder} was dropped");
+                        }
                     }
                 }
             }

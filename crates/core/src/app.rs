@@ -1192,9 +1192,9 @@ impl Runtime {
             Command::ScanMedia => self.scan_media(),
             Command::LoadMedia { filter } => self.load_media(filter),
             Command::SetMediaFavorite { id, favorite } => self.set_media_favorite(id, favorite),
-            Command::AddMediaFolder { path } => self.add_media_folder(&path),
-            Command::RemoveMediaFolder { path } => self.remove_media_folder(&path),
-            Command::SetMediaBlurUntilHover { enabled } => self.set_media_blur(enabled),
+            Command::AddMediaFolder { path } => self.add_media_folder(&path).await,
+            Command::RemoveMediaFolder { path } => self.remove_media_folder(&path).await,
+            Command::SetMediaBlurUntilHover { enabled } => self.set_media_blur(enabled).await,
             Command::RequestThumbnail { key, source } => self.request_thumbnail(key, source),
             Command::SendMediaToDiscord { path } => self.send_media_to_discord(&path),
             Command::AddWebhook { url, autopost } => self.add_webhook(url, autopost).await,
@@ -1451,21 +1451,38 @@ impl Runtime {
             .collect()
     }
 
-    /// Persist the custom folder list and refresh `media_folders`.
-    fn persist_folders(&self, custom: &[String]) {
+    /// FIFO barrier on the store thread: resolves once every op queued
+    /// before it has been applied. Fire-and-forget writes pair with this
+    /// so "persisted" events only fire after the write is durable —
+    /// matters for CLI invocations that exit right after the event.
+    async fn flush_store(&self) {
+        let Some(tx) = self.store_tx.clone() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(StoreOp::QuerySettings { reply: reply_tx }).is_ok() {
+            let _ = reply_rx.await;
+        }
+    }
+
+    /// Persist the custom folder list and refresh `media_folders`. The
+    /// [`AppEvent::MediaChanged`] fires only after the store thread has
+    /// acknowledged the write (see [`Self::flush_store`]).
+    async fn persist_folders(&self, custom: &[String]) {
         if let Some(tx) = &self.store_tx {
             let _ = tx.send(StoreOp::SetSetting {
                 key: media::SETTING_MEDIA_FOLDERS.to_string(),
                 value: media::folders_json(custom),
             });
         }
+        self.flush_store().await;
         self.state.write().media_folders = media::effective_folders(custom);
         let _ = self.events.send(AppEvent::MediaChanged);
     }
 
     /// Register a custom folder: validate it exists, dedup against the
     /// effective list, persist, then rescan so it gets indexed.
-    fn add_media_folder(&mut self, path: &str) {
+    async fn add_media_folder(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() {
             self.report_message("folder path is empty");
@@ -1488,13 +1505,13 @@ impl Runtime {
         }
         let mut custom = self.custom_folders();
         custom.push(path.to_string());
-        self.persist_folders(&custom);
+        self.persist_folders(&custom).await;
         self.scan_media();
     }
 
     /// Unregister a custom folder and drop its index rows. The platform
     /// default folder cannot be removed.
-    fn remove_media_folder(&mut self, path: &str) {
+    async fn remove_media_folder(&mut self, path: &str) {
         let path = path.trim();
         // Rows store the folder string exactly as configured — capture
         // it before the folder leaves `media_folders`.
@@ -1514,20 +1531,23 @@ impl Runtime {
             .into_iter()
             .filter(|f| Path::new(f) != Path::new(path))
             .collect();
-        self.persist_folders(&custom);
+        // Queue the row delete *before* `persist_folders`' barrier so
+        // `MediaChanged` covers both writes.
         if let Some(tx) = &self.store_tx {
             let _ = tx.send(StoreOp::DeleteMediaFolder { folder: stored });
         }
+        self.persist_folders(&custom).await;
     }
 
     /// Persist the blur-until-hover toggle (default on).
-    fn set_media_blur(&self, enabled: bool) {
+    async fn set_media_blur(&self, enabled: bool) {
         if let Some(tx) = &self.store_tx {
             let _ = tx.send(StoreOp::SetSetting {
                 key: media::SETTING_MEDIA_BLUR.to_string(),
                 value: if enabled { "1" } else { "0" }.to_string(),
             });
         }
+        self.flush_store().await;
         self.state.write().media_blur = enabled;
         let _ = self.events.send(AppEvent::MediaChanged);
     }

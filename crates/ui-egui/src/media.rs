@@ -56,8 +56,12 @@ impl VrcNextApp {
                 .load_texture(&key, color, egui::TextureOptions::LINEAR);
             // Bound the GPU-side cache: at the cap, drop every texture —
             // re-upload is cheap because the RGBA stays in the core LRU.
+            // `thumb_requested` is cleared too so thumbnails the core
+            // LRU has since evicted can be re-requested (core-side
+            // `begin()`/`fail()` still dedup in-flight and failed keys).
             if self.tex.len() >= 1024 {
                 self.tex.clear();
+                self.thumb_requested.clear();
             }
             self.tex.insert(key.clone(), tex.clone());
             return Some(tex);

@@ -276,12 +276,16 @@ impl Client {
 
     /// `GET` an absolute URL and return the raw body, capped at
     /// `max_bytes`. Intended for VRChat-hosted images (world/avatar/group
-    /// thumbnails, M6): the request still travels through [`Client::send`]
-    /// — shared rate limiter, retries, `Retry-After`, `USER_AGENT` — and a
-    /// 401 clears the VRChat session like any other API call. Only `https`
-    /// URLs are accepted; plain `http` is allowed for loopback hosts so
-    /// tests can use a local mock (callers still enforce the VRChat host
-    /// allowlist).
+    /// thumbnails, M6): the request still travels through the shared send
+    /// path — rate limiter, retries, `Retry-After`, `USER_AGENT` — but
+    /// with [`AuthPolicy::Keep`]: an image URL is not a session check, so
+    /// a 401 (expired signed URL, or a CDN host that rejects
+    /// unauthenticated fetches — cookies are domain-scoped and may not
+    /// even reach it) must not clear a healthy VRChat session. A
+    /// genuinely dead session is still cleared by the next real API
+    /// call. Only `https` URLs are accepted; plain `http` is allowed for
+    /// loopback hosts so tests can use a local mock (callers still
+    /// enforce the VRChat host allowlist).
     pub async fn get_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
         let parsed = Url::parse(url).map_err(|_| ApiError::InvalidId(url.to_string()))?;
         let loopback_http = parsed.scheme() == "http" && is_loopback_host(&parsed);
@@ -289,7 +293,11 @@ impl Client {
             return Err(ApiError::InvalidId(format!("non-https url: {url}")));
         }
         let resp = self
-            .send(Method::GET, move |http| http.get(parsed.clone()))
+            .send_inner(
+                Method::GET,
+                move |http| http.get(parsed.clone()),
+                AuthPolicy::Keep,
+            )
             .await?;
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
@@ -660,6 +668,29 @@ mod tests {
         let url = format!("{}/img.png", server.uri());
         let bytes = client.get_bytes(&url, 1024).await.unwrap();
         assert_eq!(bytes, b"\x89PNGfake");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_401_does_not_clear_session() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = Client::builder().build().unwrap();
+        client.inject_auth_cookies("auth=synthetic-token").unwrap();
+        assert!(client.auth_token().is_some());
+
+        let url = format!("{}/img.png", server.uri());
+        let err = client.get_bytes(&url, 1024).await.unwrap_err();
+        assert!(matches!(err, ApiError::Http { status: 401, .. }));
+        // An image-host 401 is not a session check — auth must survive.
+        assert!(client.auth_token().is_some());
     }
 
     #[tokio::test]

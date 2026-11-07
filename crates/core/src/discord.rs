@@ -139,6 +139,13 @@ fn parse_webhooks_json(json: &str) -> Result<Vec<WebhookEntry>, String> {
         let Some(url) = item.get("url").and_then(|v| v.as_str()) else {
             continue;
         };
+        // Entries written outside `add_webhook` (hand-edited keyring,
+        // older builds) bypass URL validation — drop anything that isn't
+        // a strict Discord webhook URL so the relay can never POST photo
+        // bytes to an arbitrary host.
+        if validate_webhook_url(url).is_err() {
+            continue;
+        }
         let autopost = item
             .get("autopost")
             .and_then(|v| v.as_bool())
@@ -264,9 +271,13 @@ async fn relay_job(
             return;
         }
     };
+    // Re-validate at send time too: a vault implementation that skips
+    // `parse_webhooks_json` must not aim photo bytes at an arbitrary
+    // host either (defense in depth — the URL carries the token).
     let targets: Vec<&WebhookEntry> = entries
         .iter()
         .filter(|e| !job.auto_only || e.autopost)
+        .filter(|e| validate_webhook_url(e.url.expose_secret()).is_ok())
         .take(MAX_WEBHOOKS)
         .collect();
     if targets.is_empty() {
@@ -319,7 +330,10 @@ async fn relay_job(
             }
             Err(e) => {
                 failed += 1;
-                tracing::debug!("discord webhook {index} send failed: {e}");
+                // Kind only — `ApiError`'s Display can embed the webhook
+                // URL (reqwest errors carry the request URL; `InvalidId`
+                // stores it verbatim) and the URL holds the token.
+                tracing::debug!("discord webhook {index} send failed: {}", error_kind(&e));
             }
         }
     }
@@ -327,6 +341,24 @@ async fn relay_job(
         let message = format!("discord webhook: {delivered} sent, {failed} failed (see logs)");
         state.write().last_error = Some(message.clone());
         let _ = events.send(AppEvent::Error(message));
+    }
+}
+
+/// Coarse, secret-free failure classification for logs. The full
+/// [`vrc_api::ApiError`] is never logged on this path: its `Display`
+/// can contain the webhook URL (RULES.md §4).
+fn error_kind(e: &vrc_api::ApiError) -> &'static str {
+    use vrc_api::ApiError as E;
+    match e {
+        E::Network(_) => "network error",
+        E::Http { .. } => "http error",
+        E::RateLimited { .. } => "rate limited",
+        E::Unauthorized => "unauthorized",
+        E::Requires2fa => "2fa required",
+        E::Decode(_) => "decode error",
+        E::Vault(_) => "vault error",
+        E::InvalidId(_) => "invalid url",
+        E::PayloadTooLarge { .. } => "response too large",
     }
 }
 
@@ -447,7 +479,8 @@ mod tests {
         let json = r#"[
             {"url":"https://discord.com/api/webhooks/1/a","autopost":true},
             {"autopost":true},
-            {"url":"https://discord.com/api/webhooks/2/b"}
+            {"url":"https://discord.com/api/webhooks/2/b"},
+            {"url":"https://evil.example.com/hook","autopost":true}
         ]"#;
         let entries = parse_webhooks_json(json).unwrap();
         assert_eq!(entries.len(), 2);
