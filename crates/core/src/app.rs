@@ -8,13 +8,13 @@
 //! (RULES.md §3). Secrets live only as `SecretString` inside commands and
 //! are never logged (RULES.md §4).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use vrc_api::{
@@ -23,16 +23,19 @@ use vrc_api::{
 };
 use vrc_logs::{LogEvent, LogTailer};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
-use vrc_store::{FriendHistoryFilter, StatsRange, Store, TimelineFilter};
+use vrc_store::{FriendHistoryFilter, MediaFilter, StatsRange, Store, TimelineFilter};
 
 use crate::browse::{self, SearchKind, BROWSE_PAGE_SIZE, DETAIL_RETRY, SEARCH_DEBOUNCE};
+use crate::discord::{self, WebhookEntry, WebhookVault};
 use crate::local::{self, StoreOp};
+use crate::media;
 use crate::sections::worlds_with_friends;
 use crate::social::{self, MULTI_INVITE_GAP};
 use crate::state::{
     valid_world_id, AppState, AuthState, BrowsePage, DetailState, Friend, MultiInviteProgress,
     PipelineStatus, ProfileView, WorldName,
 };
+use crate::thumbs::{self, ThumbSource, ThumbnailHandle, ThumbnailImage};
 
 /// Static configuration for [`App::spawn`].
 #[derive(Debug)]
@@ -89,12 +92,20 @@ impl StateHandle {
         self.read().clone()
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, AppState> {
+    pub(crate) fn read(&self) -> std::sync::RwLockReadGuard<'_, AppState> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, AppState> {
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, AppState> {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only empty state handle for unit tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(AppState::default())),
+        }
     }
 }
 
@@ -108,6 +119,9 @@ pub struct AppHandle {
     pub events: broadcast::Receiver<AppEvent>,
     /// Snapshot read access to [`AppState`].
     pub state: StateHandle,
+    /// Shared decoded-thumbnail cache — front ends upload the RGBA
+    /// payloads to their own texture store (M6).
+    pub thumbnails: ThumbnailHandle,
 }
 
 /// Every user action is a `Command` (RULES.md §7).
@@ -421,6 +435,69 @@ pub enum Command {
         /// Instance id.
         instance_id: String,
     },
+    /// Kick off a background rescan of every configured media folder
+    /// (local data — works while logged out).
+    ScanMedia,
+    /// Load a page of indexed photos into `AppState.media`.
+    LoadMedia {
+        /// Folder/favorite/world/date filters + paging.
+        filter: MediaFilter,
+    },
+    /// Toggle the local favorite flag on one media row.
+    SetMediaFavorite {
+        /// Media row id.
+        id: i64,
+        /// New flag value.
+        favorite: bool,
+    },
+    /// Register a custom media folder (persisted in settings) and
+    /// rescan.
+    AddMediaFolder {
+        /// Absolute folder path.
+        path: String,
+    },
+    /// Unregister a custom media folder and drop its index rows.
+    RemoveMediaFolder {
+        /// Folder path previously added via `AddMediaFolder`.
+        path: String,
+    },
+    /// Persist the blur-until-hover preference (default on).
+    SetMediaBlurUntilHover {
+        /// `true` blurs thumbnails until hovered.
+        enabled: bool,
+    },
+    /// Decode a thumbnail (local file or allowlisted remote URL) into
+    /// the shared cache; completion emits `AppEvent::ThumbnailReady`.
+    RequestThumbnail {
+        /// Cache key the front end will look up.
+        key: String,
+        /// Where the pixels come from.
+        source: ThumbSource,
+    },
+    /// Send one photo file to every configured Discord webhook.
+    SendMediaToDiscord {
+        /// Absolute photo path.
+        path: String,
+    },
+    /// Add a Discord webhook URL (validated; stored in the OS keyring).
+    AddWebhook {
+        /// `https://discord.com/api/webhooks/{id}/{token}` — secret.
+        url: SecretString,
+        /// Auto-post new photos to this webhook.
+        autopost: bool,
+    },
+    /// Remove the webhook at `index` (keyring order).
+    RemoveWebhook {
+        /// Zero-based slot index.
+        index: usize,
+    },
+    /// Toggle auto-post for the webhook at `index`.
+    SetWebhookAutopost {
+        /// Zero-based slot index.
+        index: usize,
+        /// New flag value.
+        enabled: bool,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -481,6 +558,17 @@ impl std::fmt::Debug for Command {
             Command::RemoveFavorite { .. } => "RemoveFavorite",
             Command::CreateInstance { .. } => "CreateInstance",
             Command::InviteMyselfToInstance { .. } => "InviteMyselfToInstance",
+            Command::ScanMedia => "ScanMedia",
+            Command::LoadMedia { .. } => "LoadMedia",
+            Command::SetMediaFavorite { .. } => "SetMediaFavorite",
+            Command::AddMediaFolder { .. } => "AddMediaFolder",
+            Command::RemoveMediaFolder { .. } => "RemoveMediaFolder",
+            Command::SetMediaBlurUntilHover { .. } => "SetMediaBlurUntilHover",
+            Command::RequestThumbnail { .. } => "RequestThumbnail",
+            Command::SendMediaToDiscord { .. } => "SendMediaToDiscord",
+            Command::AddWebhook { .. } => "AddWebhook",
+            Command::RemoveWebhook { .. } => "RemoveWebhook",
+            Command::SetWebhookAutopost { .. } => "SetWebhookAutopost",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -517,6 +605,14 @@ pub enum AppEvent {
     MultiInviteProgress,
     /// Any M5 browse/detail/favorite/instance state changed.
     BrowseChanged,
+    /// `AppState.media` was updated by `LoadMedia`.
+    MediaLoaded,
+    /// A background media scan finished (`AppState.media_last_scan`).
+    MediaScanFinished,
+    /// Media config changed (folders, favorites, blur, webhooks).
+    MediaChanged,
+    /// A thumbnail finished decoding into the shared cache.
+    ThumbnailReady,
     /// A command failed (message carries no secrets).
     Error(String),
 }
@@ -539,6 +635,8 @@ impl App {
             inner: Arc::new(RwLock::new(AppState::default())),
         };
         let inner_state = state.inner.clone();
+        let thumbnails = ThumbnailHandle::new();
+        let runtime_thumbnails = thumbnails.clone();
         std::thread::Builder::new()
             .name("vrc-core".to_string())
             .spawn(move || {
@@ -547,13 +645,20 @@ impl App {
                     .enable_all()
                     .build()
                     .expect("vrc-core tokio runtime");
-                runtime.block_on(run(config, command_rx, event_tx, inner_state));
+                runtime.block_on(run(
+                    config,
+                    command_rx,
+                    event_tx,
+                    inner_state,
+                    runtime_thumbnails,
+                ));
             })
             .expect("spawn vrc-core thread");
         AppHandle {
             commands,
             events,
             state,
+            thumbnails,
         }
     }
 }
@@ -582,10 +687,20 @@ struct Runtime {
     /// Per-kind generation counters for debounced searches; a newer command
     /// bumps the counter so stale tasks drop their results.
     search_generations: std::collections::HashMap<SearchKind, Arc<AtomicU64>>,
+    /// Generation counter for media page loads — same stale-drop
+    /// semantics as `search_generations` (media isn't debounced, but
+    /// filter changes and paging can still race on the store thread).
+    media_generation: Arc<AtomicU64>,
     /// Detached tasks (multi-invite) report a dead session here; the
     /// command loop performs the actual teardown.
     session_expired_tx: mpsc::UnboundedSender<()>,
     session_expired_rx: mpsc::UnboundedReceiver<()>,
+    /// Shared decoded-thumbnail cache (M6).
+    thumbnails: ThumbnailHandle,
+    /// Discord webhook secret store (OS keyring, memory fallback).
+    webhook_vault: Arc<dyn WebhookVault>,
+    /// Sequential webhook sender; `None`-safe (jobs no-op when empty).
+    webhook_relay: discord::WebhookRelay,
 }
 
 async fn run(
@@ -593,6 +708,7 @@ async fn run(
     commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<AppEvent>,
     state: Arc<RwLock<AppState>>,
+    thumbnails: ThumbnailHandle,
 ) {
     // The log directory feeds both orphan-session cleanup (its newest
     // file's mtime bounds when VRChat was last alive) and the tailer.
@@ -648,6 +764,46 @@ async fn run(
         None
     };
 
+    // Hydrate local media settings (folders + blur toggle). Works
+    // without a store too: the platform default folder always shows.
+    let settings = match &store_tx {
+        Some(tx) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(StoreOp::QuerySettings { reply: reply_tx }).is_ok() {
+                reply_rx.await.ok().and_then(Result::ok)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    apply_media_settings(&state, settings.as_ref());
+
+    // Webhook secrets live only in the OS keyring; a missing credential
+    // store degrades to a session-only memory vault.
+    let webhook_vault: Arc<dyn WebhookVault> = discord::KeyringWebhookVault::new()
+        .map(|vault| Arc::new(vault) as Arc<dyn WebhookVault>)
+        .unwrap_or_else(|e| {
+            tracing::debug!("vrc-core: OS keyring unavailable ({e}); webhooks are session-only");
+            Arc::new(discord::MemoryWebhookVault::new())
+        });
+    let vault_for_load = webhook_vault.clone();
+    let webhook_entries = tokio::task::spawn_blocking(move || vault_for_load.load())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    state.write().unwrap_or_else(|e| e.into_inner()).webhooks =
+        discord::slots_for(&webhook_entries);
+    let webhook_relay = discord::WebhookRelay::spawn(
+        config.client.clone(),
+        webhook_vault.clone(),
+        StateHandle {
+            inner: state.clone(),
+        },
+        events.clone(),
+    );
+
     let (session_expired_tx, session_expired_rx) = mpsc::unbounded_channel();
     let mut rt = Runtime {
         commands,
@@ -664,10 +820,19 @@ async fn run(
         local_writes: config.local_writes,
         multi_invite_cancel: None,
         search_generations: Default::default(),
+        media_generation: Arc::new(AtomicU64::new(0)),
         session_expired_tx,
         session_expired_rx,
+        thumbnails,
+        webhook_vault,
+        webhook_relay,
     };
     rt.state.write().log_tail_active = rt.log_events.is_some();
+    // Index the configured folders once at startup (desktop instance
+    // only — CLI runs stay fast and read-only).
+    if config.local_writes {
+        rt.scan_media();
+    }
     loop {
         tokio::select! {
             cmd = rt.commands.recv() => match cmd {
@@ -732,6 +897,27 @@ fn resolve_log_dir(config: &AppConfig) -> Option<PathBuf> {
     config.log_dir.clone().or_else(vrc_logs::default_log_dir)
 }
 
+/// Apply persisted media settings to `AppState`: custom folders merge
+/// with the platform default; the blur toggle defaults to **on** when
+/// the key was never written.
+fn apply_media_settings(
+    state: &Arc<RwLock<AppState>>,
+    settings: Option<&std::collections::HashMap<String, String>>,
+) {
+    let custom = media::parse_custom_folders(
+        settings
+            .and_then(|s| s.get(media::SETTING_MEDIA_FOLDERS))
+            .map(String::as_str),
+    );
+    let blur = settings
+        .and_then(|s| s.get(media::SETTING_MEDIA_BLUR))
+        .map(|v| v == "1")
+        .unwrap_or(true);
+    let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
+    guard.media_folders = media::effective_folders(&custom);
+    guard.media_blur = blur;
+}
+
 /// Surface a local-store failure like a command error: `last_error` for
 /// the UI's error line and `AppEvent::Error` so CLI `wait_for` callers
 /// see the real SQLite error instead of a bare timeout.
@@ -770,6 +956,21 @@ fn clear_page_loading<T>(slot: &mut Option<BrowsePage<T>>) {
 /// loading pages (loading continuations keep the loaded items).
 fn page_loading<T>(page: Option<&BrowsePage<T>>, key: &str, offset: usize) -> bool {
     page.is_some_and(|p| p.loading && p.key == key && p.offset + p.items.len() == offset)
+}
+
+/// Cache a finished thumbnail decode (or negatively cache the failure)
+/// and wake subscribers so the UI can pick up `ThumbnailReady`.
+fn finish_thumbnail(
+    thumbs: &ThumbnailHandle,
+    events: &broadcast::Sender<AppEvent>,
+    key: &str,
+    result: Option<ThumbnailImage>,
+) {
+    match result {
+        Some(image) => thumbs.insert(key.to_string(), image),
+        None => thumbs.fail(key),
+    }
+    let _ = events.send(AppEvent::ThumbnailReady);
 }
 
 /// Store the outcome of a debounced search into its `AppState` page slot.
@@ -993,6 +1194,19 @@ impl Runtime {
                 self.invite_myself_to_instance(&world_id, &instance_id)
                     .await
             }
+            Command::ScanMedia => self.scan_media(),
+            Command::LoadMedia { filter } => self.load_media(filter),
+            Command::SetMediaFavorite { id, favorite } => self.set_media_favorite(id, favorite),
+            Command::AddMediaFolder { path } => self.add_media_folder(&path).await,
+            Command::RemoveMediaFolder { path } => self.remove_media_folder(&path).await,
+            Command::SetMediaBlurUntilHover { enabled } => self.set_media_blur(enabled).await,
+            Command::RequestThumbnail { key, source } => self.request_thumbnail(key, source),
+            Command::SendMediaToDiscord { path } => self.send_media_to_discord(&path),
+            Command::AddWebhook { url, autopost } => self.add_webhook(url, autopost).await,
+            Command::RemoveWebhook { index } => self.remove_webhook(index).await,
+            Command::SetWebhookAutopost { index, enabled } => {
+                self.set_webhook_autopost(index, enabled).await
+            }
         }
     }
 
@@ -1112,6 +1326,413 @@ impl Runtime {
         let _ = tx.send(StoreOp::History(entry));
     }
 
+    /// Start a background rescan of every configured media folder. The
+    /// `media_scanning` state flag is both the UI indicator and the
+    /// in-flight guard; `run_media_scan` clears it when done.
+    fn scan_media(&self) {
+        if self.state.read().media_scanning {
+            return;
+        }
+        let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
+            return;
+        };
+        self.state.write().media_scanning = true;
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            media::run_media_scan(tx, state, events).await;
+        });
+    }
+
+    /// Run a paged media query on the store thread and merge the page
+    /// into `AppState.media` (offset accumulation like M5 browse pages).
+    fn load_media(&self, mut filter: MediaFilter) {
+        let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
+            return;
+        };
+        if filter.limit == 0 {
+            filter.limit = media::MEDIA_PAGE_SIZE;
+        }
+        let key = media::media_filter_key(&filter);
+        let offset = filter.offset as usize;
+        let page_len = filter.limit as usize;
+        {
+            let mut state = self.state.write();
+            // In-flight dedup: an identical query already loading is
+            // dropped — the sentinel will re-fire once it lands.
+            if state
+                .media
+                .as_ref()
+                .is_some_and(|p| p.loading && p.key == key)
+            {
+                return;
+            }
+            state.media = Some(browse::continuation_loading(
+                state.media.as_ref(),
+                &key,
+                offset,
+            ));
+        }
+        // Bump *after* the in-flight dedup: a dropped duplicate must not
+        // invalidate the query it piggybacks on.
+        let generation = self.media_generation.clone();
+        let expected = generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(StoreOp::QueryMedia {
+                filter,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            report_store_error(&self.state, &self.events, "local store is not running");
+            return;
+        }
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok((items, total))) => {
+                    let exhausted = items.len() < page_len;
+                    let page = BrowsePage {
+                        key,
+                        offset,
+                        items,
+                        total: Some(total),
+                        loading: false,
+                        exhausted,
+                    };
+                    // Re-check the generation inside the write lock: a
+                    // newer LoadMedia may have landed while this reply
+                    // was in flight — its results must win.
+                    let mut guard = state.write();
+                    if generation.load(Ordering::Relaxed) != expected {
+                        return;
+                    }
+                    browse::merge_page(&mut guard.media, page);
+                    drop(guard);
+                    let _ = events.send(AppEvent::MediaLoaded);
+                }
+                Ok(Err(message)) => report_store_error(&state, &events, message),
+                Err(_) => report_store_error(&state, &events, "local store stopped responding"),
+            }
+        });
+    }
+
+    /// Persist a favorite toggle and reflect it into the loaded page.
+    fn set_media_favorite(&self, id: i64, favorite: bool) {
+        let Some(tx) = self.store_tx.clone() else {
+            report_store_error(&self.state, &self.events, "local store is unavailable");
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(StoreOp::SetMediaFavorite {
+                id,
+                favorite,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            report_store_error(&self.state, &self.events, "local store is not running");
+            return;
+        }
+        let state = self.state.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok(())) => {
+                    let mut guard = state.write();
+                    if let Some(page) = guard.media.as_mut() {
+                        if !favorite && media::media_key_favorites_only(&page.key) {
+                            // Un-favoriting inside the favorites view
+                            // removes the row and shrinks the total.
+                            page.items.retain(|i| i.id != id);
+                            page.total = page.total.map(|t| t.saturating_sub(1));
+                        } else if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
+                            item.is_favorite = favorite;
+                        }
+                    }
+                    drop(guard);
+                    let _ = events.send(AppEvent::MediaChanged);
+                }
+                Ok(Err(message)) => report_store_error(&state, &events, message),
+                Err(_) => report_store_error(&state, &events, "local store stopped responding"),
+            }
+        });
+    }
+
+    /// The custom (user-added) folder paths currently configured.
+    fn custom_folders(&self) -> Vec<String> {
+        self.state
+            .read()
+            .media_folders
+            .iter()
+            .filter(|f| f.custom)
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// FIFO barrier on the store thread: resolves once every op queued
+    /// before it has been applied. Fire-and-forget writes pair with this
+    /// so "persisted" events only fire after the write is durable —
+    /// matters for CLI invocations that exit right after the event.
+    async fn flush_store(&self) {
+        let Some(tx) = self.store_tx.clone() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(StoreOp::QuerySettings { reply: reply_tx }).is_ok() {
+            let _ = reply_rx.await;
+        }
+    }
+
+    /// Persist the custom folder list and refresh `media_folders`. The
+    /// [`AppEvent::MediaChanged`] fires only after the store thread has
+    /// acknowledged the write (see [`Self::flush_store`]).
+    async fn persist_folders(&self, custom: &[String]) {
+        if let Some(tx) = &self.store_tx {
+            let _ = tx.send(StoreOp::SetSetting {
+                key: media::SETTING_MEDIA_FOLDERS.to_string(),
+                value: media::folders_json(custom),
+            });
+        }
+        self.flush_store().await;
+        self.state.write().media_folders = media::effective_folders(custom);
+        let _ = self.events.send(AppEvent::MediaChanged);
+    }
+
+    /// Register a custom folder: validate it exists, dedup against the
+    /// effective list, persist, then rescan so it gets indexed.
+    async fn add_media_folder(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            self.report_message("folder path is empty");
+            return;
+        }
+        if !Path::new(path).is_dir() {
+            self.report_message("folder does not exist or is not a directory");
+            return;
+        }
+        let already_scanned = {
+            let state = self.state.read();
+            state
+                .media_folders
+                .iter()
+                .any(|f| Path::new(&f.path) == Path::new(path))
+        };
+        if already_scanned {
+            self.report_message("folder is already in the scan list");
+            return;
+        }
+        let mut custom = self.custom_folders();
+        custom.push(path.to_string());
+        self.persist_folders(&custom).await;
+        self.scan_media();
+    }
+
+    /// Unregister a custom folder and drop its index rows. The platform
+    /// default folder cannot be removed.
+    async fn remove_media_folder(&mut self, path: &str) {
+        let path = path.trim();
+        // Rows store the folder string exactly as configured — capture
+        // it before the folder leaves `media_folders`.
+        let stored = self
+            .state
+            .read()
+            .media_folders
+            .iter()
+            .find(|f| f.custom && Path::new(&f.path) == Path::new(path))
+            .map(|f| f.path.clone());
+        let Some(stored) = stored else {
+            self.report_message("only custom folders can be removed");
+            return;
+        };
+        let custom: Vec<String> = self
+            .custom_folders()
+            .into_iter()
+            .filter(|f| Path::new(f) != Path::new(path))
+            .collect();
+        // Queue the row delete *before* `persist_folders`' barrier so
+        // `MediaChanged` covers both writes.
+        if let Some(tx) = &self.store_tx {
+            let _ = tx.send(StoreOp::DeleteMediaFolder { folder: stored });
+        }
+        self.persist_folders(&custom).await;
+    }
+
+    /// Persist the blur-until-hover toggle (default on).
+    async fn set_media_blur(&self, enabled: bool) {
+        if let Some(tx) = &self.store_tx {
+            let _ = tx.send(StoreOp::SetSetting {
+                key: media::SETTING_MEDIA_BLUR.to_string(),
+                value: if enabled { "1" } else { "0" }.to_string(),
+            });
+        }
+        self.flush_store().await;
+        self.state.write().media_blur = enabled;
+        let _ = self.events.send(AppEvent::MediaChanged);
+    }
+
+    /// Claim a thumbnail decode and run it off the UI thread: local files
+    /// on `spawn_blocking`, remote bytes through the shared client
+    /// (allowlist + rate limiter) then `spawn_blocking` for the decode.
+    fn request_thumbnail(&self, key: String, source: ThumbSource) {
+        if !self.thumbnails.begin(&key) {
+            return;
+        }
+        match source {
+            ThumbSource::File(path) => {
+                let thumbs = self.thumbnails.clone();
+                let events = self.events.clone();
+                tokio::task::spawn_blocking(move || {
+                    finish_thumbnail(
+                        &thumbs,
+                        &events,
+                        &key,
+                        thumbs::decode_file(Path::new(&path)),
+                    );
+                });
+            }
+            ThumbSource::Url(url) => {
+                if !media::is_allowed_image_url(&url) {
+                    self.thumbnails.fail(&key);
+                    return;
+                }
+                let client = self.client.clone();
+                let thumbs = self.thumbnails.clone();
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let result = match client.get_bytes(&url, thumbs::MAX_REMOTE_IMAGE_BYTES).await
+                    {
+                        Ok(bytes) => {
+                            tokio::task::spawn_blocking(move || thumbs::decode_bytes(&bytes))
+                                .await
+                                .ok()
+                                .flatten()
+                        }
+                        Err(e) => {
+                            tracing::debug!("remote thumbnail fetch failed: {e}");
+                            None
+                        }
+                    };
+                    finish_thumbnail(&thumbs, &events, &key, result);
+                });
+            }
+        }
+    }
+
+    /// Queue a manual Discord send for one photo file.
+    fn send_media_to_discord(&mut self, path: &str) {
+        if path.trim().is_empty() {
+            self.report_message("empty photo path");
+            return;
+        }
+        self.webhook_relay.send(PathBuf::from(path), false);
+    }
+
+    /// Add a validated webhook URL to the keyring vault (cap
+    /// [`discord::MAX_WEBHOOKS`]).
+    async fn add_webhook(&mut self, url: SecretString, autopost: bool) {
+        if let Err(message) = discord::validate_webhook_url(url.expose_secret()) {
+            self.report_message(&message);
+            return;
+        }
+        let Some(entries) = self.vault_entries().await else {
+            return;
+        };
+        if entries.len() >= discord::MAX_WEBHOOKS {
+            self.report_message(&format!(
+                "webhook limit reached ({})",
+                discord::MAX_WEBHOOKS
+            ));
+            return;
+        }
+        if entries
+            .iter()
+            .any(|e| e.url.expose_secret() == url.expose_secret())
+        {
+            self.report_message("that webhook is already configured");
+            return;
+        }
+        let mut entries = entries;
+        entries.push(WebhookEntry { url, autopost });
+        if !self.vault_save(&entries).await {
+            return;
+        }
+        self.state.write().webhooks = discord::slots_for(&entries);
+        let _ = self.events.send(AppEvent::MediaChanged);
+    }
+
+    /// Remove the webhook at `index`.
+    async fn remove_webhook(&mut self, index: usize) {
+        let Some(mut entries) = self.vault_entries().await else {
+            return;
+        };
+        if index >= entries.len() {
+            self.report_message("no webhook at that index");
+            return;
+        }
+        entries.remove(index);
+        if !self.vault_save(&entries).await {
+            return;
+        }
+        self.state.write().webhooks = discord::slots_for(&entries);
+        let _ = self.events.send(AppEvent::MediaChanged);
+    }
+
+    /// Toggle auto-post on the webhook at `index`.
+    async fn set_webhook_autopost(&mut self, index: usize, enabled: bool) {
+        let Some(mut entries) = self.vault_entries().await else {
+            return;
+        };
+        let Some(entry) = entries.get_mut(index) else {
+            self.report_message("no webhook at that index");
+            return;
+        };
+        entry.autopost = enabled;
+        if !self.vault_save(&entries).await {
+            return;
+        }
+        self.state.write().webhooks = discord::slots_for(&entries);
+        let _ = self.events.send(AppEvent::MediaChanged);
+    }
+
+    /// Load webhook entries off the async executor (keyring may block).
+    async fn vault_entries(&mut self) -> Option<Vec<WebhookEntry>> {
+        let vault = self.webhook_vault.clone();
+        match tokio::task::spawn_blocking(move || vault.load()).await {
+            Ok(Ok(entries)) => Some(entries),
+            Ok(Err(message)) => {
+                self.report_message(&message);
+                None
+            }
+            Err(_) => {
+                self.report_message("keyring read failed");
+                None
+            }
+        }
+    }
+
+    /// Persist webhook entries off the async executor.
+    async fn vault_save(&mut self, entries: &[WebhookEntry]) -> bool {
+        let vault = self.webhook_vault.clone();
+        let entries = entries.to_vec();
+        match tokio::task::spawn_blocking(move || vault.save(&entries)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(message)) => {
+                self.report_message(&message);
+                false
+            }
+            Err(_) => {
+                self.report_message("keyring write failed");
+                false
+            }
+        }
+    }
+
     /// Queue the store ops a parsed log event implies (timeline row +
     /// session bookkeeping).
     fn apply_log_event(&self, event: &LogEvent) {
@@ -1124,6 +1745,36 @@ impl Runtime {
         for op in local::ops_for_log_event(event) {
             let _ = tx.send(op);
         }
+        if let LogEvent::PhotoTaken { path, .. } = event {
+            // Link the photo to its media row + the world session
+            // covering the timestamp, and auto-post to flagged webhooks.
+            // Photos outside every scan folder get no row — the library
+            // only indexes configured folders.
+            let folder = self.media_folder_for(path);
+            if !folder.is_empty() {
+                let _ = tx.send(StoreOp::LinkPhoto {
+                    path: path.clone(),
+                    ts: event.at(),
+                    folder,
+                });
+            }
+            if self.state.read().webhooks.iter().any(|w| w.autopost) {
+                self.webhook_relay.send(PathBuf::from(path), true);
+            }
+        }
+    }
+
+    /// Longest matching configured folder for a photo path.
+    fn media_folder_for(&self, path: &str) -> String {
+        let photo = Path::new(path);
+        self.state
+            .read()
+            .media_folders
+            .iter()
+            .filter(|f| photo.starts_with(Path::new(&f.path)))
+            .max_by_key(|f| f.path.len())
+            .map(|f| f.path.clone())
+            .unwrap_or_default()
     }
 
     /// Common post-authentication path: update auth state, start the

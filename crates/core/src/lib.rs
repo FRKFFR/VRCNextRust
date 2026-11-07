@@ -9,25 +9,30 @@
 mod app;
 pub mod browse;
 mod dashboard;
+mod discord;
 pub mod format;
 mod local;
+mod media;
 mod sections;
 mod social;
 mod state;
+mod thumbs;
 
 pub use app::{
     App, AppConfig, AppEvent, AppHandle, Command, CommandSender, StateHandle, LOCAL_PAGE_SIZE,
 };
 pub use dashboard::{dashboard, world_title, DashboardEntry};
+pub use discord::{WebhookSlot, MAX_WEBHOOKS};
 pub use sections::{search, sections, worlds_with_friends, FriendSections, WorldGroup};
 pub use social::{
     friend_status_label, friends_in_instance, moderation_label, notification_kind_label,
     validate_multi_invite_targets, MULTI_INVITE_GAP, MULTI_INVITE_MAX_TARGETS,
 };
 pub use state::{
-    AppState, AuthState, BrowsePage, DetailState, Friend, HistoryPage, MultiInviteProgress,
-    PipelineStatus, ProfileView, TimelinePage, WorldName,
+    AppState, AuthState, BrowsePage, DetailState, Friend, HistoryPage, MediaFolderInfo,
+    MediaScanInfo, MultiInviteProgress, PipelineStatus, ProfileView, TimelinePage, WorldName,
 };
+pub use thumbs::{ThumbSource, ThumbnailHandle, ThumbnailImage};
 
 // Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
 // the leaf crates they legitimately need.
@@ -43,6 +48,6 @@ pub use vrc_logs::{default_log_dir, LogEvent, LogTailer};
 pub use vrc_pipeline::PipelineConfig;
 pub use vrc_pipeline::PipelineEvent;
 pub use vrc_store::{
-    FriendEvent, FriendHistoryEntry, FriendHistoryFilter, FriendTime, NewSession, Stats,
-    StatsRange, Store, TimelineEntry, TimelineFilter, TimelineKind, WorldTime,
+    FriendEvent, FriendHistoryEntry, FriendHistoryFilter, FriendTime, MediaFilter, MediaItem,
+    NewSession, Stats, StatsRange, Store, TimelineEntry, TimelineFilter, TimelineKind, WorldTime,
 };

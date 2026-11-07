@@ -2226,6 +2226,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5062,6 +5064,8 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "futures-util",
+ "image",
+ "keyring",
  "secrecy",
  "serde_json",
  "tempfile",
@@ -5069,6 +5073,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "url",
  "vrc-api",
  "vrc-launcher",
  "vrc-logs",

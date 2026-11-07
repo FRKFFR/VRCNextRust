@@ -17,8 +17,9 @@ use tokio::sync::oneshot;
 use vrc_logs::LogEvent;
 use vrc_pipeline::PipelineEvent;
 use vrc_store::{
-    FriendEvent, FriendHistoryFilter, NewFriendHistoryEntry, NewSession, NewTimelineEntry, Stats,
-    StatsRange, Store, TimelineFilter, TimelineKind,
+    FriendEvent, FriendHistoryFilter, MediaFilter, MediaItem, MediaSignature,
+    NewFriendHistoryEntry, NewSession, NewTimelineEntry, ScannedMedia, Stats, StatsRange, Store,
+    SyncOutcome, TimelineFilter, TimelineKind,
 };
 
 use crate::state::{Friend, HistoryPage, TimelinePage};
@@ -79,6 +80,66 @@ pub enum StoreOp {
         range: StatsRange,
         /// Where the result goes.
         reply: oneshot::Sender<QueryResult<Stats>>,
+    },
+    /// Upsert one scanned folder's media rows and delete stale ones
+    /// (scanner sync, M6).
+    SyncMediaFolder {
+        /// Scan generation — rows not stamped with it are deleted.
+        scan_id: i64,
+        /// Scan root the items were found under.
+        folder: String,
+        /// Every image file seen under `folder` this scan.
+        items: Vec<ScannedMedia>,
+        /// Where the sync outcome goes.
+        reply: oneshot::Sender<QueryResult<SyncOutcome>>,
+    },
+    /// `(path → signature)` map for incremental scans.
+    QueryMediaSignatures {
+        /// Where the map goes.
+        reply: oneshot::Sender<QueryResult<HashMap<String, MediaSignature>>>,
+    },
+    /// Paged media query (`items, total`).
+    QueryMedia {
+        /// Filters + paging.
+        filter: MediaFilter,
+        /// Where the result goes.
+        reply: oneshot::Sender<QueryResult<(Vec<MediaItem>, u64)>>,
+    },
+    /// Set the local favorite flag on one media row.
+    SetMediaFavorite {
+        /// Media row id.
+        id: i64,
+        /// New flag value.
+        favorite: bool,
+        /// Where the outcome goes.
+        reply: oneshot::Sender<QueryResult<()>>,
+    },
+    /// Delete every index row under a removed scan folder.
+    DeleteMediaFolder {
+        /// Folder path being unregistered.
+        folder: String,
+    },
+    /// Link a `PhotoTaken` log event to its media row: refresh
+    /// `taken_at` and attach the world of the session covering `ts`.
+    LinkPhoto {
+        /// Photo file path from the log line.
+        path: String,
+        /// Event timestamp.
+        ts: OffsetDateTime,
+        /// Scan folder containing the file (empty when unknown).
+        folder: String,
+    },
+    /// All settings as a map (startup hydration).
+    QuerySettings {
+        /// Where the map goes.
+        reply: oneshot::Sender<QueryResult<HashMap<String, String>>>,
+    },
+    /// Write one setting (fire-and-forget).
+    SetSetting {
+        /// Setting key.
+        key: String,
+        /// Setting value.
+        value: String,
     },
 }
 
@@ -280,6 +341,73 @@ fn store_loop(store: Store, rx: mpsc::Receiver<StoreOp>) {
                         .compute(&range, STATS_TOP_N)
                         .map_err(|e| e.to_string()),
                 );
+            }
+            StoreOp::SyncMediaFolder {
+                scan_id,
+                folder,
+                items,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .media()
+                        .sync_folder(scan_id, &folder, &items)
+                        .map_err(|e| e.to_string()),
+                );
+            }
+            StoreOp::QueryMediaSignatures { reply } => {
+                let _ = reply.send(store.media().signatures().map_err(|e| e.to_string()));
+            }
+            StoreOp::QueryMedia { filter, reply } => {
+                let repo = store.media();
+                let result = repo
+                    .list(&filter)
+                    .and_then(|items| repo.count(&filter).map(|total| (items, total)))
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            StoreOp::SetMediaFavorite {
+                id,
+                favorite,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .media()
+                        .set_favorite(id, favorite)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                );
+            }
+            StoreOp::DeleteMediaFolder { folder } => {
+                if let Err(e) = store.media().delete_folder(&folder) {
+                    tracing::debug!("vrc-core: media folder delete failed: {e}");
+                }
+            }
+            StoreOp::LinkPhoto { path, ts, folder } => {
+                // Resolve the world of the session covering the photo's
+                // timestamp so the media row links to world + session.
+                let (world_id, world_name) = store
+                    .sessions()
+                    .session_at(ts)
+                    .ok()
+                    .flatten()
+                    .map(|s| (s.world_id, s.world_name))
+                    .unwrap_or_default();
+                if let Err(e) = store
+                    .media()
+                    .link_photo(&path, ts, &folder, &world_id, &world_name)
+                {
+                    tracing::debug!("vrc-core: media link failed: {e}");
+                }
+            }
+            StoreOp::QuerySettings { reply } => {
+                let _ = reply.send(store.settings().all().map_err(|e| e.to_string()));
+            }
+            StoreOp::SetSetting { key, value } => {
+                if let Err(e) = store.settings().set(&key, &value) {
+                    tracing::debug!("vrc-core: setting write failed: {e}");
+                }
             }
         }
     }

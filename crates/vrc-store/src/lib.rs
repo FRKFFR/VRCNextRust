@@ -10,7 +10,9 @@
 //! persisted — never e-mails, tokens or credentials (RULES.md §4).
 
 mod history;
+mod media;
 mod sessions;
+mod settings;
 mod stats;
 mod timeline;
 
@@ -23,7 +25,9 @@ use rusqlite_migration::{Migrations, M};
 pub use history::{
     FriendEvent, FriendHistoryEntry, FriendHistoryFilter, HistoryRepo, NewFriendHistoryEntry,
 };
+pub use media::{MediaFilter, MediaItem, MediaRepo, MediaSignature, ScannedMedia, SyncOutcome};
 pub use sessions::{NewSession, Session, SessionRepo};
+pub use settings::SettingsRepo;
 pub use stats::{FriendTime, Stats, StatsRange, StatsRepo, WorldTime};
 pub use timeline::{NewTimelineEntry, TimelineEntry, TimelineFilter, TimelineKind, TimelineRepo};
 
@@ -64,8 +68,9 @@ impl std::fmt::Debug for Store {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(
-        "CREATE TABLE timeline (
+    Migrations::new(vec![
+        M::up(
+            "CREATE TABLE timeline (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,
             kind        TEXT    NOT NULL,
@@ -104,7 +109,33 @@ fn migrations() -> Migrations<'static> {
             location    TEXT    NOT NULL DEFAULT ''
         );
         CREATE INDEX sessions_started_idx ON sessions(started_at DESC, id DESC);",
-    )])
+        ),
+        M::up(
+            "CREATE TABLE media (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            path            TEXT    NOT NULL UNIQUE,
+            folder          TEXT    NOT NULL DEFAULT '',
+            size            INTEGER NOT NULL DEFAULT 0,
+            mtime           INTEGER NOT NULL DEFAULT 0,
+            taken_at        INTEGER NOT NULL DEFAULT 0,
+            width           INTEGER NOT NULL DEFAULT 0,
+            height          INTEGER NOT NULL DEFAULT 0,
+            world_id        TEXT    NOT NULL DEFAULT '',
+            world_name      TEXT    NOT NULL DEFAULT '',
+            is_favorite     INTEGER NOT NULL DEFAULT 0,
+            metadata        TEXT    NOT NULL DEFAULT '',
+            last_seen_scan  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX media_taken_idx   ON media(taken_at DESC, id DESC);
+        CREATE INDEX media_folder_idx  ON media(folder, taken_at DESC);
+        CREATE INDEX media_world_idx   ON media(world_id, taken_at DESC);
+
+        CREATE TABLE settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+        ),
+    ])
 }
 
 impl Store {
@@ -161,6 +192,16 @@ impl Store {
     pub fn stats(&self) -> StatsRepo {
         StatsRepo::new(self.conn.clone())
     }
+
+    /// Indexed photo library (M6).
+    pub fn media(&self) -> MediaRepo {
+        MediaRepo::new(self.conn.clone())
+    }
+
+    /// Key/value app settings (M6).
+    pub fn settings(&self) -> SettingsRepo {
+        SettingsRepo::new(self.conn.clone())
+    }
 }
 
 /// Lock the shared connection; a poisoned mutex still yields the guard —
@@ -188,7 +229,13 @@ mod tests {
     fn migrations_create_all_tables() {
         let store = Store::open_in_memory().unwrap();
         let conn = lock(&store.conn);
-        for table in ["timeline", "friend_history", "sessions"] {
+        for table in [
+            "timeline",
+            "friend_history",
+            "sessions",
+            "media",
+            "settings",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",

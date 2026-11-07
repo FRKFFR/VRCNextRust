@@ -35,7 +35,7 @@ mod worlds;
 
 pub use auth::LoginOutcome;
 pub use avatars::{valid_avatar_id, AvatarSearchQuery};
-pub use client::{Client, ClientBuilder, API_ROOT};
+pub use client::{Client, ClientBuilder, ExternalResponse, API_ROOT};
 pub use error::ApiError;
 pub use favorites::valid_favorite_id;
 pub use groups::{

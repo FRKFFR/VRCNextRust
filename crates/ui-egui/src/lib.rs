@@ -7,10 +7,11 @@
 //! never stored in `AppState` or logged (RULES.md §4).
 
 mod browse;
+mod media;
 mod social;
 mod tabs;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use secrecy::SecretString;
@@ -18,8 +19,8 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TrySendError;
 use vrc_core::{
     search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
-    GroupAccessType, InstanceKind, InstanceRegion, PipelineStatus, StateHandle, TimelineKind,
-    TrustRank, TwoFactorMethod,
+    GroupAccessType, InstanceKind, InstanceRegion, PipelineStatus, StateHandle, ThumbnailHandle,
+    TimelineKind, TrustRank, TwoFactorMethod,
 };
 
 /// Which worlds feed the Worlds tab lists (`GET /worlds`, `/worlds/active`
@@ -120,10 +121,32 @@ pub struct VrcNextApp {
     new_instance_access: GroupAccessType,
     /// `canRequestInvite` for a private instance (Invite+ vs Invite).
     new_instance_can_request_invite: bool,
+    /// Media tab: live query text.
+    media_query: String,
+    /// Media tab: folder filter (`None` = all folders).
+    media_folder: Option<String>,
+    /// Media tab: favorites-only toggle.
+    media_favorites_only: bool,
+    /// Media tab: selected photo row id (detail window).
+    media_selected: Option<i64>,
+    /// Media tab: folder-add input buffer.
+    media_folder_input: String,
+    /// Media tab: webhook URL input buffer.
+    media_webhook_input: String,
+    /// Media tab: auto-post flag for the next added webhook.
+    media_webhook_autopost: bool,
+    /// egui textures uploaded from core-decoded thumbnails, keyed by
+    /// `ThumbSource::key()`. Bounded — cleared wholesale at the cap.
+    tex: HashMap<String, egui::TextureHandle>,
+    /// Thumbnail keys already requested this session (dedup; failures
+    /// are negatively cached core-side).
+    thumb_requested: HashSet<String>,
+    /// Shared decoded-thumbnail cache owned by `vrc-core`.
+    thumbnails: ThumbnailHandle,
 }
 
 impl VrcNextApp {
-    fn new(commands: CommandSender, state: StateHandle) -> Self {
+    fn new(commands: CommandSender, state: StateHandle, thumbnails: ThumbnailHandle) -> Self {
         let app = Self {
             commands,
             state,
@@ -158,6 +181,16 @@ impl VrcNextApp {
             new_instance_group: String::new(),
             new_instance_access: GroupAccessType::Members,
             new_instance_can_request_invite: false,
+            media_query: String::new(),
+            media_folder: None,
+            media_favorites_only: false,
+            media_selected: None,
+            media_folder_input: String::new(),
+            media_webhook_input: String::new(),
+            media_webhook_autopost: false,
+            tex: HashMap::new(),
+            thumb_requested: HashSet::new(),
+            thumbnails,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).
@@ -494,6 +527,7 @@ pub fn run(handle: AppHandle, options: eframe::NativeOptions) -> eframe::Result<
         commands,
         events,
         state,
+        thumbnails,
     } = handle;
     eframe::run_native(
         "VRCNextRust",
@@ -519,7 +553,7 @@ pub fn run(handle: AppHandle, options: eframe::NativeOptions) -> eframe::Result<
                     }
                 })
                 .expect("spawn vrc-ui-events thread");
-            Ok(Box::new(VrcNextApp::new(commands, state)))
+            Ok(Box::new(VrcNextApp::new(commands, state, thumbnails)))
         }),
     )
 }

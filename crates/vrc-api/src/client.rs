@@ -25,6 +25,55 @@ pub const API_ROOT: &str = "https://api.vrchat.cloud/api/1";
 /// Cookies that carry session state and may be persisted in the vault.
 const AUTH_COOKIE_NAMES: [&str; 2] = ["auth", "twoFactorAuth"];
 
+/// How a 401 response is treated by [`Client::send_inner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPolicy {
+    /// VRChat API calls: the session is dead — clear auth state and fail.
+    Clear,
+    /// External hosts (Discord webhooks): report the status, keep auth.
+    Keep,
+}
+
+/// Response of [`Client::post_external`]: status code plus a capped body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response body (capped at [`EXTERNAL_BODY_CAP`] bytes).
+    pub body: Vec<u8>,
+}
+
+/// Cap for external (non-VRChat) response bodies — webhook replies are
+/// small JSON payloads.
+const EXTERNAL_BODY_CAP: usize = 256 * 1024;
+
+/// Read a response body chunk-by-chunk, failing once `max_bytes` is
+/// exceeded (decompression-bomb / runaway-response guard).
+async fn read_capped(mut resp: Response, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(ApiError::Network)? {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(ApiError::PayloadTooLarge { limit: max_bytes });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// `true` for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`) — the
+/// only plain-`http` URLs [`Client::post_external`] accepts, so tests can
+/// point webhooks at a local mock without weakening production policy.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 /// Maximum number of retries after the initial attempt.
 const MAX_RETRIES: u32 = 3;
 
@@ -40,6 +89,7 @@ pub(crate) struct Inner {
     vault: Option<Arc<dyn CookieVault>>,
     limiter: RateLimiter,
     base_url: String,
+    allow_loopback_http: bool,
 }
 
 impl fmt::Debug for Client {
@@ -58,6 +108,7 @@ pub struct ClientBuilder {
     vault: Option<Arc<dyn CookieVault>>,
     requests_per_second: f64,
     burst: u32,
+    allow_loopback_http: bool,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -77,6 +128,7 @@ impl Default for ClientBuilder {
             vault: None,
             requests_per_second: 1.0,
             burst: 3,
+            allow_loopback_http: false,
         }
     }
 }
@@ -101,6 +153,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Permit plain-`http` loopback URLs (`127.0.0.0/8`, `localhost`,
+    /// `::1`) in [`Client::get_bytes`]/[`Client::post_external`]. For
+    /// tests that point at a local mock — production clients must not
+    /// enable this.
+    pub fn allow_loopback_http(mut self) -> Self {
+        self.allow_loopback_http = true;
+        self
+    }
+
     pub fn build(self) -> Result<Client, ApiError> {
         let cookies = Arc::new(CookieStoreMutex::default());
         let http = reqwest::Client::builder()
@@ -115,6 +176,7 @@ impl ClientBuilder {
                 vault: self.vault,
                 limiter: RateLimiter::new(self.requests_per_second, self.burst),
                 base_url: self.base_url.trim_end_matches('/').to_string(),
+                allow_loopback_http: self.allow_loopback_http,
             }),
         })
     }
@@ -225,6 +287,81 @@ impl Client {
         Ok(())
     }
 
+    /// `GET` an absolute URL and return the raw body, capped at
+    /// `max_bytes`. Intended for VRChat-hosted images (world/avatar/group
+    /// thumbnails, M6): the request still travels through the shared send
+    /// path — rate limiter, retries, `Retry-After`, `USER_AGENT` — but
+    /// with [`AuthPolicy::Keep`]: an image URL is not a session check, so
+    /// a 401 (expired signed URL, or a CDN host that rejects
+    /// unauthenticated fetches — cookies are domain-scoped and may not
+    /// even reach it) must not clear a healthy VRChat session. A
+    /// genuinely dead session is still cleared by the next real API
+    /// call. Only `https` URLs are accepted; plain `http` is allowed for
+    /// loopback hosts only when the client opted in via
+    /// [`ClientBuilder::allow_loopback_http`] (callers still enforce the
+    /// VRChat host allowlist).
+    pub async fn get_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
+        let parsed = Url::parse(url).map_err(|_| ApiError::InvalidId(url.to_string()))?;
+        let loopback_http = self.inner.allow_loopback_http
+            && parsed.scheme() == "http"
+            && is_loopback_host(&parsed);
+        if parsed.scheme() != "https" && !loopback_http {
+            return Err(ApiError::InvalidId(format!("non-https url: {url}")));
+        }
+        let resp = self
+            .send_inner(
+                Method::GET,
+                move |http| http.get(parsed.clone()),
+                AuthPolicy::Keep,
+            )
+            .await?;
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.bytes().await.map_err(ApiError::Network)?;
+            return Err(ApiError::Http {
+                status: status.as_u16(),
+                message: extract_error_message(&body),
+            });
+        }
+        read_capped(resp, max_bytes).await
+    }
+
+    /// `POST` raw bytes to an absolute URL *outside* the VRChat API — the
+    /// Discord webhook relay (M6). Shares the rate limiter, retry and
+    /// `Retry-After` policy of [`Client::send`], but a 401 from the remote
+    /// host is reported as a plain status and never clears VRChat auth
+    /// state (the host is not VRChat). `https` is required; plain `http`
+    /// is accepted only for loopback hosts when the client opted in via
+    /// [`ClientBuilder::allow_loopback_http`] (tests use a local mock).
+    pub async fn post_external(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<ExternalResponse, ApiError> {
+        let parsed = Url::parse(url).map_err(|_| ApiError::InvalidId(url.to_string()))?;
+        let scheme = parsed.scheme();
+        let loopback_http =
+            self.inner.allow_loopback_http && scheme == "http" && is_loopback_host(&parsed);
+        if scheme != "https" && !loopback_http {
+            return Err(ApiError::InvalidId(format!("non-https url: {url}")));
+        }
+        let resp = self
+            .send_inner(
+                Method::POST,
+                move |http| {
+                    http.post(parsed.clone())
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(body.clone())
+                },
+                AuthPolicy::Keep,
+            )
+            .await?;
+        let status = resp.status().as_u16();
+        let body = read_capped(resp, EXTERNAL_BODY_CAP).await?;
+        Ok(ExternalResponse { status, body })
+    }
+
     /// Single send path for every request: rate limit, retry, 401 handling.
     ///
     /// `make` rebuilds the [`reqwest::RequestBuilder`] on each attempt. Retries
@@ -235,6 +372,15 @@ impl Client {
         &self,
         method: Method,
         make: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Response, ApiError> {
+        self.send_inner(method, make, AuthPolicy::Clear).await
+    }
+
+    async fn send_inner(
+        &self,
+        method: Method,
+        make: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+        auth: AuthPolicy,
     ) -> Result<Response, ApiError> {
         let mut retries = 0;
         loop {
@@ -260,6 +406,11 @@ impl Client {
                         continue;
                     }
                     if status == StatusCode::UNAUTHORIZED {
+                        if auth == AuthPolicy::Keep {
+                            // External host: a 401 says nothing about the
+                            // VRChat session — hand the response back.
+                            return Ok(resp);
+                        }
                         // Session or credentials rejected: drop every stored
                         // trace of them (RULES.md §4).
                         self.clear_auth_state();
@@ -475,8 +626,93 @@ mod tests {
         assert_eq!(extract_error_message(b"not json"), "not json");
     }
 
-    #[test]
-    fn retry_after_parses_seconds_and_http_date() {
+    #[tokio::test]
+    async fn post_external_posts_to_loopback_mock() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/webhooks/1/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "1", "type": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::builder().allow_loopback_http().build().unwrap();
+        let url = format!("{}/api/webhooks/1/abc", server.uri());
+        let resp = client
+            .post_external(&url, b"payload".to_vec(), "text/plain")
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.windows(4).any(|w| w == b"\"id\""));
+    }
+
+    #[tokio::test]
+    async fn post_external_rejects_plain_http_non_loopback() {
+        let client = Client::builder().build().unwrap();
+        let err = client
+            .post_external("http://example.com/hook", vec![], "text/plain")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::InvalidId(_)));
+    }
+
+    #[tokio::test]
+    async fn get_bytes_rejects_non_https() {
+        let client = Client::builder().build().unwrap();
+        let err = client
+            .get_bytes("http://example.com/x.png", 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::InvalidId(_)));
+    }
+
+    #[tokio::test]
+    async fn get_bytes_fetches_loopback_mock() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNGfake".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = Client::builder().allow_loopback_http().build().unwrap();
+        let url = format!("{}/img.png", server.uri());
+        let bytes = client.get_bytes(&url, 1024).await.unwrap();
+        assert_eq!(bytes, b"\x89PNGfake");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_401_does_not_clear_session() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = Client::builder().allow_loopback_http().build().unwrap();
+        client.inject_auth_cookies("auth=synthetic-token").unwrap();
+        assert!(client.auth_token().is_some());
+
+        let url = format!("{}/img.png", server.uri());
+        let err = client.get_bytes(&url, 1024).await.unwrap_err();
+        assert!(matches!(err, ApiError::Http { status: 401, .. }));
+        // An image-host 401 is not a session check — auth must survive.
+        assert!(client.auth_token().is_some());
+    }
+
+    #[tokio::test]
+    async fn retry_after_parses_seconds_and_http_date() {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
         assert_eq!(retry_after(&headers), Some(Duration::from_secs(5)));

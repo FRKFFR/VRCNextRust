@@ -127,6 +127,45 @@ impl SessionRepo {
         .map_err(StoreError::Sql)
     }
 
+    /// The session covering `ts`: the visit that was open at that instant.
+    /// When no session spans `ts` (e.g. a photo taken in the menu just
+    /// after leaving), falls back to a session that ended within
+    /// [`SESSION_PHOTO_GRACE`] before `ts` — a photo belongs to the world
+    /// the player was just in, never to an ancient visit.
+    pub fn session_at(&self, ts: OffsetDateTime) -> Result<Option<Session>, StoreError> {
+        let conn = lock(&self.conn);
+        let t = ts_to_i64(ts);
+        if let Some(session) = conn
+            .query_row(
+                &format!(
+                    "{SESSION_SELECT}
+                     WHERE started_at <= ?1
+                       AND (ended_at IS NULL OR ended_at >= ?1)
+                     ORDER BY started_at DESC, id DESC LIMIT 1"
+                ),
+                params![t],
+                map_session,
+            )
+            .optional()
+            .map_err(StoreError::Sql)?
+        {
+            return Ok(Some(session));
+        }
+        conn.query_row(
+            &format!(
+                "{SESSION_SELECT}
+                 WHERE ended_at IS NOT NULL
+                   AND ended_at <= ?1
+                   AND ended_at >= ?1 - ?2
+                 ORDER BY ended_at DESC, id DESC LIMIT 1"
+            ),
+            params![t, SESSION_PHOTO_GRACE_SECS],
+            map_session,
+        )
+        .optional()
+        .map_err(StoreError::Sql)
+    }
+
     /// Close every still-open session at `ended_at` — used at startup to
     /// retire sessions orphaned by a previous app run. `ended_at` is
     /// clamped to `started_at` so clock skew can't produce negative
@@ -144,6 +183,10 @@ impl SessionRepo {
 
 const SESSION_SELECT: &str =
     "SELECT id, started_at, ended_at, world_id, world_name, instance_id, location FROM sessions";
+
+/// How long after a session ended a `PhotoTaken` may still be attributed
+/// to it (photos snapped in the menu/loading screens right after leaving).
+const SESSION_PHOTO_GRACE_SECS: i64 = 15 * 60;
 
 /// All sessions overlapping `[since, until)` (either bound may be absent),
 /// ordered by start. Open sessions (`ended_at IS NULL`) always overlap.
@@ -245,6 +288,39 @@ mod tests {
         let rows = sessions_in_range(&conn, None, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, Some(t0));
+    }
+
+    #[test]
+    fn session_at_covers_and_graces() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = store.sessions();
+        let t0 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000);
+        let id = repo
+            .open(&NewSession {
+                started_at: t0,
+                world_id: "wrld_a".to_string(),
+                world_name: "World A".to_string(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        repo.close(id, t0 + Duration::seconds(60)).unwrap();
+
+        // Inside the session.
+        let s = repo
+            .session_at(t0 + Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.world_id, "wrld_a");
+        // Just after it ended — inside the grace window.
+        let s = repo
+            .session_at(t0 + Duration::seconds(60 + 60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.world_id, "wrld_a");
+        // Long after — no attribution.
+        assert!(repo.session_at(t0 + Duration::hours(2)).unwrap().is_none());
+        // Before any session.
+        assert!(repo.session_at(t0 - Duration::hours(1)).unwrap().is_none());
     }
 
     #[test]
