@@ -30,7 +30,7 @@ pub(crate) fn notifications_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: 
             .on_hover_text("Deletes every notification")
             .clicked()
         {
-            app.send(Command::ClearNotifications);
+            app.confirm = Some(ConfirmAction::ClearNotifications);
         }
         ui.separator();
         ui.weak(format!(
@@ -370,6 +370,11 @@ pub(crate) fn note_editor(app: &mut VrcNextApp, ui: &mut egui::Ui, user_id: &str
                 });
             }
             if ui.button("Clear").clicked() {
+                // Clear on the server too — an empty note removes it.
+                app.send(Command::SetUserNote {
+                    user_id: user_id.to_string(),
+                    note: String::new(),
+                });
                 app.note_edit.clear();
             }
         });
@@ -481,6 +486,11 @@ pub(crate) fn confirm_dialog(app: &mut VrcNextApp, ui: &mut egui::Ui) {
                 kind: PlayerModerationKind::Block,
                 confirm: true,
             },
+        ),
+        ConfirmAction::ClearNotifications => (
+            "Clear all notifications?",
+            "Delete every notification?".to_string(),
+            Command::ClearNotifications,
         ),
     };
     let mut open = true;
