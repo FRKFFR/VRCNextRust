@@ -165,7 +165,7 @@ async fn notifications_list_decodes_string_details_and_nulls() {
 #[tokio::test]
 async fn notification_actions_hit_documented_put_paths() {
     let server = MockServer::start().await;
-    for (suffix, expect_id) in [("see", NOTIF_ID), ("hide", NOTIF_ID), ("accept", FRQ_ID)] {
+    for (suffix, expect_id) in [("see", NOTIF_ID), ("accept", FRQ_ID)] {
         Mock::given(method("PUT"))
             .and(path(format!(
                 "/auth/user/notifications/{expect_id}/{suffix}"
@@ -177,6 +177,15 @@ async fn notification_actions_hit_documented_put_paths() {
             .mount(&server)
             .await;
     }
+    Mock::given(method("PUT"))
+        .and(path(format!("/auth/user/notifications/{NOTIF_ID}/hide")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": NOTIF_ID,
+            "type": "invite"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("PUT"))
         .and(path("/auth/user/notifications/clear"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({

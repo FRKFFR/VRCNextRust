@@ -231,6 +231,25 @@ fn build_local_client() -> Result<Client> {
         .context("building the REST client")
 }
 
+/// True when the vault holds a session to resume.
+fn vault_has_session(vault: &impl vrc_core::CookieVault) -> Result<bool> {
+    Ok(vault.load()?.is_some())
+}
+
+/// Client for commands that need authentication: refuses to run without
+/// stored credentials so no HTTP request goes out while logged out.
+fn logged_in_client() -> Result<Client> {
+    let vault = KeyringVault::new().context("opening the OS credential store")?;
+    if !vault_has_session(&vault).context("reading stored credentials")? {
+        eprintln!("not logged in — run `vrcnext-cli login`");
+        std::process::exit(1);
+    }
+    Client::builder()
+        .vault(vault)
+        .build()
+        .context("building the REST client")
+}
+
 /// App config for every CLI command. The CLI shares `vrc.db` and the log
 /// directory with the desktop app, so it must not tail logs, persist
 /// events, or run session cleanup — a second writer would close live
@@ -333,7 +352,7 @@ async fn login(username: Option<String>) -> Result<()> {
 }
 
 async fn me() -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     let state = handle.state.snapshot();
     let user = state.current_user.context("no user despite session")?;
@@ -345,7 +364,7 @@ async fn me() -> Result<()> {
 }
 
 async fn friends() -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     wait_for(&mut handle, |e| matches!(e, AppEvent::FriendsRefreshed)).await?;
     let state = handle.state.snapshot();
@@ -370,7 +389,7 @@ async fn friends() -> Result<()> {
 }
 
 async fn watch() -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     println!("Watching pipeline events (Ctrl-C to stop)…");
     loop {
@@ -547,7 +566,7 @@ fn sender_name(state: &vrc_core::AppState, user_id: &str, fallback: &str) -> Str
 }
 
 async fn notifications(command: Option<NotificationCommand>) -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
 
     let command = match command {
@@ -613,7 +632,7 @@ fn instance_id_from_location(location: &str) -> &str {
 }
 
 async fn invite(user_id: &str, location: Option<&str>, slot: Option<u8>) -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
@@ -629,7 +648,7 @@ async fn invite(user_id: &str, location: Option<&str>, slot: Option<u8>) -> Resu
 }
 
 async fn request_invite(user_id: &str, slot: Option<u8>) -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
@@ -644,7 +663,7 @@ async fn request_invite(user_id: &str, slot: Option<u8>) -> Result<()> {
 }
 
 async fn multi_invite(user_ids: Vec<String>, location: Option<&str>) -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
@@ -724,7 +743,7 @@ async fn multi_invite(user_ids: Vec<String>, location: Option<&str>) -> Result<(
 }
 
 async fn profile(user_id: &str) -> Result<()> {
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
@@ -763,7 +782,7 @@ async fn set_note(user_id: &str, note: Vec<String>) -> Result<()> {
     if note.trim().is_empty() {
         bail!("note text is empty");
     }
-    let mut handle = App::spawn(cli_config(build_client()?));
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
@@ -775,4 +794,15 @@ async fn set_note(user_id: &str, note: Vec<String>) -> Result<()> {
     wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await?;
     println!("Note saved.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vrc_core::MemoryVault;
+
+    #[test]
+    fn empty_vault_has_no_session_to_resume() {
+        assert!(!vault_has_session(&MemoryVault::new()).unwrap());
+    }
 }

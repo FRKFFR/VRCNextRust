@@ -18,18 +18,6 @@ fn check_user_id(user_id: &str) -> Result<(), ApiError> {
     }
 }
 
-/// Validates an instance id for use in a request body — same charset rules
-/// as [`crate::instances::valid_instance_id`], re-checked here so callers
-/// can't smuggle a malformed location into the JSON body either.
-fn valid_instance_segment(instance_id: &str) -> bool {
-    !instance_id.is_empty()
-        && instance_id.len() <= 256
-        && !instance_id.contains("..")
-        && instance_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '(' | ')' | '-' | '+'))
-}
-
 impl Client {
     /// `POST /invite/{userId}` — invite a user to an instance.
     ///
@@ -46,7 +34,7 @@ impl Client {
         message_slot: Option<u8>,
     ) -> Result<Notification, ApiError> {
         check_user_id(user_id)?;
-        if !valid_instance_segment(instance_id) {
+        if !crate::valid_instance_id(instance_id) {
             return Err(ApiError::InvalidId(instance_id.chars().take(64).collect()));
         }
         if let Some(slot) = message_slot {
@@ -115,17 +103,16 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_instance_segment;
 
     #[test]
     fn instance_segment_validation() {
-        assert!(valid_instance_segment(
+        assert!(crate::valid_instance_id(
             "12345~hidden(usr_x)~region(eu)~nonce(abc)"
         ));
-        assert!(valid_instance_segment("offline"));
-        assert!(!valid_instance_segment(""));
-        assert!(!valid_instance_segment("a/b"));
-        assert!(!valid_instance_segment("a?b=c"));
-        assert!(!valid_instance_segment("a..b"));
+        assert!(crate::valid_instance_id("offline"));
+        assert!(!crate::valid_instance_id(""));
+        assert!(!crate::valid_instance_id("a/b"));
+        assert!(!crate::valid_instance_id("a?b=c"));
+        assert!(!crate::valid_instance_id("a..b"));
     }
 }

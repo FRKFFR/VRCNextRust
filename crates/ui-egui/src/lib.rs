@@ -34,6 +34,8 @@ pub(crate) enum ConfirmAction {
         /// `usr_…` target id.
         user_id: String,
     },
+    /// `Command::ClearNotifications` — destructive, needs the dialog.
+    ClearNotifications,
 }
 
 /// Root eframe application.
