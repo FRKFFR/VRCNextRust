@@ -11,6 +11,7 @@ mod dashboard;
 pub mod format;
 mod local;
 mod sections;
+mod social;
 mod state;
 
 pub use app::{
@@ -18,15 +19,21 @@ pub use app::{
 };
 pub use dashboard::{dashboard, world_title, DashboardEntry};
 pub use sections::{search, sections, worlds_with_friends, FriendSections, WorldGroup};
+pub use social::{
+    friend_status_label, friends_in_instance, moderation_label, notification_kind_label,
+    validate_multi_invite_targets, MULTI_INVITE_GAP, MULTI_INVITE_MAX_TARGETS,
+};
 pub use state::{
-    AppState, AuthState, Friend, HistoryPage, PipelineStatus, TimelinePage, WorldName,
+    AppState, AuthState, Friend, HistoryPage, MultiInviteProgress, PipelineStatus, ProfileView,
+    TimelinePage, WorldName,
 };
 
 // Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
 // the leaf crates they legitimately need.
 pub use vrc_api::{
-    ApiError, Client, ClientBuilder, CookieVault, KeyringVault, LoginOutcome, MemoryVault,
-    TrustRank, TwoFactorMethod, USER_AGENT,
+    ApiError, Client, ClientBuilder, CookieVault, FriendStatus, Instance, KeyringVault,
+    LoginOutcome, MemoryVault, Notification, NotificationV2, PlayerModeration,
+    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, USER_AGENT,
 };
 pub use vrc_logs::{default_log_dir, LogEvent, LogTailer};
 pub use vrc_pipeline::PipelineConfig;

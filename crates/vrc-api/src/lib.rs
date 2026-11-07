@@ -19,18 +19,28 @@ mod auth;
 mod client;
 mod error;
 mod friends;
+mod instances;
+mod invites;
 pub mod models;
+mod moderation;
+mod notifications;
 mod rate_limit;
+mod users;
 mod vault;
 mod worlds;
 
 pub use auth::LoginOutcome;
 pub use client::{Client, ClientBuilder, API_ROOT};
 pub use error::ApiError;
+pub use instances::valid_instance_id;
 pub use models::{
-    CurrentUser, Favorite, LimitedUser, PastDisplayName, TrustRank, TwoFactorMethod, User, World,
+    CurrentUser, CurrentUserPresence, Favorite, FriendStatus, Instance, LimitedUser, Notification,
+    NotificationV2, NotificationV2Response, PastDisplayName, PlayerModeration,
+    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, World,
 };
+pub use notifications::valid_notification_id;
 pub use rate_limit::RateLimiter;
+pub use users::valid_user_id;
 pub use vault::{CookieVault, KeyringVault, MemoryVault};
 pub use worlds::valid_world_id;
 

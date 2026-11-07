@@ -9,6 +9,7 @@
 //! are never logged (RULES.md §4).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -16,14 +17,18 @@ use futures_util::StreamExt;
 use secrecy::SecretString;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, TwoFactorMethod};
+use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, PlayerModerationKind, TwoFactorMethod};
 use vrc_logs::{LogEvent, LogTailer};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
 use vrc_store::{FriendHistoryFilter, StatsRange, Store, TimelineFilter};
 
 use crate::local::{self, StoreOp};
 use crate::sections::worlds_with_friends;
-use crate::state::{valid_world_id, AppState, AuthState, Friend, PipelineStatus, WorldName};
+use crate::social::{self, MULTI_INVITE_GAP};
+use crate::state::{
+    valid_world_id, AppState, AuthState, Friend, MultiInviteProgress, PipelineStatus, ProfileView,
+    WorldName,
+};
 
 /// Static configuration for [`App::spawn`].
 #[derive(Debug)]
@@ -148,6 +153,113 @@ pub enum Command {
         /// Time bounds; `StatsRange::default()` covers all time.
         range: StatsRange,
     },
+    /// `GET /auth/user/notifications` into `AppState.notifications`.
+    RefreshNotifications,
+    /// `PUT …/notifications/{id}/see` — mark one notification seen.
+    SeeNotification {
+        /// `not_…`/`frq_…` notification id.
+        id: String,
+    },
+    /// `PUT …/notifications/{id}/hide` — hide/delete one notification.
+    HideNotification {
+        /// `not_…`/`frq_…` notification id.
+        id: String,
+    },
+    /// `PUT …/notifications/{id}/accept` — accept a friend request.
+    AcceptNotification {
+        /// `frq_…` friend-request notification id.
+        id: String,
+    },
+    /// `PUT …/notifications/clear` — clear **all** notifications.
+    ClearNotifications,
+    /// Load a user profile (`GET /users/{id}` + `friendStatus` +
+    /// `playermoderations`) into `AppState.profile`.
+    LoadProfile {
+        /// `usr_…` id of the user to inspect.
+        user_id: String,
+    },
+    /// `POST /userNotes` — set the note on `AppState.profile`'s user.
+    SetUserNote {
+        /// `usr_…` id of the profile's user.
+        user_id: String,
+        /// Note text.
+        note: String,
+    },
+    /// `POST /user/{id}/friendRequest`.
+    SendFriendRequest {
+        /// `usr_…` target id.
+        user_id: String,
+    },
+    /// `DELETE /user/{id}/friendRequest` — cancel an outgoing request.
+    CancelFriendRequest {
+        /// `usr_…` target id.
+        user_id: String,
+    },
+    /// `DELETE /auth/user/friends/{id}` — remove a friend. Destructive:
+    /// requires `confirm: true`.
+    Unfriend {
+        /// `usr_…` target id.
+        user_id: String,
+        /// Must be `true`; anything else is rejected without an API call.
+        confirm: bool,
+    },
+    /// `POST /auth/user/playermoderations` — block/mute/etc. `Block` is
+    /// destructive and requires `confirm: true`; the other kinds do not.
+    ModerateUser {
+        /// `usr_…` target id.
+        user_id: String,
+        /// Moderation kind (`block`, `mute`, `hideAvatar`, …).
+        kind: PlayerModerationKind,
+        /// Required `true` for `Block`; ignored otherwise.
+        confirm: bool,
+    },
+    /// `PUT /auth/user/unplayermoderate` — undo a moderation.
+    UnmoderateUser {
+        /// `usr_…` target id.
+        user_id: String,
+        /// Moderation kind to remove.
+        kind: PlayerModerationKind,
+    },
+    /// `POST /invite/{userId}` — invite a user to an instance.
+    InviteUser {
+        /// `usr_…` target id.
+        user_id: String,
+        /// Instance id override; `None` → the session's own instance.
+        instance_id: Option<String>,
+        /// Custom invite message slot (0–11).
+        message_slot: Option<u8>,
+    },
+    /// `POST /requestInvite/{userId}` — ask a user to invite you.
+    RequestInvite {
+        /// `usr_…` target id.
+        user_id: String,
+        /// Custom request message slot (0–11).
+        request_slot: Option<u8>,
+    },
+    /// `POST /invite/{notificationId}/response` — reply to an invite.
+    RespondToInvite {
+        /// `not_…` invite notification id.
+        notification_id: String,
+        /// Response slot (0–11).
+        response_slot: u8,
+    },
+    /// Throttled, cancellable batch of [`Command::InviteUser`] calls —
+    /// sequential, ≥1.5 s apart, ≤50 targets.
+    MultiInvite {
+        /// `usr_…` target ids.
+        user_ids: Vec<String>,
+        /// Instance id override; `None` → the session's own instance.
+        instance_id: Option<String>,
+    },
+    /// Stop the running multi-invite batch (finishes the in-flight invite).
+    CancelMultiInvite,
+    /// `GET /instances/{worldId}:{instanceId}` into `AppState.instance`.
+    LoadInstance {
+        /// `wrld_…` world id.
+        world_id: String,
+        /// Instance id.
+        instance_id: String,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -165,6 +277,24 @@ impl std::fmt::Debug for Command {
             Command::LoadTimeline { .. } => "LoadTimeline",
             Command::LoadFriendHistory { .. } => "LoadFriendHistory",
             Command::LoadStats { .. } => "LoadStats",
+            Command::RefreshNotifications => "RefreshNotifications",
+            Command::SeeNotification { .. } => "SeeNotification",
+            Command::HideNotification { .. } => "HideNotification",
+            Command::AcceptNotification { .. } => "AcceptNotification",
+            Command::ClearNotifications => "ClearNotifications",
+            Command::LoadProfile { .. } => "LoadProfile",
+            Command::SetUserNote { .. } => "SetUserNote",
+            Command::SendFriendRequest { .. } => "SendFriendRequest",
+            Command::CancelFriendRequest { .. } => "CancelFriendRequest",
+            Command::Unfriend { .. } => "Unfriend",
+            Command::ModerateUser { .. } => "ModerateUser",
+            Command::UnmoderateUser { .. } => "UnmoderateUser",
+            Command::InviteUser { .. } => "InviteUser",
+            Command::RequestInvite { .. } => "RequestInvite",
+            Command::RespondToInvite { .. } => "RespondToInvite",
+            Command::MultiInvite { .. } => "MultiInvite",
+            Command::CancelMultiInvite => "CancelMultiInvite",
+            Command::LoadInstance { .. } => "LoadInstance",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -189,6 +319,16 @@ pub enum AppEvent {
     FriendHistoryLoaded,
     /// `AppState.stats` was updated by `LoadStats`.
     StatsLoaded,
+    /// `AppState.notifications` changed (fetch or mutation).
+    NotificationsChanged,
+    /// `AppState.profile` changed (load or mutation).
+    ProfileChanged,
+    /// `AppState.instance` was updated by `LoadInstance`.
+    InstanceLoaded,
+    /// An invite/request-invite/respond completed successfully.
+    InviteSent,
+    /// `AppState.multi_invite` progress changed.
+    MultiInviteProgress,
     /// A command failed (message carries no secrets).
     Error(String),
 }
@@ -248,6 +388,13 @@ struct Runtime {
     log_events: Option<mpsc::UnboundedReceiver<LogEvent>>,
     /// `AppConfig::local_writes` — gates store writes (queries still work).
     local_writes: bool,
+    /// Cancellation flag for the running multi-invite batch; `None` when
+    /// no batch is active.
+    multi_invite_cancel: Option<Arc<AtomicBool>>,
+    /// Detached tasks (multi-invite) report a dead session here; the
+    /// command loop performs the actual teardown.
+    session_expired_tx: mpsc::UnboundedSender<()>,
+    session_expired_rx: mpsc::UnboundedReceiver<()>,
 }
 
 async fn run(
@@ -310,6 +457,7 @@ async fn run(
         None
     };
 
+    let (session_expired_tx, session_expired_rx) = mpsc::unbounded_channel();
     let mut rt = Runtime {
         commands,
         events,
@@ -323,6 +471,9 @@ async fn run(
         store_tx,
         log_events,
         local_writes: config.local_writes,
+        multi_invite_cancel: None,
+        session_expired_tx,
+        session_expired_rx,
     };
     rt.state.write().log_tail_active = rt.log_events.is_some();
     loop {
@@ -337,6 +488,11 @@ async fn run(
                     rt.apply_pipeline_event(&event);
                     rt.ensure_world_names();
                     let _ = rt.events.send(AppEvent::Pipeline(Box::new(event)));
+                }
+            }
+            expired = rt.session_expired_rx.recv() => {
+                if expired.is_some() {
+                    rt.session_expired();
                 }
             }
             log = async {
@@ -451,6 +607,47 @@ impl Runtime {
             Command::LoadTimeline { page, filter } => self.load_timeline(page, filter),
             Command::LoadFriendHistory { page, filter } => self.load_friend_history(page, filter),
             Command::LoadStats { range } => self.load_stats(range),
+            Command::RefreshNotifications => self.refresh_notifications().await,
+            Command::SeeNotification { id } => self.see_notification(&id).await,
+            Command::HideNotification { id } => self.hide_notification(&id).await,
+            Command::AcceptNotification { id } => self.accept_notification(&id).await,
+            Command::ClearNotifications => self.clear_notifications().await,
+            Command::LoadProfile { user_id } => self.load_profile(&user_id).await,
+            Command::SetUserNote { user_id, note } => self.set_user_note(&user_id, &note).await,
+            Command::SendFriendRequest { user_id } => self.send_friend_request(&user_id).await,
+            Command::CancelFriendRequest { user_id } => self.cancel_friend_request(&user_id).await,
+            Command::Unfriend { user_id, confirm } => self.unfriend(&user_id, confirm).await,
+            Command::ModerateUser {
+                user_id,
+                kind,
+                confirm,
+            } => self.moderate_user(&user_id, kind, confirm).await,
+            Command::UnmoderateUser { user_id, kind } => self.unmoderate_user(&user_id, kind).await,
+            Command::InviteUser {
+                user_id,
+                instance_id,
+                message_slot,
+            } => self.invite_user(&user_id, instance_id, message_slot).await,
+            Command::RequestInvite {
+                user_id,
+                request_slot,
+            } => self.request_invite(&user_id, request_slot).await,
+            Command::RespondToInvite {
+                notification_id,
+                response_slot,
+            } => {
+                self.respond_to_invite(&notification_id, response_slot)
+                    .await
+            }
+            Command::MultiInvite {
+                user_ids,
+                instance_id,
+            } => self.start_multi_invite(user_ids, instance_id).await,
+            Command::CancelMultiInvite => self.cancel_multi_invite(),
+            Command::LoadInstance {
+                world_id,
+                instance_id,
+            } => self.load_instance(&world_id, &instance_id).await,
         }
     }
 
@@ -720,6 +917,452 @@ impl Runtime {
         }
     }
 
+    /// Await a social REST call; `Unauthorized` tears the session down and
+    /// other errors are reported — the handler just gets `None` back.
+    async fn attempt<T>(
+        &mut self,
+        fut: impl std::future::Future<Output = Result<T, ApiError>>,
+    ) -> Option<T> {
+        match fut.await {
+            Ok(value) => Some(value),
+            Err(ApiError::Unauthorized) => {
+                self.session_expired();
+                None
+            }
+            Err(e) => {
+                self.report(e);
+                None
+            }
+        }
+    }
+
+    /// Report a non-API failure (validation, missing state) like a command
+    /// error without needing an [`ApiError`].
+    fn report_message(&mut self, message: &str) {
+        let message = message.to_string();
+        self.state.write().last_error = Some(message.clone());
+        let _ = self.events.send(AppEvent::Error(message));
+    }
+
+    /// `GET /auth/user/notifications` → `AppState.notifications`.
+    async fn refresh_notifications(&mut self) {
+        if let Some(list) = self.attempt(self.client.clone().notifications()).await {
+            self.state.write().notifications = Some(list);
+            let _ = self.events.send(AppEvent::NotificationsChanged);
+        }
+    }
+
+    /// `PUT …/see` then mark the cached entry seen.
+    async fn see_notification(&mut self, id: &str) {
+        if self
+            .attempt(self.client.clone().see_notification(id))
+            .await
+            .is_some()
+        {
+            if let Some(list) = self.state.write().notifications.as_mut() {
+                if let Some(n) = list.iter_mut().find(|n| n.id == id) {
+                    n.seen = true;
+                }
+            }
+            let _ = self.events.send(AppEvent::NotificationsChanged);
+        }
+    }
+
+    /// `PUT …/hide` then drop the cached entry.
+    async fn hide_notification(&mut self, id: &str) {
+        if self
+            .attempt(self.client.clone().hide_notification(id))
+            .await
+            .is_some()
+        {
+            if let Some(list) = self.state.write().notifications.as_mut() {
+                list.retain(|n| n.id != id);
+            }
+            let _ = self.events.send(AppEvent::NotificationsChanged);
+        }
+    }
+
+    /// `PUT …/accept` — accept a friend request, drop the notification and
+    /// refresh friends so the new friend appears without waiting for the
+    /// pipeline `friend-add`.
+    async fn accept_notification(&mut self, id: &str) {
+        if self
+            .attempt(self.client.clone().accept_friend_request(id))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        {
+            let mut state = self.state.write();
+            if let Some(list) = state.notifications.as_mut() {
+                list.retain(|n| n.id != id);
+            }
+        }
+        let _ = self.events.send(AppEvent::NotificationsChanged);
+        match self.refresh_friends().await {
+            Ok(()) => {}
+            Err(ApiError::Unauthorized) => self.session_expired(),
+            Err(e) => self.report(e),
+        }
+    }
+
+    /// `PUT …/clear` — wipe the whole notification list.
+    async fn clear_notifications(&mut self) {
+        if self
+            .attempt(self.client.clone().clear_notifications())
+            .await
+            .is_some()
+        {
+            self.state.write().notifications = Some(Vec::new());
+            let _ = self.events.send(AppEvent::NotificationsChanged);
+        }
+    }
+
+    /// `GET /users/{id}` + `friendStatus` + `playermoderations` →
+    /// `AppState.profile`.
+    async fn load_profile(&mut self, user_id: &str) {
+        let user = match self.attempt(self.client.clone().user(user_id)).await {
+            Some(user) => user,
+            None => return,
+        };
+        // The companion calls are best-effort — a failure leaves defaults
+        // rather than blanking the profile — but a rejected session still
+        // tears down like every other authenticated call.
+        let friend_status = match self.client.clone().friend_status(user_id).await {
+            Ok(status) => status,
+            Err(ApiError::Unauthorized) => {
+                self.session_expired();
+                return;
+            }
+            Err(_) => Default::default(),
+        };
+        let moderations = match self
+            .client
+            .clone()
+            .player_moderations(Some(user_id), None)
+            .await
+        {
+            Ok(list) => list,
+            Err(ApiError::Unauthorized) => {
+                self.session_expired();
+                return;
+            }
+            Err(_) => Vec::new(),
+        };
+        self.state.write().profile = Some(ProfileView {
+            user,
+            friend_status,
+            moderations,
+        });
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `POST /userNotes` and reflect the note into the loaded profile.
+    async fn set_user_note(&mut self, user_id: &str, note: &str) {
+        let saved = match self
+            .attempt(self.client.clone().set_user_note(user_id, note))
+            .await
+        {
+            Some(saved) => saved,
+            None => return,
+        };
+        let mut state = self.state.write();
+        if let Some(profile) = state.profile.as_mut() {
+            if profile.user.id == user_id {
+                profile.user.note = saved.note.clone();
+            }
+        }
+        drop(state);
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `POST /user/{id}/friendRequest`; optimistically flips the profile's
+    /// outgoing-request flag.
+    async fn send_friend_request(&mut self, user_id: &str) {
+        if self
+            .attempt(self.client.clone().send_friend_request(user_id))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        if let Some(profile) = self.state.write().profile.as_mut() {
+            if profile.user.id == user_id {
+                profile.friend_status.outgoing_request = true;
+                profile.friend_status.incoming_request = false;
+            }
+        }
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `DELETE /user/{id}/friendRequest`; clears the outgoing-request flag.
+    async fn cancel_friend_request(&mut self, user_id: &str) {
+        if self
+            .attempt(self.client.clone().cancel_friend_request(user_id))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        if let Some(profile) = self.state.write().profile.as_mut() {
+            if profile.user.id == user_id {
+                profile.friend_status.outgoing_request = false;
+            }
+        }
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `DELETE /auth/user/friends/{id}` — requires `confirm`; removes the
+    /// friend locally and clears profile relationship state.
+    async fn unfriend(&mut self, user_id: &str, confirm: bool) {
+        if !confirm {
+            self.report_message("unfriend requires confirmation");
+            return;
+        }
+        if self
+            .attempt(self.client.clone().unfriend(user_id))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        let mut state = self.state.write();
+        state.friends.remove(user_id);
+        if let Some(profile) = state.profile.as_mut() {
+            if profile.user.id == user_id {
+                profile.friend_status = Default::default();
+                profile.user.friend_request_status.clear();
+            }
+        }
+        drop(state);
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `POST /auth/user/playermoderations` — `Block` requires `confirm`.
+    async fn moderate_user(&mut self, user_id: &str, kind: PlayerModerationKind, confirm: bool) {
+        if kind == PlayerModerationKind::Block && !confirm {
+            self.report_message("blocking a user requires confirmation");
+            return;
+        }
+        let created = match self
+            .attempt(self.client.clone().moderate_user(user_id, kind))
+            .await
+        {
+            Some(created) => created,
+            None => return,
+        };
+        if let Some(profile) = self.state.write().profile.as_mut() {
+            if profile.user.id == user_id {
+                // Dedupe on the moderation id when present, else on
+                // target+kind so an id-less response can't stack copies.
+                let duplicate = profile.moderations.iter().any(|m| {
+                    (!created.id.is_empty() && m.id == created.id)
+                        || (m.target_user_id == user_id && m.kind() == Some(kind))
+                });
+                if !duplicate {
+                    profile.moderations.push(created);
+                }
+            }
+        }
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// `PUT /auth/user/unplayermoderate` — drops matching moderations from
+    /// the loaded profile.
+    async fn unmoderate_user(&mut self, user_id: &str, kind: PlayerModerationKind) {
+        if self
+            .attempt(self.client.clone().unmoderate_user(user_id, kind))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        if let Some(profile) = self.state.write().profile.as_mut() {
+            profile
+                .moderations
+                .retain(|m| !(m.target_user_id == user_id && m.kind() == Some(kind)));
+        }
+        let _ = self.events.send(AppEvent::ProfileChanged);
+    }
+
+    /// Resolve the invite target instance: explicit override wins, else the
+    /// session's own `presence.instance`.
+    fn resolve_invite_instance(&self, override_id: Option<String>) -> Option<String> {
+        override_id
+            .filter(|id| !id.is_empty())
+            .or_else(|| social::own_instance_id(&self.state.read()))
+    }
+
+    /// `POST /invite/{userId}`.
+    async fn invite_user(
+        &mut self,
+        user_id: &str,
+        instance_id: Option<String>,
+        message_slot: Option<u8>,
+    ) {
+        let Some(instance) = self.resolve_invite_instance(instance_id) else {
+            self.report_message("no instance to invite to — join an instance first");
+            return;
+        };
+        if self
+            .attempt(
+                self.client
+                    .clone()
+                    .invite_user(user_id, &instance, message_slot),
+            )
+            .await
+            .is_some()
+        {
+            let _ = self.events.send(AppEvent::InviteSent);
+        }
+    }
+
+    /// `POST /requestInvite/{userId}`.
+    async fn request_invite(&mut self, user_id: &str, request_slot: Option<u8>) {
+        if self
+            .attempt(self.client.clone().request_invite(user_id, request_slot))
+            .await
+            .is_some()
+        {
+            let _ = self.events.send(AppEvent::InviteSent);
+        }
+    }
+
+    /// `POST /invite/{notificationId}/response`.
+    async fn respond_to_invite(&mut self, notification_id: &str, response_slot: u8) {
+        if self
+            .attempt(
+                self.client
+                    .clone()
+                    .respond_invite(notification_id, response_slot),
+            )
+            .await
+            .is_some()
+        {
+            let _ = self.events.send(AppEvent::InviteSent);
+        }
+    }
+
+    /// Start a throttled multi-invite batch. Targets are validated and
+    /// deduplicated up front; the spawned task walks them sequentially,
+    /// waiting [`MULTI_INVITE_GAP`] between invites and honoring the
+    /// cancellation flag (RULES.md §3).
+    async fn start_multi_invite(&mut self, user_ids: Vec<String>, instance_id: Option<String>) {
+        let targets = match social::validate_multi_invite_targets(&user_ids) {
+            Ok(targets) => targets,
+            Err(message) => {
+                self.report_message(&message);
+                return;
+            }
+        };
+        if self
+            .state
+            .read()
+            .multi_invite
+            .as_ref()
+            .is_some_and(|p| p.running)
+        {
+            self.report_message("a multi-invite is already running");
+            return;
+        }
+        let Some(instance) = self.resolve_invite_instance(instance_id) else {
+            self.report_message("no instance to invite to — join an instance first");
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.multi_invite_cancel = Some(cancel.clone());
+        let total = targets.len();
+        {
+            let mut state = self.state.write();
+            state.multi_invite = Some(MultiInviteProgress {
+                total,
+                running: true,
+                ..Default::default()
+            });
+        }
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let events = self.events.clone();
+        let session_expired_tx = self.session_expired_tx.clone();
+        tokio::spawn(async move {
+            let mut progress = MultiInviteProgress {
+                total,
+                running: true,
+                ..Default::default()
+            };
+            let publish = |progress: &MultiInviteProgress| {
+                // Teardown (logout/401) clears the slot; keep emitting the
+                // event so waiters still see the batch end, but never
+                // resurrect session state afterwards.
+                {
+                    let mut guard = state.write();
+                    if guard.multi_invite.is_some() {
+                        guard.multi_invite = Some(progress.clone());
+                    }
+                }
+                let _ = events.send(AppEvent::MultiInviteProgress);
+            };
+            for target in targets {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                progress.current = Some(target.clone());
+                publish(&progress);
+                match client.invite_user(&target, &instance, None).await {
+                    Ok(_) => progress.succeeded += 1,
+                    Err(ApiError::Unauthorized) => {
+                        // The session is dead: count the attempt, stop the
+                        // batch and let the command loop tear the session
+                        // down — remaining targets are skipped.
+                        progress.failed += 1;
+                        progress.done += 1;
+                        progress.current = None;
+                        let _ = session_expired_tx.send(());
+                        break;
+                    }
+                    Err(e) => {
+                        progress.failed += 1;
+                        state.write().last_error = Some(format!("invite {target}: {e}"));
+                    }
+                }
+                progress.done += 1;
+                progress.current = None;
+                publish(&progress);
+                // Throttle: wait out the gap in small slices so cancel
+                // lands promptly instead of after a full 1.5 s.
+                let deadline = Instant::now() + MULTI_INVITE_GAP;
+                while Instant::now() < deadline {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            progress.running = false;
+            progress.current = None;
+            publish(&progress);
+        });
+    }
+
+    /// Flag the running multi-invite batch to stop.
+    fn cancel_multi_invite(&mut self) {
+        if let Some(cancel) = &self.multi_invite_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `GET /instances/{worldId}:{instanceId}` → `AppState.instance`.
+    async fn load_instance(&mut self, world_id: &str, instance_id: &str) {
+        if let Some(instance) = self
+            .attempt(self.client.clone().instance(world_id, instance_id))
+            .await
+        {
+            self.state.write().instance = Some(instance);
+            let _ = self.events.send(AppEvent::InstanceLoaded);
+        }
+    }
+
     /// Merge one pipeline event into `AppState` (never re-fetches).
     fn apply_pipeline_event(&mut self, event: &PipelineEvent) {
         let mut state = self.state.write();
@@ -832,9 +1475,56 @@ impl Runtime {
             PipelineEvent::FriendDelete { user_id } => {
                 state.friends.remove(user_id);
             }
-            // Notifications, user updates and unknown frames don't alter the
-            // friends map; subscribers still see them via AppEvent::Pipeline.
-            PipelineEvent::Notification(_)
+            PipelineEvent::Notification { notification } => {
+                if notification.id.is_empty() {
+                    return;
+                }
+                let list = state.notifications.get_or_insert_with(Vec::new);
+                match list.iter_mut().find(|n| n.id == notification.id) {
+                    Some(existing) => *existing = notification.clone(),
+                    // Newest first, matching the REST list ordering.
+                    None => list.insert(0, notification.clone()),
+                }
+            }
+            PipelineEvent::SeeNotification { notification_id } => {
+                if let Some(list) = state.notifications.as_mut() {
+                    if let Some(n) = list.iter_mut().find(|n| &n.id == notification_id) {
+                        n.seen = true;
+                    }
+                }
+            }
+            PipelineEvent::HideNotification { notification_id } => {
+                if let Some(list) = state.notifications.as_mut() {
+                    list.retain(|n| n.id != *notification_id);
+                }
+            }
+            PipelineEvent::ClearNotifications => {
+                state.notifications = Some(Vec::new());
+            }
+            PipelineEvent::NotificationV2 { notification } => {
+                if notification.id.is_empty() {
+                    return;
+                }
+                match state
+                    .notifications_v2
+                    .iter_mut()
+                    .find(|n| n.id == notification.id)
+                {
+                    Some(existing) => *existing = notification.clone(),
+                    None => state.notifications_v2.insert(0, notification.clone()),
+                }
+            }
+            PipelineEvent::NotificationV2Update { id, updates } => {
+                if let Some(existing) = state.notifications_v2.iter_mut().find(|n| &n.id == id) {
+                    social::merge_notification_v2(existing, updates);
+                }
+            }
+            PipelineEvent::NotificationV2Delete { ids } => {
+                state.notifications_v2.retain(|n| !ids.contains(&n.id));
+            }
+            // user updates, responses and unknown frames don't alter state;
+            // subscribers still see them via AppEvent::Pipeline.
+            PipelineEvent::ResponseNotification { .. }
             | PipelineEvent::UserUpdate { .. }
             | PipelineEvent::Unknown { .. } => {}
         }
@@ -862,11 +1552,21 @@ impl Runtime {
         // pipeline status or repopulate friends after teardown (same reason
         // `after_login` installs a fresh channel).
         self.pipeline_events = mpsc::unbounded_channel();
+        // Stop any running multi-invite batch; its task observes the flag
+        // and finishes without further requests.
+        if let Some(cancel) = self.multi_invite_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         let mut state = self.state.write();
         state.current_user = None;
         state.friends.clear();
         state.pipeline = PipelineStatus::Disconnected;
         state.world_names.clear();
+        state.notifications = None;
+        state.notifications_v2.clear();
+        state.profile = None;
+        state.instance = None;
+        state.multi_invite = None;
     }
 
     fn report(&mut self, error: ApiError) {

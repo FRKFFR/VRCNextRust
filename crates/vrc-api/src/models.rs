@@ -180,6 +180,10 @@ pub struct CurrentUser {
         deserialize_with = "null_to_default"
     )]
     pub profile_pic_override_thumbnail: String,
+    /// The current user's live location/session info (`presence` on
+    /// `GET /auth/user`); `None` when absent.
+    #[serde(deserialize_with = "null_to_default")]
+    pub presence: Option<CurrentUserPresence>,
 }
 
 impl CurrentUser {
@@ -330,6 +334,16 @@ pub struct User {
     pub profile_pic_override_thumbnail: String,
     #[serde(rename = "fallbackAvatar", deserialize_with = "null_to_default")]
     pub fallback_avatar: String,
+    /// The current user's note on this user (empty when unset).
+    #[serde(deserialize_with = "null_to_default")]
+    pub note: String,
+    /// Friend-request state reported by the API (`none`, `incoming`,
+    /// `outgoing`, …).
+    #[serde(rename = "friendRequestStatus", deserialize_with = "null_to_default")]
+    pub friend_request_status: String,
+    /// The user's pronouns, when set.
+    #[serde(deserialize_with = "null_to_default")]
+    pub pronouns: String,
 }
 
 impl User {
@@ -400,6 +414,361 @@ pub struct Favorite {
     pub tags: Vec<String>,
     #[serde(deserialize_with = "null_to_default")]
     pub visibility: String,
+}
+
+/// A notification (`GET /auth/user/notifications`, pipeline `notification`).
+///
+/// `id` is `not_…` for regular notifications and `frq_…` for friend
+/// requests. `details` is a JSON-encoded object on REST responses and an
+/// object on WebSocket pushes; both decode into [`serde_json::Value`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notification {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    /// Notification kind: `friendRequest`, `invite`, `inviteResponse`,
+    /// `message`, `requestInvite`, `requestInviteResponse`, `votetokick`.
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    #[serde(rename = "created_at", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    /// Type-specific payload (invite world, vote details, …); always a
+    /// decoded JSON value — REST sends it string-encoded, the pipeline
+    /// sends it as an object.
+    #[serde(deserialize_with = "details_to_value")]
+    pub details: serde_json::Value,
+    #[serde(deserialize_with = "null_to_default")]
+    pub message: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub seen: bool,
+    #[serde(rename = "senderUserId", deserialize_with = "null_to_default")]
+    pub sender_user_id: String,
+    #[serde(rename = "senderUsername", deserialize_with = "null_to_default")]
+    pub sender_username: String,
+    #[serde(rename = "receiverUserId", deserialize_with = "null_to_default")]
+    pub receiver_user_id: String,
+}
+
+impl Notification {
+    /// `true` for incoming friend requests (accepted via
+    /// `PUT …/notifications/{id}/accept`). REST reports `friendRequest`;
+    /// pipeline pushes may use the kebab-case spelling.
+    pub fn is_friend_request(&self) -> bool {
+        matches!(self.kind.as_str(), "friendRequest" | "friend-request")
+    }
+}
+
+/// `details` arrives either as a JSON string (REST) or an object
+/// (WebSocket); normalise both to the decoded value.
+fn details_to_value<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(s)) => {
+            Ok(serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)))
+        }
+        Some(value) => Ok(value),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+/// A response action offered on a [`NotificationV2`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationV2Response {
+    /// Response kind: `delete`, `unsubscribe`, …
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub data: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub icon: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub text: String,
+}
+
+/// A NotificationV2 object (pipeline `notification-v2`).
+///
+/// The newer notification system (group announcements, social pushes). All
+/// fields default so partial pushes still decode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationV2 {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub version: i64,
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub category: String,
+    #[serde(rename = "isSystem", deserialize_with = "null_to_default")]
+    pub is_system: bool,
+    #[serde(rename = "ignoreDND", deserialize_with = "null_to_default")]
+    pub ignore_dnd: bool,
+    #[serde(rename = "senderUserId", deserialize_with = "null_to_default")]
+    pub sender_user_id: String,
+    #[serde(rename = "senderUsername", deserialize_with = "null_to_default")]
+    pub sender_username: String,
+    #[serde(rename = "receiverUserId", deserialize_with = "null_to_default")]
+    pub receiver_user_id: String,
+    #[serde(
+        rename = "relatedNotificationsId",
+        deserialize_with = "null_to_default"
+    )]
+    pub related_notifications_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub title: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub message: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub link: String,
+    #[serde(rename = "linkText", deserialize_with = "null_to_default")]
+    pub link_text: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub responses: Vec<NotificationV2Response>,
+    #[serde(rename = "expiresAt", deserialize_with = "null_to_default")]
+    pub expires_at: String,
+    #[serde(rename = "expiryAfterSeen", deserialize_with = "null_to_default")]
+    pub expiry_after_seen: i64,
+    #[serde(rename = "requireSeen", deserialize_with = "null_to_default")]
+    pub require_seen: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub seen: bool,
+    #[serde(rename = "canDelete", deserialize_with = "null_to_default")]
+    pub can_delete: bool,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+}
+
+/// Friend-relationship state between the current user and another user
+/// (`GET /user/{userId}/friendStatus`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FriendStatus {
+    #[serde(rename = "incomingRequest", deserialize_with = "null_to_default")]
+    pub incoming_request: bool,
+    #[serde(rename = "isFriend", deserialize_with = "null_to_default")]
+    pub is_friend: bool,
+    #[serde(rename = "outgoingRequest", deserialize_with = "null_to_default")]
+    pub outgoing_request: bool,
+}
+
+/// The current user's note on another user (`POST /userNotes`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserNote {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub note: String,
+    #[serde(rename = "targetUserId", deserialize_with = "null_to_default")]
+    pub target_user_id: String,
+    #[serde(rename = "userId", deserialize_with = "null_to_default")]
+    pub user_id: String,
+}
+
+/// Player-moderation kinds (`PlayerModerationType` in the API docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlayerModerationKind {
+    Block,
+    HideAvatar,
+    InteractOff,
+    InteractOn,
+    Mute,
+    MuteChat,
+    ShowAvatar,
+    Unmute,
+    UnmuteChat,
+}
+
+impl PlayerModerationKind {
+    /// The documented wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::HideAvatar => "hideAvatar",
+            Self::InteractOff => "interactOff",
+            Self::InteractOn => "interactOn",
+            Self::Mute => "mute",
+            Self::MuteChat => "muteChat",
+            Self::ShowAvatar => "showAvatar",
+            Self::Unmute => "unmute",
+            Self::UnmuteChat => "unmuteChat",
+        }
+    }
+
+    /// Parse a documented kind name; unknown values return `None`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "block" => Self::Block,
+            "hideAvatar" => Self::HideAvatar,
+            "interactOff" => Self::InteractOff,
+            "interactOn" => Self::InteractOn,
+            "mute" => Self::Mute,
+            "muteChat" => Self::MuteChat,
+            "showAvatar" => Self::ShowAvatar,
+            "unmute" => Self::Unmute,
+            "unmuteChat" => Self::UnmuteChat,
+            _ => return None,
+        })
+    }
+}
+
+/// One player moderation the current user has applied
+/// (`GET /auth/user/playermoderations`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerModeration {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub created: String,
+    #[serde(rename = "sourceDisplayName", deserialize_with = "null_to_default")]
+    pub source_display_name: String,
+    #[serde(rename = "sourceUserId", deserialize_with = "null_to_default")]
+    pub source_user_id: String,
+    #[serde(rename = "targetDisplayName", deserialize_with = "null_to_default")]
+    pub target_display_name: String,
+    #[serde(rename = "targetUserId", deserialize_with = "null_to_default")]
+    pub target_user_id: String,
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+}
+
+impl PlayerModeration {
+    /// Parsed [`PlayerModerationKind`], when the kind is documented.
+    pub fn kind(&self) -> Option<PlayerModerationKind> {
+        PlayerModerationKind::parse(&self.kind)
+    }
+}
+
+/// An instance (`GET /instances/{worldId}:{instanceId}`).
+///
+/// `users` is only populated when querying an instance owned by the
+/// requesting user (documented `LimitedUserInstance` entries).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Instance {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "instanceId", deserialize_with = "null_to_default")]
+    pub instance_id: String,
+    #[serde(rename = "worldId", deserialize_with = "null_to_default")]
+    pub world_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    #[serde(rename = "secureName", deserialize_with = "null_to_default")]
+    pub secure_name: String,
+    #[serde(rename = "shortName", deserialize_with = "null_to_default")]
+    pub short_name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub capacity: i32,
+    #[serde(rename = "recommendedCapacity", deserialize_with = "null_to_default")]
+    pub recommended_capacity: i32,
+    #[serde(rename = "n_users", deserialize_with = "null_to_default")]
+    pub n_users: i32,
+    #[serde(rename = "userCount", deserialize_with = "null_to_default")]
+    pub user_count: i32,
+    #[serde(deserialize_with = "null_to_default")]
+    pub region: String,
+    #[serde(rename = "photonRegion", deserialize_with = "null_to_default")]
+    pub photon_region: String,
+    /// Instance kind: `public`, `friends`, `hidden`, `private`, `group`.
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    #[serde(rename = "ownerId", deserialize_with = "null_to_default")]
+    pub owner_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub location: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub strict: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub permanent: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub active: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub full: bool,
+    #[serde(rename = "queueEnabled", deserialize_with = "null_to_default")]
+    pub queue_enabled: bool,
+    #[serde(rename = "queueSize", deserialize_with = "null_to_default")]
+    pub queue_size: i32,
+    #[serde(rename = "hasCapacityForYou", deserialize_with = "null_to_default")]
+    pub has_capacity_for_you: bool,
+    #[serde(rename = "canRequestInvite", deserialize_with = "null_to_default")]
+    pub can_request_invite: bool,
+    #[serde(rename = "ageGate", deserialize_with = "null_to_default")]
+    pub age_gate: bool,
+    #[serde(rename = "closedAt", deserialize_with = "null_to_default")]
+    pub closed_at: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
+    /// Occupants — populated for the requesting user's own instance only.
+    #[serde(deserialize_with = "null_to_default")]
+    pub users: Vec<LimitedUser>,
+    /// The world this instance belongs to.
+    #[serde(deserialize_with = "null_to_default")]
+    pub world: World,
+}
+
+/// The `{"success": {…}}` envelope returned by action endpoints
+/// (unfriend, clear notifications, unmoderate, …).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SuccessResponse {
+    pub success: SuccessDetail,
+}
+
+/// Inner `success` object of [`SuccessResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SuccessDetail {
+    #[serde(deserialize_with = "null_to_default")]
+    pub message: String,
+    #[serde(rename = "status_code", deserialize_with = "null_to_default")]
+    pub status_code: i32,
+}
+
+/// The `presence` object on `GET /auth/user` — the current session's live
+/// location, used to resolve "my instance" for invites.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CurrentUserPresence {
+    #[serde(rename = "world", deserialize_with = "null_to_default")]
+    pub world: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub instance: String,
+    #[serde(rename = "instanceType", deserialize_with = "null_to_default")]
+    pub instance_type: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub platform: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub status: String,
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    #[serde(rename = "userIcon", deserialize_with = "null_to_default")]
+    pub user_icon: String,
+    #[serde(rename = "avatarThumbnail", deserialize_with = "null_to_default")]
+    pub avatar_thumbnail: String,
+    #[serde(rename = "profilePicOverride", deserialize_with = "null_to_default")]
+    pub profile_pic_override: String,
+    #[serde(rename = "travelingToWorld", deserialize_with = "null_to_default")]
+    pub traveling_to_world: String,
+    #[serde(rename = "travelingToInstance", deserialize_with = "null_to_default")]
+    pub traveling_to_instance: String,
+    #[serde(rename = "isRejoining", deserialize_with = "null_to_default")]
+    pub is_rejoining: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub groups: Vec<String>,
 }
 
 /// The `GET /auth/user` envelope while 2FA is still pending. Internal to the

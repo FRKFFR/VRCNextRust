@@ -41,6 +41,26 @@ pub fn fmt_ts(ts: OffsetDateTime) -> String {
     )
 }
 
+/// `YYYY-MM-DD HH:MM` from an ISO-8601 string (`…T…`), or the raw string
+/// when it doesn't look like one. Used for REST timestamps that arrive as
+/// strings (notifications, notes, moderations).
+pub fn fmt_iso_ts(iso: &str) -> String {
+    // ISO-8601 `2026-01-02T03:04:05…` → `2026-01-02 03:04`.
+    if iso.len() >= 16 {
+        let date = &iso[..10];
+        let time = &iso[11..16];
+        if date.len() == 10
+            && time.len() == 5
+            && date.as_bytes()[4] == b'-'
+            && date.as_bytes()[7] == b'-'
+            && iso.as_bytes()[10] == b'T'
+        {
+            return format!("{date} {time}");
+        }
+    }
+    iso.to_string()
+}
+
 /// Seconds → compact `"2h 5m"` / `"45m 10s"` / `"30s"`.
 pub fn format_duration(seconds: i64) -> String {
     let s = seconds.max(0);

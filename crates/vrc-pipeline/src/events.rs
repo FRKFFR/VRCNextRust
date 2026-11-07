@@ -7,7 +7,7 @@
 //! [`PipelineEvent::Unknown`].
 
 use serde_json::Value;
-use vrc_api::models::User;
+use vrc_api::models::{Notification, NotificationV2, User};
 
 /// Events pushed by the VRChat WebSocket pipeline.
 #[derive(Debug, Clone)]
@@ -75,9 +75,50 @@ pub enum PipelineEvent {
         /// `userId` of the removed friend.
         user_id: String,
     },
-    /// `notification`: a notification was pushed; carried as the raw JSON
-    /// payload for now.
-    Notification(Value),
+    /// `notification`: a new notification was pushed.
+    Notification {
+        /// The notification object.
+        notification: Notification,
+    },
+    /// `response-notification`: someone responded to one of our
+    /// notifications (e.g. accepted a friend request we sent).
+    ResponseNotification {
+        /// `notificationId` of the notification that was answered.
+        notification_id: String,
+        /// `receiverId` of the original notification.
+        receiver_id: String,
+        /// `responseId` identifying the response.
+        response_id: String,
+    },
+    /// `see-notification`: a notification was marked seen elsewhere.
+    SeeNotification {
+        /// The notification id (the content is a bare string).
+        notification_id: String,
+    },
+    /// `hide-notification`: a notification was hidden/deleted elsewhere.
+    HideNotification {
+        /// The notification id (the content is a bare string).
+        notification_id: String,
+    },
+    /// `clear-notification`: all notifications were cleared elsewhere.
+    ClearNotifications,
+    /// `notification-v2`: a NotificationV2 object was pushed.
+    NotificationV2 {
+        /// The NotificationV2 object.
+        notification: NotificationV2,
+    },
+    /// `notification-v2-update`: fields of a NotificationV2 changed.
+    NotificationV2Update {
+        /// `id` of the NotificationV2 being updated.
+        id: String,
+        /// `updates` object carrying the changed fields.
+        updates: Value,
+    },
+    /// `notification-v2-delete`: NotificationV2 objects were removed.
+    NotificationV2Delete {
+        /// Deleted NotificationV2 ids.
+        ids: Vec<String>,
+    },
     /// `user-update`: the current user's profile changed.
     UserUpdate {
         /// `userId` (the current user).
@@ -108,12 +149,14 @@ pub(crate) fn decode(text: &str) -> Option<PipelineEvent> {
     };
     let kind = envelope.get("type").and_then(Value::as_str)?;
     // `content` is either an object or a JSON-encoded string of the object.
+    // Some documented events (see/hide-notification) carry a bare string id
+    // instead, so a failed re-parse keeps the string rather than dropping it.
     let content = match envelope.get("content") {
         Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
             Ok(value) => value,
             Err(e) => {
-                tracing::warn!("pipeline: bad string content in {kind} frame: {e}");
-                Value::Null
+                tracing::debug!("pipeline: non-JSON string content in {kind} frame: {e}");
+                Value::String(s.clone())
             }
         },
         Some(value) => value.clone(),
@@ -149,6 +192,20 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
             })
             .unwrap_or_default()
     };
+    // `see`/`hide-notification` carry the id as a bare string content.
+    let bare_id = || content.as_str().unwrap_or_default().to_string();
+    // Decode a notification payload; a malformed one degrades to defaults
+    // (same policy as `user()`).
+    let notification_v1 = || {
+        serde_json::from_value::<Notification>(content.clone())
+            .map_err(|e| tracing::warn!("pipeline: bad {kind} notification payload: {e}"))
+            .unwrap_or_default()
+    };
+    let notification_v2 = || {
+        serde_json::from_value::<NotificationV2>(content.clone())
+            .map_err(|e| tracing::warn!("pipeline: bad {kind} notification-v2 payload: {e}"))
+            .unwrap_or_default()
+    };
     match kind {
         "friend-online" => PipelineEvent::FriendOnline {
             user_id: user_id(),
@@ -180,7 +237,47 @@ fn decode_typed(kind: &str, content: &Value, raw: &str) -> PipelineEvent {
             user: user(),
         },
         "friend-delete" => PipelineEvent::FriendDelete { user_id: user_id() },
-        "notification" => PipelineEvent::Notification(content.clone()),
+        "notification" => PipelineEvent::Notification {
+            notification: notification_v1(),
+        },
+        "response-notification" => PipelineEvent::ResponseNotification {
+            notification_id: str_field("notificationId"),
+            receiver_id: str_field("receiverId"),
+            response_id: str_field("responseId"),
+        },
+        "see-notification" => PipelineEvent::SeeNotification {
+            notification_id: bare_id(),
+        },
+        "hide-notification" => PipelineEvent::HideNotification {
+            notification_id: bare_id(),
+        },
+        "clear-notification" => PipelineEvent::ClearNotifications,
+        "notification-v2" => PipelineEvent::NotificationV2 {
+            notification: notification_v2(),
+        },
+        "notification-v2-update" => PipelineEvent::NotificationV2Update {
+            id: str_field("id"),
+            updates: content.get("updates").cloned().unwrap_or(Value::Null),
+        },
+        "notification-v2-delete" => {
+            // Documented content is `{id, version}` — one id per event.
+            // An `ids` array is tolerated in case a batch shape appears.
+            let mut ids: Vec<String> = content
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                if let Some(id) = content.get("id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+            PipelineEvent::NotificationV2Delete { ids }
+        }
         "user-update" => PipelineEvent::UserUpdate {
             user_id: user_id(),
             user: user(),
@@ -266,18 +363,83 @@ mod tests {
     }
 
     #[test]
-    fn notification_carries_raw_json() {
+    fn notification_decodes_typed() {
         let event = decode(
             r#"{"type":"notification","content":{"id":"not_1","type":"friendRequest","senderUserId":"usr_x"}}"#,
         )
         .unwrap();
         match event {
-            PipelineEvent::Notification(raw) => {
-                assert_eq!(raw["type"], "friendRequest");
-                assert_eq!(raw["senderUserId"], "usr_x");
+            PipelineEvent::Notification { notification } => {
+                assert_eq!(notification.id, "not_1");
+                assert!(notification.is_friend_request());
+                assert_eq!(notification.sender_user_id, "usr_x");
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn notification_family_decodes_all_variants() {
+        // see/hide carry the id as a bare (non-JSON) string content.
+        let event = decode(r#"{"type":"see-notification","content":"not_1"}"#).unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::SeeNotification { ref notification_id } if notification_id == "not_1"
+        ));
+        let event = decode(r#"{"type":"hide-notification","content":"not_1"}"#).unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::HideNotification { ref notification_id } if notification_id == "not_1"
+        ));
+        let event = decode(r#"{"type":"clear-notification","content":null}"#).unwrap();
+        assert!(matches!(event, PipelineEvent::ClearNotifications));
+
+        let event = decode(
+            r#"{"type":"response-notification","content":{"notificationId":"not_1","receiverId":"usr_a","responseId":"rsp_1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::ResponseNotification { ref notification_id, ref receiver_id, .. }
+                if notification_id == "not_1" && receiver_id == "usr_a"
+        ));
+
+        let v2 = r#"{"id":"ntf2_1","version":2,"type":"groupAnnouncement","senderUserId":null,"title":"Hi","message":"There","seen":false,"createdAt":"2026-01-01T00:00:00Z"}"#;
+        let event = decode(&format!(r#"{{"type":"notification-v2","content":{v2}}}"#)).unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::NotificationV2 { ref notification }
+                if notification.id == "ntf2_1" && notification.title == "Hi"
+        ));
+
+        let event = decode(
+            r#"{"type":"notification-v2-update","content":{"id":"ntf2_1","updates":{"seen":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::NotificationV2Update { ref id, ref updates }
+                if id == "ntf2_1" && updates["seen"] == true
+        ));
+
+        // Documented shape: `{id, version}` — a single id per event.
+        let event =
+            decode(r#"{"type":"notification-v2-delete","content":{"id":"ntf2_1","version":3}}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::NotificationV2Delete { ref ids }
+                if ids == &["ntf2_1".to_string()]
+        ));
+        // An `ids` array is still tolerated.
+        let event =
+            decode(r#"{"type":"notification-v2-delete","content":{"ids":["ntf2_1","ntf2_2"]}}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            PipelineEvent::NotificationV2Delete { ref ids }
+                if ids == &["ntf2_1".to_string(), "ntf2_2".to_string()]
+        ));
     }
 
     #[test]

@@ -173,6 +173,36 @@ impl Client {
         self.decode(resp).await
     }
 
+    /// `METHOD path` with an optional non-secret JSON body, decoding the
+    /// JSON response into `T`. Used by the social-action endpoints
+    /// (notifications, invites, users, moderations, instances); every call
+    /// still travels through [`Client::send`] — rate limit, retry, 401
+    /// handling (RULES.md §3, §4).
+    pub(crate) async fn send_json<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<T, ApiError> {
+        let url = self.url(path);
+        let payload = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(ApiError::Decode)?;
+        let resp = self
+            .send(method.clone(), move |http| {
+                let request = http.request(method.clone(), &url);
+                match &payload {
+                    Some(bytes) => request
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes.clone()),
+                    None => request,
+                }
+            })
+            .await?;
+        self.decode(resp).await
+    }
+
     /// Single send path for every request: rate limit, retry, 401 handling.
     ///
     /// `make` rebuilds the [`reqwest::RequestBuilder`] on each attempt. Retries

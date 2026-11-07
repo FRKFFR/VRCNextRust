@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use vrc_api::{CurrentUser, LimitedUser, TrustRank, TwoFactorMethod, User};
+use vrc_api::{
+    CurrentUser, FriendStatus, Instance, LimitedUser, Notification, NotificationV2,
+    PlayerModeration, TrustRank, TwoFactorMethod, User,
+};
 use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
 /// Whether a session exists and in what stage.
@@ -203,6 +206,45 @@ impl Default for WorldName {
     }
 }
 
+/// The user profile currently shown in the profile view, plus the social
+/// state fetched alongside it (`GET /users/{id}`, `/friendStatus`,
+/// `/playermoderations?targetUserId=`).
+#[derive(Debug, Clone, Default)]
+pub struct ProfileView {
+    /// The user's public profile.
+    pub user: User,
+    /// Friend/request relationship vs. the current user.
+    pub friend_status: FriendStatus,
+    /// Moderations the current user has applied to this user.
+    pub moderations: Vec<PlayerModeration>,
+}
+
+impl ProfileView {
+    /// `true` when a moderation of `kind` targets this profile's user.
+    pub fn has_moderation(&self, kind: vrc_api::PlayerModerationKind) -> bool {
+        self.moderations
+            .iter()
+            .any(|m| m.target_user_id == self.user.id && m.kind() == Some(kind))
+    }
+}
+
+/// Progress of a running (or just-finished) multi-invite batch.
+#[derive(Debug, Clone, Default)]
+pub struct MultiInviteProgress {
+    /// Number of targets in the batch.
+    pub total: usize,
+    /// Targets attempted so far.
+    pub done: usize,
+    /// Invites that succeeded.
+    pub succeeded: usize,
+    /// Invites that failed.
+    pub failed: usize,
+    /// `true` while the batch is still running.
+    pub running: bool,
+    /// User id currently being invited, when one is in flight.
+    pub current: Option<String>,
+}
+
 /// One page of personal-timeline rows plus the total match count.
 #[derive(Debug, Clone, Default)]
 pub struct TimelinePage {
@@ -246,6 +288,19 @@ pub struct AppState {
     pub stats: Option<Stats>,
     /// Whether the VRChat output-log tailer is running.
     pub log_tail_active: bool,
+    /// Notifications (`GET /auth/user/notifications` + pipeline pushes);
+    /// `None` until the first `RefreshNotifications` completes. Pipeline
+    /// events upsert into it incrementally.
+    pub notifications: Option<Vec<Notification>>,
+    /// NotificationV2 objects kept live from pipeline events only (there is
+    /// no REST list endpoint for them in the documented API).
+    pub notifications_v2: Vec<NotificationV2>,
+    /// The profile shown in the profile view (`None` until `LoadProfile`).
+    pub profile: Option<ProfileView>,
+    /// The instance loaded via `LoadInstance` (`None` until then).
+    pub instance: Option<Instance>,
+    /// Multi-invite batch progress (`None` until the first batch).
+    pub multi_invite: Option<MultiInviteProgress>,
 }
 
 #[cfg(test)]

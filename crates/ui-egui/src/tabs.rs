@@ -42,6 +42,10 @@ impl VrcNextApp {
 pub(crate) enum Tab {
     /// Friends' worlds dashboard (the M2 view).
     Dashboard,
+    /// Notifications + NotificationV2 list.
+    Notifications,
+    /// The loaded user's profile, note and social actions.
+    Profile,
     /// Personal timeline parsed from VRChat logs.
     Timeline,
     /// Friend presence/location history from pipeline events.
@@ -93,6 +97,8 @@ pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
     app.tab = tab;
     match tab {
         Tab::Dashboard => {}
+        Tab::Notifications => app.send(Command::RefreshNotifications),
+        Tab::Profile => {}
         Tab::Timeline => app.reload_timeline(),
         Tab::FriendHistory => app.reload_history(),
         Tab::Stats => app.reload_stats(),
@@ -105,6 +111,8 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Dashboard, "Dashboard"),
+                (Tab::Notifications, "Notifications"),
+                (Tab::Profile, "Profile"),
                 (Tab::Timeline, "Timeline"),
                 (Tab::FriendHistory, "Friend history"),
                 (Tab::Stats, "Stats"),
@@ -116,7 +124,9 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
         });
         ui.separator();
         match app.tab {
-            Tab::Dashboard => dashboard_tab(ui, state),
+            Tab::Dashboard => dashboard_tab(app, ui, state),
+            Tab::Notifications => crate::social::notifications_tab(app, ui, state),
+            Tab::Profile => crate::social::profile_tab(app, ui, state),
             Tab::Timeline => timeline_tab(app, ui, state),
             Tab::FriendHistory => history_tab(app, ui, state),
             Tab::Stats => stats_tab(app, ui, state),
@@ -128,9 +138,16 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
 // Dashboard (moved verbatim from the old central panel)
 // ---------------------------------------------------------------------------
 
-fn dashboard_tab(ui: &mut egui::Ui, state: &AppState) {
+fn dashboard_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
     ui.heading("Friends' worlds");
     ui.separator();
+
+    // The loaded instance's details + which friends are inside it.
+    if let Some(instance) = &state.instance {
+        instance_card(app, ui, state, instance);
+        ui.separator();
+    }
+
     let entries = vrc_core::dashboard(state);
     if entries.is_empty() {
         ui.label("No friends in a world right now.");
@@ -142,20 +159,105 @@ fn dashboard_tab(ui: &mut egui::Ui, state: &AppState) {
             .spacing(egui::vec2(12.0, 12.0))
             .show(ui, |ui| {
                 for entry in &entries {
-                    world_card(ui, entry);
+                    world_card(app, ui, entry);
                     ui.end_row();
                 }
             });
     });
 }
 
-fn world_card(ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
+/// Details of the instance loaded via `LoadInstance`, including the
+/// friends currently located there (`friends_in_instance`).
+fn instance_card(
+    app: &mut VrcNextApp,
+    ui: &mut egui::Ui,
+    state: &AppState,
+    instance: &vrc_core::Instance,
+) {
+    let inside =
+        vrc_core::friends_in_instance(&state.friends, &instance.world_id, &instance.instance_id);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(if instance.world.name.is_empty() {
+                    instance.world_id.clone()
+                } else {
+                    instance.world.name.clone()
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!(
+                        "{} user{}",
+                        instance.user_count.max(instance.n_users),
+                        if instance.user_count.max(instance.n_users) == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
+                });
+            });
+            ui.small(
+                egui::RichText::new(format!(
+                    "{} · {} · {}",
+                    instance.kind, instance.instance_id, instance.short_name
+                ))
+                .monospace()
+                .weak(),
+            );
+            ui.separator();
+            if inside.is_empty() {
+                ui.weak("No friends in this instance.");
+            } else {
+                for friend in inside {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .color(crate::presence_color(friend))
+                                .size(12.0),
+                        );
+                        ui.label(&friend.display_name);
+                        if ui.small_button("Profile").clicked() {
+                            app.send(Command::LoadProfile {
+                                user_id: friend.id.clone(),
+                            });
+                            app.tab = Tab::Profile;
+                        }
+                        if ui
+                            .small_button("invite")
+                            .on_hover_text("Invite to your instance")
+                            .clicked()
+                        {
+                            app.send(Command::InviteUser {
+                                user_id: friend.id.clone(),
+                                instance_id: None,
+                                message_slot: None,
+                            });
+                        }
+                    });
+                }
+            }
+        });
+}
+
+fn world_card(app: &mut VrcNextApp, ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.set_min_width(220.0);
             ui.horizontal(|ui| {
-                ui.strong(vrc_core::world_title(entry));
+                // Clicking the card loads the instance's details
+                // (`GET /instances/{world}:{instance}`) into state.
+                if ui
+                    .strong(vrc_core::world_title(entry))
+                    .on_hover_text("Load instance details")
+                    .clicked()
+                {
+                    app.send(Command::LoadInstance {
+                        world_id: entry.world_id.clone(),
+                        instance_id: entry.instance_id.clone(),
+                    });
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(format!(
                         "{} friend{}",
@@ -174,6 +276,17 @@ fn world_card(ui: &mut egui::Ui, entry: &vrc_core::DashboardEntry) {
                             .size(12.0),
                     );
                     ui.label(&friend.display_name);
+                    if ui
+                        .small_button("invite")
+                        .on_hover_text("Invite to your instance")
+                        .clicked()
+                    {
+                        app.send(Command::InviteUser {
+                            user_id: friend.id.clone(),
+                            instance_id: None,
+                            message_slot: None,
+                        });
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (_, label) = crate::trust_badge(friend.trust_rank);
                         ui.weak(label);
