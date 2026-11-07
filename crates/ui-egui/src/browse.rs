@@ -720,6 +720,17 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
         }
     });
 
+    // The group's pinned announcement — plain text only, no image loading.
+    if let Some(announcement) = state.group_announcements.get(group_id) {
+        if !announcement.title.is_empty() {
+            ui.strong(announcement.title.as_str());
+        }
+        if !announcement.text.is_empty() {
+            ui.label(announcement.text.as_str());
+        }
+        ui.separator();
+    }
+
     if let Some(page) = state.group_members.get(group_id) {
         if !page.items.is_empty() {
             ui.strong("Members");

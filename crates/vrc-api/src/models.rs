@@ -870,8 +870,6 @@ pub struct Avatar {
 pub struct Group {
     #[serde(deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
-    pub group_id: String,
     #[serde(deserialize_with = "null_to_default")]
     pub name: String,
     #[serde(rename = "shortCode", deserialize_with = "null_to_default")]
@@ -993,6 +991,26 @@ pub struct GroupMemberUser {
     pub current_avatar_thumbnail_image_url: String,
     #[serde(rename = "currentAvatarTags", deserialize_with = "null_to_default")]
     pub current_avatar_tags: Vec<String>,
+}
+
+/// `GET /groups/{id}/announcement` — the group's pinned announcement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupAnnouncement {
+    #[serde(rename = "announcementId", deserialize_with = "null_to_default")]
+    pub announcement_id: String,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub title: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub text: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
 }
 
 /// A group membership (`GET /groups/{id}/members`, join/leave responses).

@@ -1982,14 +1982,29 @@ impl Runtime {
             .insert(group_id.to_string(), DetailState::Pending);
         match self.client.clone().group(group_id, include_roles).await {
             Ok(group) => {
-                let mut state = self.state.write();
-                if state.auth == AuthState::Authenticated {
-                    state
-                        .group_details
-                        .insert(group_id.to_string(), DetailState::Known(group));
+                {
+                    let mut state = self.state.write();
+                    if state.auth == AuthState::Authenticated {
+                        state
+                            .group_details
+                            .insert(group_id.to_string(), DetailState::Known(group));
+                    }
                 }
-                drop(state);
                 let _ = self.events.send(AppEvent::BrowseChanged);
+                // Second call per the spec: a 404 simply means the group
+                // has no announcement.
+                match self.client.clone().group_announcement(group_id).await {
+                    Ok(announcement) => {
+                        self.state
+                            .write()
+                            .group_announcements
+                            .insert(group_id.to_string(), announcement);
+                        let _ = self.events.send(AppEvent::BrowseChanged);
+                    }
+                    Err(ApiError::Http { status: 404, .. }) => {}
+                    Err(ApiError::Unauthorized) => self.session_expired(),
+                    Err(_) => {}
+                }
             }
             Err(ApiError::Unauthorized) => self.session_expired(),
             Err(e) => {

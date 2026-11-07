@@ -122,6 +122,19 @@ impl Client {
             .await
     }
 
+    /// `GET /groups/{groupId}/announcement` — the group's pinned
+    /// announcement. The API returns 404 when none exists.
+    pub async fn group_announcement(
+        &self,
+        group_id: &str,
+    ) -> Result<crate::GroupAnnouncement, ApiError> {
+        if !valid_group_id(group_id) {
+            return Err(ApiError::InvalidId(group_id.chars().take(64).collect()));
+        }
+        self.get_json(&format!("/groups/{group_id}/announcement"))
+            .await
+    }
+
     /// `GET /groups/{groupId}/posts` — the documented `{posts}` envelope
     /// (no `total` field).
     pub async fn group_posts(

@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use vrc_api::{
-    Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupGalleryImage,
-    GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification, NotificationV2,
-    PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
+    Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupAnnouncement,
+    GroupGalleryImage, GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification,
+    NotificationV2, PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
 };
 use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
@@ -391,6 +391,8 @@ pub struct AppState {
     pub world_details: HashMap<String, DetailState<World>>,
     /// `GET /groups/{id}` detail cache keyed by group id.
     pub group_details: HashMap<String, DetailState<Group>>,
+    /// Pinned announcement per group (`None`-absent = none or unfetched).
+    pub group_announcements: HashMap<String, GroupAnnouncement>,
     /// `GET /avatars/{id}` detail cache keyed by avatar id.
     pub avatar_details: HashMap<String, DetailState<Avatar>>,
     /// `GET /users/{me}/avatar` — the current user's active avatar.

@@ -708,3 +708,35 @@ async fn self_invite_rejects_bad_ids_without_request() {
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn group_announcement_decodes_and_bad_ids_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/groups/grp_00000000-0000-0000-0000-000000000001/announcement",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "announcementId": "annc_00000000-0000-0000-0000-000000000001",
+            "groupId": "grp_00000000-0000-0000-0000-000000000001",
+            "title": "Synthetic announcement",
+            "text": "Fixture text, not a real group.",
+            "imageUrl": null,
+            "createdAt": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let a = client
+        .group_announcement("grp_00000000-0000-0000-0000-000000000001")
+        .await
+        .unwrap();
+    assert_eq!(a.title, "Synthetic announcement");
+    assert_eq!(a.text, "Fixture text, not a real group.");
+    assert!(a.image_url.is_empty() && a.created_at.is_empty());
+    // An invalid group id is rejected before any request goes out.
+    assert!(client.group_announcement("not a group").await.is_err());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}

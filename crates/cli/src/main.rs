@@ -1223,7 +1223,7 @@ async fn own_groups() -> Result<()> {
     for group in groups {
         println!(
             "{:<32} {:<10} {:>5} members  {}",
-            group.name, group.short_code, group.member_count, group.group_id
+            group.name, group.short_code, group.member_count, group.id
         );
         if group.is_representing {
             println!("    (representing)");
