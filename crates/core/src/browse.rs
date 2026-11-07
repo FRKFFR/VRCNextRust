@@ -16,14 +16,18 @@ pub const DETAIL_RETRY: Duration = Duration::from_secs(60);
 /// Page size used for M5 browse/search/favorite lists.
 pub const BROWSE_PAGE_SIZE: usize = 24;
 
-/// Which top-level search feed a debounced command belongs to.
+/// Which top-level browse feed a debounced command belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchKind {
     /// `GET /worlds`.
     Worlds,
+    /// `GET /worlds/active`.
+    ActiveWorlds,
+    /// `GET /worlds/recent`.
+    RecentWorlds,
     /// `GET /groups`.
     Groups,
-    /// `GET /avatars`.
+    /// `GET /avatars` (featured vs. own is part of the page key).
     Avatars,
 }
 

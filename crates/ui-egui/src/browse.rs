@@ -8,11 +8,12 @@
 use eframe::egui;
 use vrc_core::browse;
 use vrc_core::{
-    AppState, Avatar, Command, CreateInstanceRequest, DetailState, FavoriteKind, Group,
-    GroupInstance, GroupMember, GroupPost, InstanceKind, InstanceRegion, World,
+    AppState, Avatar, Command, CreateInstanceRequest, DetailState, FavoriteGroup, FavoriteKind,
+    Group, GroupAccessType, GroupInstance, GroupMember, GroupPost, InstanceKind, InstanceRegion,
+    UserGroup, World,
 };
 
-use crate::{ConfirmAction, VrcNextApp};
+use crate::{ConfirmAction, VrcNextApp, WorldsFeed};
 
 // ---------------------------------------------------------------------------
 // Pure label helpers (unit-tested below)
@@ -87,13 +88,7 @@ pub(crate) fn member_label(member: &GroupMember) -> String {
     member
         .user
         .as_ref()
-        .map(|u| {
-            if u.display_name.is_empty() {
-                u.username.clone()
-            } else {
-                u.display_name.clone()
-            }
-        })
+        .map(|u| u.display_name.clone())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| member.user_id.clone())
 }
@@ -170,6 +165,67 @@ pub(crate) fn instance_region_label(region: InstanceRegion) -> &'static str {
     }
 }
 
+/// Display label for a group access type (group-instance picker).
+pub(crate) fn group_access_label(access: GroupAccessType) -> &'static str {
+    match access {
+        GroupAccessType::Public => "Public",
+        GroupAccessType::Plus => "VRChat+",
+        GroupAccessType::Members => "Members",
+    }
+}
+
+/// One-line summary for an own-groups row (`GET /users/{me}/groups`).
+pub(crate) fn user_group_label(group: &UserGroup) -> String {
+    let name = if group.name.is_empty() {
+        group.group_id.clone()
+    } else {
+        group.name.clone()
+    };
+    let mut label = name;
+    if !group.short_code.is_empty() {
+        label.push_str(&format!(" ({})", group.short_code));
+    }
+    if group.member_count > 0 {
+        label.push_str(&format!(" — {} members", group.member_count));
+    }
+    if group.is_representing {
+        label.push_str(" · representing");
+    }
+    label
+}
+
+/// One-line summary for a favorite-group set (`GET /favorite/groups`).
+pub(crate) fn favorite_group_label(group: &FavoriteGroup) -> String {
+    let name = if group.display_name.is_empty() {
+        group.name.clone()
+    } else {
+        group.display_name.clone()
+    };
+    let name = if name.is_empty() {
+        group.id.clone()
+    } else {
+        name
+    };
+    let mut label = name;
+    if !group.kind.is_empty() {
+        label.push_str(&format!(" — {}", group.kind));
+    }
+    if !group.owner_display_name.is_empty() {
+        label.push_str(&format!(" · {}", group.owner_display_name));
+    }
+    label
+}
+
+/// The worlds-feed search command for the active tab feed.
+pub(crate) fn worlds_command(app: &VrcNextApp, offset: usize) -> Command {
+    let query = app.world_query.clone();
+    match app.worlds_feed {
+        WorldsFeed::Search => Command::SearchWorlds { query, offset },
+        WorldsFeed::Active => Command::SearchActiveWorlds { query, offset },
+        WorldsFeed::Recent => Command::SearchRecentWorlds { query, offset },
+    }
+}
+
 /// The `kind`/`object_id` pair a favorite toggle sends.
 fn favorite_command(state: &AppState, kind: FavoriteKind, object_id: &str) -> Option<Command> {
     if browse::is_favorite(state, kind, object_id) {
@@ -228,18 +284,27 @@ fn more_button<T>(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn worlds_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
-    if search_bar(ui, &mut app.world_query, "Search worlds…") {
-        app.send(Command::SearchWorlds {
-            query: app.world_query.clone(),
-            offset: 0,
-        });
-    }
-    if ui.button("Refresh").clicked() {
-        app.send(Command::SearchWorlds {
-            query: app.world_query.clone(),
-            offset: 0,
-        });
-    }
+    ui.horizontal(|ui| {
+        for (feed, label) in [
+            (WorldsFeed::Search, "Search"),
+            (WorldsFeed::Active, "Active"),
+            (WorldsFeed::Recent, "Recent"),
+        ] {
+            if ui
+                .selectable_value(&mut app.worlds_feed, feed, label)
+                .changed()
+            {
+                app.send(worlds_command(app, 0));
+            }
+        }
+        ui.separator();
+        if search_bar(ui, &mut app.world_query, "Filter worlds…") {
+            app.send(worlds_command(app, 0));
+        }
+        if ui.button("Refresh").clicked() {
+            app.send(worlds_command(app, 0));
+        }
+    });
     ui.separator();
 
     if let Some(id) = app.world_detail.clone() {
@@ -256,12 +321,17 @@ pub(crate) fn worlds_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
         ui.separator();
     }
 
-    let Some(page) = &state.world_search else {
-        ui.label("Search for worlds above.");
+    let page = match app.worlds_feed {
+        WorldsFeed::Search => state.world_search.as_ref(),
+        WorldsFeed::Active => state.active_worlds.as_ref(),
+        WorldsFeed::Recent => state.recent_worlds.as_ref(),
+    };
+    let Some(page) = page else {
+        ui.label("Pick a feed above.");
         return;
     };
     if page.loading {
-        ui.label("Searching…");
+        ui.label("Loading…");
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
         for world in &page.items {
@@ -269,10 +339,7 @@ pub(crate) fn worlds_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
         }
     });
     more_button(app, ui, page, |app, offset| {
-        app.send(Command::SearchWorlds {
-            query: app.world_query.clone(),
-            offset,
-        });
+        app.send(worlds_command(app, offset));
     });
 }
 
@@ -367,14 +434,42 @@ fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, world: &World) {
                             );
                         }
                     });
+                if app.new_instance_kind == InstanceKind::Group {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.new_instance_group)
+                            .hint_text("grp_… owner id")
+                            .desired_width(140.0),
+                    );
+                    egui::ComboBox::from_label("Access")
+                        .selected_text(group_access_label(app.new_instance_access))
+                        .show_ui(ui, |ui| {
+                            for access in [
+                                GroupAccessType::Public,
+                                GroupAccessType::Plus,
+                                GroupAccessType::Members,
+                            ] {
+                                ui.selectable_value(
+                                    &mut app.new_instance_access,
+                                    access,
+                                    group_access_label(access),
+                                );
+                            }
+                        });
+                }
                 if ui.button("Create instance").clicked() {
-                    app.send(Command::CreateInstance {
-                        request: CreateInstanceRequest::new(
-                            world.id.clone(),
-                            app.new_instance_kind,
-                            app.new_instance_region,
-                        ),
-                    });
+                    let mut request = CreateInstanceRequest::new(
+                        world.id.clone(),
+                        app.new_instance_kind,
+                        app.new_instance_region,
+                    );
+                    if app.new_instance_kind == InstanceKind::Group {
+                        let group_id = app.new_instance_group.trim().to_string();
+                        if !group_id.is_empty() {
+                            request.owner_id = Some(group_id);
+                            request.group_access_type = Some(app.new_instance_access);
+                        }
+                    }
+                    app.send(Command::CreateInstance { request });
                 }
             });
         });
@@ -385,18 +480,34 @@ fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, world: &World) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn groups_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
-    if search_bar(ui, &mut app.group_query, "Search groups…") {
-        app.send(Command::SearchGroups {
-            query: app.group_query.clone(),
-            offset: 0,
-        });
-    }
-    if ui.button("Refresh").clicked() {
-        app.send(Command::SearchGroups {
-            query: app.group_query.clone(),
-            offset: 0,
-        });
-    }
+    ui.horizontal(|ui| {
+        let mut mine = app.groups_mine;
+        ui.selectable_value(&mut mine, false, "Search");
+        ui.selectable_value(&mut mine, true, "My groups");
+        if mine != app.groups_mine {
+            app.groups_mine = mine;
+            if mine {
+                app.send(Command::LoadOwnGroups);
+            }
+        }
+        ui.separator();
+        if !app.groups_mine {
+            if search_bar(ui, &mut app.group_query, "Search groups…") {
+                app.send(Command::SearchGroups {
+                    query: app.group_query.clone(),
+                    offset: 0,
+                });
+            }
+            if ui.button("Refresh").clicked() {
+                app.send(Command::SearchGroups {
+                    query: app.group_query.clone(),
+                    offset: 0,
+                });
+            }
+        } else if ui.button("Refresh").clicked() {
+            app.send(Command::LoadOwnGroups);
+        }
+    });
     ui.separator();
 
     if let Some(id) = app.group_detail.clone() {
@@ -413,6 +524,11 @@ pub(crate) fn groups_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
         ui.separator();
         group_subsections(app, ui, state, &id);
         ui.separator();
+    }
+
+    if app.groups_mine {
+        own_groups_list(app, ui, state);
+        return;
     }
 
     let Some(page) = &state.group_search else {
@@ -432,6 +548,36 @@ pub(crate) fn groups_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
             query: app.group_query.clone(),
             offset,
         });
+    });
+}
+
+/// The "My groups" list (`GET /users/{me}/groups` — unpaged).
+fn own_groups_list(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
+    let Some(groups) = &state.own_groups else {
+        ui.label("Your groups are not loaded yet.");
+        return;
+    };
+    if groups.is_empty() {
+        ui.label("You are not a member of any public groups.");
+        return;
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for group in groups {
+            ui.horizontal(|ui| {
+                if ui
+                    .strong(user_group_label(group))
+                    .on_hover_text("Group details")
+                    .clicked()
+                {
+                    app.group_detail = Some(group.group_id.clone());
+                    app.send(Command::LoadGroup {
+                        group_id: group.group_id.clone(),
+                        include_roles: true,
+                    });
+                }
+            });
+            ui.add_space(2.0);
+        }
     });
 }
 
@@ -493,7 +639,6 @@ fn group_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, group: &Group) {
                     } else {
                         app.send(Command::JoinGroup {
                             group_id: group_id.clone(),
-                            confirm_override_block: false,
                         });
                     }
                 }
@@ -579,7 +724,12 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
         }
         ui.strong(format!("Gallery {}", &key[prefix.len()..]));
         for image in &page.items {
-            ui.label(format!("• {}", image.file_id));
+            ui.horizontal(|ui| {
+                ui.label(format!("• {}", image.file_id));
+                if !image.image_url.is_empty() {
+                    ui.weak(image.image_url.clone());
+                }
+            });
         }
     }
 }
@@ -590,27 +740,24 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
 
 pub(crate) fn avatars_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut app.avatar_own, false, "Featured");
-        ui.selectable_value(&mut app.avatar_own, true, "My avatars");
+        let mut own = app.avatar_own;
+        ui.selectable_value(&mut own, false, "Featured");
+        ui.selectable_value(&mut own, true, "My avatars");
+        if own != app.avatar_own {
+            app.avatar_own = own;
+            app.send(Command::LoadAvatars { offset: 0, own });
+        }
         ui.separator();
         if ui.button("Current").clicked() {
             app.send(Command::LoadOwnAvatar);
         }
+        if ui.button("Refresh").clicked() {
+            app.send(Command::LoadAvatars {
+                offset: 0,
+                own: app.avatar_own,
+            });
+        }
     });
-    if search_bar(ui, &mut app.avatar_query, "Search avatars…") {
-        app.send(Command::SearchAvatars {
-            query: app.avatar_query.clone(),
-            offset: 0,
-            own: app.avatar_own,
-        });
-    }
-    if ui.button("Refresh").clicked() {
-        app.send(Command::SearchAvatars {
-            query: app.avatar_query.clone(),
-            offset: 0,
-            own: app.avatar_own,
-        });
-    }
     ui.separator();
 
     if let Some(avatar) = &state.own_avatar {
@@ -642,7 +789,7 @@ pub(crate) fn avatars_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSt
         return;
     };
     if page.loading {
-        ui.label("Searching…");
+        ui.label("Loading…");
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
         for avatar in &page.items {
@@ -650,8 +797,7 @@ pub(crate) fn avatars_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSt
         }
     });
     more_button(app, ui, page, |app, offset| {
-        app.send(Command::SearchAvatars {
-            query: app.avatar_query.clone(),
+        app.send(Command::LoadAvatars {
             offset,
             own: app.avatar_own,
         });
@@ -738,6 +884,7 @@ pub(crate) fn favorites_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
     ui.horizontal(|ui| {
         if ui.button("Refresh").clicked() {
             app.send(Command::RefreshFavorites);
+            app.send(Command::LoadFavoriteGroups { offset: 0 });
         }
         ui.weak(format!(
             "{} favorite{}",
@@ -806,6 +953,24 @@ pub(crate) fn favorites_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
                     }
                     more_button(app, ui, page, |app, offset| {
                         app.send(Command::LoadFavoriteAvatars { offset });
+                    });
+                }
+                None => {
+                    ui.weak("Not loaded — press Refresh.");
+                }
+            }
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.strong("Favorite groups");
+            ui.separator();
+            match &state.favorite_groups {
+                Some(page) => {
+                    for group in &page.items {
+                        ui.label(favorite_group_label(group));
+                    }
+                    more_button(app, ui, page, |app, offset| {
+                        app.send(Command::LoadFavoriteGroups { offset });
                     });
                 }
                 None => {

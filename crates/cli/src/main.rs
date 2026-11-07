@@ -16,9 +16,10 @@ use tokio::sync::broadcast;
 
 use vrc_core::{
     format, friend_status_label, moderation_label, notification_kind_label, sections, App,
-    AppConfig, AppEvent, AppHandle, AuthState, Client, Command, CreateInstanceRequest, DetailState,
-    GroupAccessType, InstanceKind, InstanceRegion, KeyringVault, MemoryVault, StatsRange,
-    TimelineFilter, TimelineKind, TwoFactorMethod, USER_AGENT,
+    AppConfig, AppEvent, AppHandle, AuthState, BrowsePage, Client, Command, CreateInstanceRequest,
+    DetailState, Favorite, FavoriteGroup, Group, GroupAccessType, InstanceKind, InstanceRegion,
+    KeyringVault, MemoryVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, World,
+    USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -115,61 +116,46 @@ enum Commands {
         /// Note text (multiple words are joined with spaces)
         note: Vec<String>,
     },
-    /// Search worlds by name
+    /// Browse worlds (search, active, recent)
     Worlds {
-        /// Free-text world-name filter (empty = browse defaults)
-        #[arg(long)]
-        query: Option<String>,
-        /// Zero-based item offset for paging
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
+        /// Which worlds feed to list
+        #[command(subcommand)]
+        command: WorldsCommand,
     },
     /// Show one world's public details
     World {
         /// `wrld_…` world id
         world_id: String,
     },
-    /// Search groups by name
+    /// Browse groups (search or your own memberships)
     Groups {
-        /// Free-text group-name filter
-        #[arg(long)]
-        query: Option<String>,
-        /// Zero-based item offset for paging
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
+        /// Which groups feed to list
+        #[command(subcommand)]
+        command: GroupsCommand,
     },
     /// Show one group's details (membership, galleries, roles)
     Group {
         /// `grp_…` group id
         group_id: String,
     },
-    /// Search avatars (featured, or your own with --own)
+    /// Browse avatars (featured or your own)
     Avatars {
-        /// Free-text avatar-name filter
-        #[arg(long)]
-        query: Option<String>,
-        /// Search your own avatars instead of featured ones
-        #[arg(long)]
-        own: bool,
-        /// Zero-based item offset for paging
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
+        /// Which avatar feed to list
+        #[command(subcommand)]
+        command: AvatarsCommand,
     },
-    /// Show one avatar's public details
+    /// Inspect or switch into avatars
     Avatar {
-        /// `avtr_…` avatar id
-        avatar_id: String,
+        /// Action to perform
+        #[command(subcommand)]
+        command: AvatarCommand,
     },
-    /// Switch into an avatar (requires --yes)
-    AvatarSelect {
-        /// `avtr_…` avatar id to switch into
-        avatar_id: String,
-        /// Confirm the switch without prompting
-        #[arg(long)]
-        yes: bool,
+    /// List your favorites (worlds, avatars, friends, groups)
+    Favorites {
+        /// Restrict to one favorite list; omitted lists everything
+        #[command(subcommand)]
+        command: Option<FavoritesCommand>,
     },
-    /// List your world/avatar favorites
-    Favorites,
     /// Create a world or group instance
     InstanceCreate {
         /// `wrld_…` world id to instance
@@ -194,6 +180,102 @@ enum Commands {
     SelfInvite {
         /// Instance location `wrld_…:instanceId`
         location: String,
+    },
+}
+
+/// `vrcnext-cli worlds …` actions.
+#[derive(Subcommand)]
+enum WorldsCommand {
+    /// Search/browse worlds by name
+    Search {
+        /// Free-text world-name filter (empty = browse defaults)
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Worlds currently active near you
+    Active {
+        /// Free-text world-name filter
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Worlds you recently visited
+    Recent {
+        /// Free-text world-name filter
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+}
+
+/// `vrcnext-cli groups …` actions.
+#[derive(Subcommand)]
+enum GroupsCommand {
+    /// Groups you belong to (`GET /users/{me}/groups`, unpaged)
+    Own,
+    /// Search groups by name
+    Search {
+        /// Free-text group-name filter
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+}
+
+/// `vrcnext-cli avatars …` actions.
+#[derive(Subcommand)]
+enum AvatarsCommand {
+    /// Featured avatars
+    Featured {
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Your own avatars
+    Own {
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+}
+
+/// `vrcnext-cli avatar …` actions.
+#[derive(Subcommand)]
+enum AvatarCommand {
+    /// Show one avatar's public details
+    Show {
+        /// `avtr_…` avatar id
+        avatar_id: String,
+    },
+    /// Switch into an avatar (requires --yes)
+    Select {
+        /// `avtr_…` avatar id to switch into
+        avatar_id: String,
+        /// Confirm the switch without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `vrcnext-cli favorites …` actions.
+#[derive(Subcommand)]
+enum FavoritesCommand {
+    /// List every favorite kind (the default when no subcommand is given)
+    All,
+    /// List favorite groups only (`GET /favorite/groups`)
+    Groups {
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
 }
 
@@ -352,14 +434,33 @@ async fn main() -> Result<()> {
         }
         Commands::Profile { user_id } => profile(&user_id).await,
         Commands::Note { user_id, note } => set_note(&user_id, note).await,
-        Commands::Worlds { query, offset } => worlds(query, offset).await,
+        Commands::Worlds { command } => match command {
+            WorldsCommand::Search { query, offset } => worlds_search(query, offset).await,
+            WorldsCommand::Active { query, offset } => {
+                worlds_feed(WorldsFeedKind::Active, query, offset).await
+            }
+            WorldsCommand::Recent { query, offset } => {
+                worlds_feed(WorldsFeedKind::Recent, query, offset).await
+            }
+        },
         Commands::World { world_id } => world(&world_id).await,
-        Commands::Groups { query, offset } => groups(query, offset).await,
+        Commands::Groups { command } => match command {
+            GroupsCommand::Own => own_groups().await,
+            GroupsCommand::Search { query, offset } => groups_search(query, offset).await,
+        },
         Commands::Group { group_id } => group(&group_id).await,
-        Commands::Avatars { query, own, offset } => avatars(query, own, offset).await,
-        Commands::Avatar { avatar_id } => avatar(&avatar_id).await,
-        Commands::AvatarSelect { avatar_id, yes } => avatar_select(&avatar_id, yes).await,
-        Commands::Favorites => favorites().await,
+        Commands::Avatars { command } => match command {
+            AvatarsCommand::Featured { offset } => avatars(false, offset).await,
+            AvatarsCommand::Own { offset } => avatars(true, offset).await,
+        },
+        Commands::Avatar { command } => match command {
+            AvatarCommand::Show { avatar_id } => avatar(&avatar_id).await,
+            AvatarCommand::Select { avatar_id, yes } => avatar_select(&avatar_id, yes).await,
+        },
+        Commands::Favorites { command } => match command {
+            Some(FavoritesCommand::Groups { offset }) => favorite_groups(offset).await,
+            _ => favorites().await,
+        },
         Commands::InstanceCreate {
             world_id,
             kind,
@@ -967,7 +1068,24 @@ async fn wait_browse(handle: &mut AppHandle) -> Result<()> {
     Ok(())
 }
 
-async fn worlds(query: Option<String>, offset: usize) -> Result<()> {
+/// Which `/worlds/*` feed a `worlds` subcommand reads.
+#[derive(Clone, Copy)]
+enum WorldsFeedKind {
+    Active,
+    Recent,
+}
+
+fn print_worlds(page: &BrowsePage<World>) {
+    for world in &page.items {
+        println!(
+            "{:<40} by {:<24} cap {:>4}  {}",
+            world.name, world.author_name, world.capacity, world.id
+        );
+    }
+    println!("-- {} world(s) --", page.items.len());
+}
+
+async fn worlds_search(query: Option<String>, offset: usize) -> Result<()> {
     let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
@@ -982,13 +1100,29 @@ async fn worlds(query: Option<String>, offset: usize) -> Result<()> {
     let Some(page) = &state.world_search else {
         bail!("no world results");
     };
-    for world in &page.items {
-        println!(
-            "{:<40} by {:<24} cap {:>4}  {}",
-            world.name, world.author_name, world.capacity, world.id
-        );
-    }
-    println!("-- {} world(s) --", page.items.len());
+    print_worlds(page);
+    Ok(())
+}
+
+async fn worlds_feed(kind: WorldsFeedKind, query: Option<String>, offset: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    let query = query.unwrap_or_default();
+    let command = match kind {
+        WorldsFeedKind::Active => Command::SearchActiveWorlds { query, offset },
+        WorldsFeedKind::Recent => Command::SearchRecentWorlds { query, offset },
+    };
+    handle.commands.send(command).await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let page = match kind {
+        WorldsFeedKind::Active => &state.active_worlds,
+        WorldsFeedKind::Recent => &state.recent_worlds,
+    };
+    let Some(page) = page else {
+        bail!("no world results");
+    };
+    print_worlds(page);
     Ok(())
 }
 
@@ -1032,7 +1166,17 @@ async fn world(world_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn groups(query: Option<String>, offset: usize) -> Result<()> {
+fn print_groups(page: &BrowsePage<Group>) {
+    for group in &page.items {
+        println!(
+            "{:<32} {:<10} {:>5} members ({:>4} online)  {}",
+            group.name, group.short_code, group.member_count, group.online_member_count, group.id
+        );
+    }
+    println!("-- {} group(s) --", page.items.len());
+}
+
+async fn groups_search(query: Option<String>, offset: usize) -> Result<()> {
     let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
@@ -1047,13 +1191,33 @@ async fn groups(query: Option<String>, offset: usize) -> Result<()> {
     let Some(page) = &state.group_search else {
         bail!("no group results");
     };
-    for group in &page.items {
-        println!(
-            "{:<32} {:<10} {:>5} members ({:>4} online)  {}",
-            group.name, group.short_code, group.member_count, group.online_member_count, group.id
-        );
+    print_groups(page);
+    Ok(())
+}
+
+async fn own_groups() -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle.commands.send(Command::LoadOwnGroups).await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(groups) = &state.own_groups else {
+        bail!("your groups are not loaded");
+    };
+    if groups.is_empty() {
+        println!("(no public group memberships)");
+        return Ok(());
     }
-    println!("-- {} group(s) --", page.items.len());
+    for group in groups {
+        println!(
+            "{:<32} {:<10} {:>5} members  {}",
+            group.name, group.short_code, group.member_count, group.group_id
+        );
+        if group.is_representing {
+            println!("    (representing)");
+        }
+    }
+    println!("-- {} group(s) --", groups.len());
     Ok(())
 }
 
@@ -1106,16 +1270,12 @@ async fn group(group_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn avatars(query: Option<String>, own: bool, offset: usize) -> Result<()> {
+async fn avatars(own: bool, offset: usize) -> Result<()> {
     let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle
         .commands
-        .send(Command::SearchAvatars {
-            query: query.unwrap_or_default(),
-            offset,
-            own,
-        })
+        .send(Command::LoadAvatars { offset, own })
         .await?;
     wait_browse(&mut handle).await?;
     let state = handle.state.snapshot();
@@ -1184,10 +1344,41 @@ async fn avatar_select(avatar_id: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_favorite_groups(page: &BrowsePage<FavoriteGroup>) {
+    for group in &page.items {
+        let name = if group.display_name.is_empty() {
+            group.name.as_str()
+        } else {
+            group.display_name.as_str()
+        };
+        println!(
+            "{:<32} {:<8} {:<24} {}",
+            name, group.kind, group.owner_display_name, group.id
+        );
+    }
+    println!("-- {} favorite group(s) --", page.items.len());
+}
+
+fn print_friend_favorites(records: &[Favorite]) {
+    let mut count = 0;
+    for record in records {
+        if record.kind == "friend" {
+            println!("  {}", record.favorite_id);
+            count += 1;
+        }
+    }
+    println!("  -- {count} friend favorite(s) --");
+}
+
 async fn favorites() -> Result<()> {
     let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;
     handle.commands.send(Command::RefreshFavorites).await?;
+    wait_browse(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadFavoriteGroups { offset: 0 })
+        .await?;
     wait_browse(&mut handle).await?;
     let state = handle.state.snapshot();
     println!("== Worlds ==");
@@ -1208,6 +1399,30 @@ async fn favorites() -> Result<()> {
     } else {
         println!("  (none)");
     }
+    println!("== Friends ==");
+    print_friend_favorites(&state.favorite_records);
+    println!("== Favorite groups ==");
+    if let Some(page) = &state.favorite_groups {
+        print_favorite_groups(page);
+    } else {
+        println!("  (none)");
+    }
+    Ok(())
+}
+
+async fn favorite_groups(offset: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadFavoriteGroups { offset })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(page) = &state.favorite_groups else {
+        bail!("no favorite groups");
+    };
+    print_favorite_groups(page);
     Ok(())
 }
 

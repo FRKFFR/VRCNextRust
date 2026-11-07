@@ -21,6 +21,7 @@ const FAKE_COOKIE: &str = "authcookie_00000000000000000000000000000000";
 const WORLD_ID: &str = "wrld_00000000-0000-0000-0000-000000000001";
 const GROUP_ID: &str = "grp_00000000-0000-0000-0000-000000000001";
 const AVATAR_ID: &str = "avtr_00000000-0000-0000-0000-000000000001";
+const USER_ID: &str = "usr_00000000-0000-0000-0000-000000000001";
 const INSTANCE_ID: &str = "12345~region(us)";
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -70,6 +71,17 @@ fn fake_group() -> serde_json::Value {
         "membershipStatus": "None",
         "galleries": [],
         "roles": []
+    })
+}
+
+fn fake_avatar(name: &str) -> serde_json::Value {
+    json!({
+        "id": AVATAR_ID,
+        "name": name,
+        "authorName": "Test Author",
+        "authorId": USER_ID,
+        "releaseStatus": "public",
+        "version": 3
     })
 }
 
@@ -279,8 +291,7 @@ async fn group_detail_join_members_posts_and_instances() {
     Mock::given(method("GET"))
         .and(path(format!("/groups/{GROUP_ID}/posts")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "posts": [{"id": "gpost_1", "groupId": GROUP_ID, "title": "Hi", "text": "Synthetic post."}],
-            "total": 1
+            "posts": [{"id": "gpost_1", "groupId": GROUP_ID, "title": "Hi", "text": "Synthetic post."}]
         })))
         .expect(1)
         .mount(&server)
@@ -291,7 +302,6 @@ async fn group_detail_join_members_posts_and_instances() {
             "instanceId": INSTANCE_ID,
             "location": format!("{WORLD_ID}:{INSTANCE_ID}"),
             "memberCount": 4,
-            "groupId": GROUP_ID,
             "world": fake_world()
         })]))
         .expect(1)
@@ -314,7 +324,6 @@ async fn group_detail_join_members_posts_and_instances() {
         .commands
         .send(Command::JoinGroup {
             group_id: GROUP_ID.to_string(),
-            confirm_override_block: false,
         })
         .await
         .unwrap();
@@ -355,7 +364,8 @@ async fn group_detail_join_members_posts_and_instances() {
     ));
     assert_eq!(state.group_members[GROUP_ID].items.len(), 1);
     assert_eq!(state.group_posts[GROUP_ID].items.len(), 1);
-    assert_eq!(state.group_posts[GROUP_ID].total, Some(1));
+    // The documented posts envelope has no `total`.
+    assert!(state.group_posts[GROUP_ID].total.is_none());
     assert_eq!(state.group_instances[GROUP_ID].items.len(), 1);
     server.verify().await;
 }
@@ -569,5 +579,246 @@ async fn create_instance_and_self_invite() {
         .await
         .unwrap();
     wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await;
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn own_groups_favorite_groups_and_world_feeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/{USER_ID}/groups")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+            "groupId": GROUP_ID,
+            "id": "gmem_00000000-0000-0000-0000-000000000001",
+            "name": "Synthetic Group",
+            "shortCode": "synth",
+            "memberCount": 12,
+            "isRepresenting": false
+        })]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorite/groups"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+            "id": "fvgrp_00000000-0000-0000-0000-000000000001",
+            "displayName": "Close friends",
+            "name": "group_0",
+            "ownerId": USER_ID,
+            "ownerDisplayName": "Test User",
+            "type": "friend",
+            "visibility": "friends"
+        })]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for feed in ["active", "recent"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/worlds/{feed}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_world()]))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let mut handle = authed_handle(&server).await;
+    login(&mut handle).await;
+
+    handle.commands.send(Command::LoadOwnGroups).await.unwrap();
+    wait_browse(&mut handle).await;
+    handle
+        .commands
+        .send(Command::LoadFavoriteGroups { offset: 0 })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    handle
+        .commands
+        .send(Command::SearchActiveWorlds {
+            query: String::new(),
+            offset: 0,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    handle
+        .commands
+        .send(Command::SearchRecentWorlds {
+            query: String::new(),
+            offset: 0,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+
+    let state = handle.state.snapshot();
+    let own = state.own_groups.as_ref().expect("own groups");
+    assert_eq!(own[0].group_id, GROUP_ID);
+    assert_eq!(own[0].short_code, "synth");
+    let fav_groups = state.favorite_groups.as_ref().expect("favorite groups");
+    assert_eq!(fav_groups.items[0].display_name, "Close friends");
+    assert_eq!(fav_groups.items[0].kind, "friend");
+    assert_eq!(state.active_worlds.as_ref().unwrap().items.len(), 1);
+    assert_eq!(state.recent_worlds.as_ref().unwrap().items.len(), 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn avatar_scope_switch_reloads_results() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/avatars"))
+        .and(query_param("featured", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![fake_avatar("Featured Avatar")]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/avatars"))
+        .and(query_param("user", "me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_avatar("Own Avatar")]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut handle = authed_handle(&server).await;
+    login(&mut handle).await;
+
+    handle
+        .commands
+        .send(Command::LoadAvatars {
+            offset: 0,
+            own: false,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    {
+        let state = handle.state.snapshot();
+        let page = state.avatar_search.as_ref().expect("avatar page");
+        assert_eq!(page.key, "featured");
+        assert_eq!(page.items[0].name, "Featured Avatar");
+    }
+
+    // Switching scope must not dedup against the featured page.
+    handle
+        .commands
+        .send(Command::LoadAvatars {
+            offset: 0,
+            own: true,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    let state = handle.state.snapshot();
+    let page = state.avatar_search.as_ref().expect("avatar page");
+    assert_eq!(page.key, "own");
+    assert_eq!(page.items[0].name, "Own Avatar");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn avatar_scope_switch_during_debounce_uses_newest() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/avatars"))
+        .and(query_param("featured", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![fake_avatar("Featured Avatar")]),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/avatars"))
+        .and(query_param("user", "me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_avatar("Own Avatar")]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut handle = authed_handle(&server).await;
+    login(&mut handle).await;
+
+    // Both commands land inside the debounce window: the featured fetch is
+    // superseded and must never reach the wire.
+    handle
+        .commands
+        .send(Command::LoadAvatars {
+            offset: 0,
+            own: false,
+        })
+        .await
+        .unwrap();
+    handle
+        .commands
+        .send(Command::LoadAvatars {
+            offset: 0,
+            own: true,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    // Let any stale task finish before counting requests.
+    sleep(Duration::from_millis(700)).await;
+
+    let state = handle.state.snapshot();
+    let page = state.avatar_search.as_ref().expect("avatar page");
+    assert_eq!(page.key, "own");
+    assert_eq!(page.items[0].name, "Own Avatar");
+
+    let avatar_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|req| req.url.path() == "/avatars")
+        .count();
+    assert_eq!(avatar_requests, 1, "only the newest scope may hit the wire");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn search_task_is_dropped_after_logout() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // No /worlds mock: a request escaping the auth check would 404 and
+    // still be visible in received_requests.
+
+    let mut handle = authed_handle(&server).await;
+    login(&mut handle).await;
+
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: "synthetic".to_string(),
+            offset: 0,
+        })
+        .await
+        .unwrap();
+    handle.commands.send(Command::Logout).await.unwrap();
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::AuthChanged(AuthState::LoggedOut))
+    })
+    .await;
+    // Past the 400 ms debounce: the detached task must have observed the
+    // logged-out state and returned without a request or a state write.
+    sleep(Duration::from_millis(700)).await;
+
+    assert!(handle.state.snapshot().world_search.is_none());
+    let world_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|req| req.url.path() == "/worlds")
+        .count();
+    assert_eq!(world_requests, 0);
     server.verify().await;
 }

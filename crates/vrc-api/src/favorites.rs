@@ -4,7 +4,7 @@
 use reqwest::Method;
 
 use crate::avatars::valid_avatar_id;
-use crate::models::{Avatar, Favorite, FavoriteKind, SuccessResponse, World};
+use crate::models::{Avatar, Favorite, FavoriteGroup, FavoriteKind, SuccessResponse, World};
 use crate::query::{append_page, append_query_opt};
 use crate::users::valid_user_id;
 use crate::worlds::valid_world_id;
@@ -95,6 +95,26 @@ impl Client {
         let mut path = String::from("/avatars/favorites");
         append_page(&mut path, n, offset);
         append_query_opt(&mut path, "tag", tag);
+        self.get_json(&path).await
+    }
+
+    /// `GET /favorite/groups` — the user's favorite-group sets
+    /// (`FavoriteGroup` objects: `group_0`–`group_3`, `worlds1`–`worlds4`,
+    /// `avatars1`–`avatars4`). `owner_id` filters by `usr_…` owner.
+    pub async fn favorite_groups(
+        &self,
+        n: Option<u32>,
+        offset: Option<u64>,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<FavoriteGroup>, ApiError> {
+        if let Some(owner) = owner_id {
+            if !valid_user_id(owner) {
+                return Err(ApiError::InvalidId(owner.chars().take(64).collect()));
+            }
+        }
+        let mut path = String::from("/favorite/groups");
+        append_page(&mut path, n, offset);
+        append_query_opt(&mut path, "ownerId", owner_id);
         self.get_json(&path).await
     }
 }

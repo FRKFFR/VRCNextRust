@@ -971,7 +971,8 @@ pub struct GroupRole {
     pub updated_at: String,
 }
 
-/// The limited user object embedded on a [`GroupMember`].
+/// The limited user object embedded on a [`GroupMember`]
+/// (`GroupMemberLimitedUser` in the API docs).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GroupMemberUser {
@@ -979,22 +980,19 @@ pub struct GroupMemberUser {
     pub id: String,
     #[serde(rename = "displayName", deserialize_with = "null_to_default")]
     pub display_name: String,
-    #[serde(deserialize_with = "null_to_default")]
-    pub username: String,
     #[serde(rename = "iconUrl", deserialize_with = "null_to_default")]
     pub icon_url: String,
-    #[serde(rename = "bannerUrl", deserialize_with = "null_to_default")]
-    pub banner_url: String,
-    #[serde(rename = "bannerColor", deserialize_with = "null_to_default")]
-    pub banner_color: String,
-    #[serde(rename = "bannerType", deserialize_with = "null_to_default")]
-    pub banner_type: String,
-    #[serde(rename = "iconFrame", deserialize_with = "null_to_default")]
-    pub icon_frame: String,
-    #[serde(rename = "nameplateEffect", deserialize_with = "null_to_default")]
-    pub nameplate_effect: String,
-    #[serde(rename = "profileEffect", deserialize_with = "null_to_default")]
-    pub profile_effect: String,
+    #[serde(rename = "profilePicOverride", deserialize_with = "null_to_default")]
+    pub profile_pic_override: String,
+    #[serde(rename = "thumbnailUrl", deserialize_with = "null_to_default")]
+    pub thumbnail_url: String,
+    #[serde(
+        rename = "currentAvatarThumbnailImageUrl",
+        deserialize_with = "null_to_default"
+    )]
+    pub current_avatar_thumbnail_image_url: String,
+    #[serde(rename = "currentAvatarTags", deserialize_with = "null_to_default")]
+    pub current_avatar_tags: Vec<String>,
 }
 
 /// A group membership (`GET /groups/{id}/members`, join/leave responses).
@@ -1073,6 +1071,7 @@ pub struct GroupPost {
     pub image_url: String,
     #[serde(deserialize_with = "null_to_default")]
     pub visibility: String,
+    /// `roleIds` on the wire — a `GroupRoleIDList` (array of `grol_…`).
     #[serde(rename = "roleIds", deserialize_with = "null_to_default")]
     pub role_ids: Vec<String>,
     #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
@@ -1081,14 +1080,13 @@ pub struct GroupPost {
     pub updated_at: String,
 }
 
-/// The `{posts, total}` envelope returned by `GET /groups/{id}/posts`.
+/// The `{posts}` envelope returned by `GET /groups/{id}/posts`
+/// (`GroupPostsResponse` — the documented schema has no `total`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GroupPostPage {
     #[serde(deserialize_with = "null_to_default")]
     pub posts: Vec<GroupPost>,
-    #[serde(deserialize_with = "null_to_default")]
-    pub total: i64,
 }
 
 /// One image inside a group gallery.
@@ -1127,10 +1125,78 @@ pub struct GroupInstance {
     pub location: String,
     #[serde(rename = "memberCount", deserialize_with = "null_to_default")]
     pub member_count: i32,
-    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
-    pub group_id: String,
     #[serde(deserialize_with = "null_to_default")]
     pub world: World,
+}
+
+/// A group the user belongs to (`GET /users/{userId}/groups`,
+/// `LimitedUserGroups` in the API docs — no paging params).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserGroup {
+    /// `grp_…` group id.
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    /// `gmem_…` membership id.
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(rename = "shortCode", deserialize_with = "null_to_default")]
+    pub short_code: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(rename = "memberCount", deserialize_with = "null_to_default")]
+    pub member_count: i32,
+    #[serde(rename = "ownerId", deserialize_with = "null_to_default")]
+    pub owner_id: String,
+    #[serde(rename = "iconUrl", deserialize_with = "null_to_default")]
+    pub icon_url: String,
+    #[serde(rename = "bannerUrl", deserialize_with = "null_to_default")]
+    pub banner_url: String,
+    #[serde(rename = "isRepresenting", deserialize_with = "null_to_default")]
+    pub is_representing: bool,
+    #[serde(rename = "lastPostCreatedAt", deserialize_with = "null_to_default")]
+    pub last_post_created_at: String,
+    #[serde(rename = "lastPostReadAt", deserialize_with = "null_to_default")]
+    pub last_post_read_at: String,
+    #[serde(rename = "memberVisibility", deserialize_with = "null_to_default")]
+    pub member_visibility: String,
+    #[serde(rename = "mutualGroup", deserialize_with = "null_to_default")]
+    pub mutual_group: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub privacy: String,
+}
+
+/// A favorite *group* record (`GET /favorite/groups`,
+/// `FavoriteGroup` in the API docs — a named set of favorites, not a
+/// `grp_…` group).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FavoriteGroup {
+    /// `fvgrp_…` favorite-group id.
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    /// Display name of the set.
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    /// Set name (`group_0`–`group_3` for friends, `worlds1`–`worlds4` /
+    /// `avatars1`–`avatars4` for the typed lists).
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    /// `usr_…` owner of the set.
+    #[serde(rename = "ownerId", deserialize_with = "null_to_default")]
+    pub owner_id: String,
+    #[serde(rename = "ownerDisplayName", deserialize_with = "null_to_default")]
+    pub owner_display_name: String,
+    /// `FavoriteType` (`world`/`avatar`/`friend`) the set holds.
+    #[serde(rename = "type", deserialize_with = "null_to_default")]
+    pub kind: String,
+    /// `FavoriteGroupVisibility` (`friends`/`private`/`public`).
+    #[serde(deserialize_with = "null_to_default")]
+    pub visibility: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
 }
 
 #[cfg(test)]

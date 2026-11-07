@@ -5,8 +5,11 @@
 
 use reqwest::Method;
 
-use crate::models::{Group, GroupGalleryImage, GroupInstance, GroupMember, GroupPostPage};
+use crate::models::{
+    Group, GroupGalleryImage, GroupInstance, GroupMember, GroupPostPage, UserGroup,
+};
 use crate::query::{append_bool, append_page, append_query_opt};
+use crate::users::valid_user_id;
 use crate::{ApiError, Client};
 
 fn check_prefixed_id(prefix: &str, id: &str) -> bool {
@@ -69,19 +72,10 @@ impl Client {
     }
 
     /// `POST /groups/{groupId}/join` — join a group (returns the member).
-    pub async fn join_group(
-        &self,
-        group_id: &str,
-        confirm_override_block: bool,
-    ) -> Result<GroupMember, ApiError> {
+    /// The documented endpoint takes no query params and no body.
+    pub async fn join_group(&self, group_id: &str) -> Result<GroupMember, ApiError> {
         check_group_id(group_id)?;
-        let mut path = format!("/groups/{group_id}/join");
-        append_bool(
-            &mut path,
-            "confirmOverrideBlock",
-            Some(confirm_override_block),
-        );
-        self.send_json(Method::POST, &path, Some(&serde_json::json!({})))
+        self.send_json(Method::POST, &format!("/groups/{group_id}/join"), None)
             .await
     }
 
@@ -114,25 +108,6 @@ impl Client {
         self.get_json(&path).await
     }
 
-    /// `GET /groups/{groupId}/members/search` — search members (query ≥3).
-    pub async fn search_group_members(
-        &self,
-        group_id: &str,
-        query: &str,
-        n: Option<u32>,
-        offset: Option<u64>,
-    ) -> Result<Vec<GroupMember>, ApiError> {
-        check_group_id(group_id)?;
-        let query = query.trim();
-        if query.chars().count() < 3 {
-            return Err(ApiError::InvalidId("member search query".to_string()));
-        }
-        let mut path = format!("/groups/{group_id}/members/search");
-        append_page(&mut path, n, offset);
-        append_query_opt(&mut path, "query", Some(query));
-        self.get_json(&path).await
-    }
-
     /// `GET /groups/{groupId}/members/{userId}` — one member.
     pub async fn group_member(
         &self,
@@ -147,7 +122,8 @@ impl Client {
             .await
     }
 
-    /// `GET /groups/{groupId}/posts` — `{posts,total}` envelope.
+    /// `GET /groups/{groupId}/posts` — the documented `{posts}` envelope
+    /// (no `total` field).
     pub async fn group_posts(
         &self,
         group_id: &str,
@@ -186,6 +162,15 @@ impl Client {
         check_group_id(group_id)?;
         self.get_json(&format!("/groups/{group_id}/instances"))
             .await
+    }
+
+    /// `GET /users/{userId}/groups` — the user's public groups
+    /// (`LimitedUserGroups`; no paging params are documented).
+    pub async fn user_groups(&self, user_id: &str) -> Result<Vec<UserGroup>, ApiError> {
+        if !valid_user_id(user_id) {
+            return Err(ApiError::InvalidId(user_id.chars().take(64).collect()));
+        }
+        self.get_json(&format!("/users/{user_id}/groups")).await
     }
 }
 

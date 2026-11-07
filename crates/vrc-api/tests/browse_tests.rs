@@ -131,6 +131,39 @@ async fn world_search_rejects_bad_user_scope_without_request() {
 }
 
 #[tokio::test]
+async fn active_and_recent_worlds_hit_documented_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/worlds/active"))
+        .and(query_param("search", "castle"))
+        .and(query_param("n", "24"))
+        .and(query_param("offset", "24"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_world()]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/worlds/recent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_world()]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let query = vrc_api::WorldSearchQuery {
+        search: Some("castle".to_string()),
+        n: Some(24),
+        offset: Some(24),
+        ..Default::default()
+    };
+    let active = client.active_worlds(&query).await.unwrap();
+    assert_eq!(active[0].name, "Synthetic World");
+    let recent = client.recent_worlds(&Default::default()).await.unwrap();
+    assert_eq!(recent.len(), 1);
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn group_endpoints_hit_documented_paths() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -148,7 +181,6 @@ async fn group_endpoints_hit_documented_paths() {
         .await;
     Mock::given(method("POST"))
         .and(path(format!("/groups/{GROUP_ID}/join")))
-        .and(query_param("confirmOverrideBlock", "false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "gmem_00000000-0000-0000-0000-000000000001",
             "groupId": GROUP_ID,
@@ -171,17 +203,9 @@ async fn group_endpoints_hit_documented_paths() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/groups/{GROUP_ID}/members/search")))
-        .and(query_param("query", "ali"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
         .and(path(format!("/groups/{GROUP_ID}/posts")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "posts": [{"id": "gpost_1", "groupId": GROUP_ID, "title": "Hi", "text": "Synthetic post."}],
-            "total": 1
+            "posts": [{"id": "gpost_1", "groupId": GROUP_ID, "title": "Hi", "text": "Synthetic post."}]
         })))
         .expect(1)
         .mount(&server)
@@ -205,7 +229,6 @@ async fn group_endpoints_hit_documented_paths() {
             "instanceId": INSTANCE_ID,
             "location": format!("{WORLD_ID}:{INSTANCE_ID}"),
             "memberCount": 4,
-            "groupId": GROUP_ID,
             "world": fake_world()
         })]))
         .expect(1)
@@ -220,21 +243,17 @@ async fn group_endpoints_hit_documented_paths() {
     assert_eq!(groups[0].name, "Synthetic Group");
     let group = client.group(GROUP_ID, true).await.unwrap();
     assert_eq!(group.short_code, "synth");
-    client.join_group(GROUP_ID, false).await.unwrap();
+    client.join_group(GROUP_ID).await.unwrap();
     let members = client
         .group_members(GROUP_ID, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(members[0].user_id, USER_ID);
-    client
-        .search_group_members(GROUP_ID, "ali", None, None)
-        .await
-        .unwrap();
     let posts = client
         .group_posts(GROUP_ID, None, None, false)
         .await
         .unwrap();
-    assert_eq!(posts.total, 1);
+    assert_eq!(posts.posts.len(), 1);
     let images = client
         .group_gallery_images(GROUP_ID, GALLERY_ID, None, None, None)
         .await
@@ -246,7 +265,7 @@ async fn group_endpoints_hit_documented_paths() {
 }
 
 #[tokio::test]
-async fn group_leave_and_member_search_validation() {
+async fn group_leave_posts_member_and_user_groups_endpoints() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/groups/{GROUP_ID}/leave")))
@@ -254,13 +273,37 @@ async fn group_leave_and_member_search_validation() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/groups/{GROUP_ID}/members/{USER_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "gmem_00000000-0000-0000-0000-000000000001",
+            "groupId": GROUP_ID,
+            "userId": USER_ID,
+            "membershipStatus": "Member"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/{USER_ID}/groups")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+            "groupId": GROUP_ID,
+            "id": "gmem_00000000-0000-0000-0000-000000000001",
+            "name": "Synthetic Group",
+            "shortCode": "synth",
+            "memberCount": 12,
+            "isRepresenting": false
+        })]))
+        .expect(1)
+        .mount(&server)
+        .await;
     let client = test_client(&server);
     client.leave_group(GROUP_ID).await.unwrap();
-    // Member search needs >=3 chars.
-    assert!(client
-        .search_group_members(GROUP_ID, "ab", None, None)
-        .await
-        .is_err());
+    let member = client.group_member(GROUP_ID, USER_ID).await.unwrap();
+    assert_eq!(member.user_id, USER_ID);
+    let groups = client.user_groups(USER_ID).await.unwrap();
+    assert_eq!(groups[0].group_id, GROUP_ID);
+    assert_eq!(groups[0].short_code, "synth");
     server.verify().await;
 }
 
@@ -270,7 +313,7 @@ async fn group_calls_reject_bad_ids_without_request() {
     let client = test_client(&server);
     for bad in ["usr_123", "grp_../x", "grp_a?b=c", "grp_a b", ""] {
         assert!(client.group(bad, false).await.is_err(), "{bad}");
-        assert!(client.join_group(bad, false).await.is_err(), "{bad}");
+        assert!(client.join_group(bad).await.is_err(), "{bad}");
         assert!(client.leave_group(bad).await.is_err(), "{bad}");
         assert!(
             client
@@ -293,6 +336,9 @@ async fn group_calls_reject_bad_ids_without_request() {
         .group_members(GROUP_ID, None, None, None, Some("grol_../x"))
         .await
         .is_err());
+    for bad in ["grp_123", "usr_../x", ""] {
+        assert!(client.user_groups(bad).await.is_err(), "{bad}");
+    }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -302,7 +348,6 @@ async fn avatar_search_detail_own_and_select() {
     Mock::given(method("GET"))
         .and(path("/avatars"))
         .and(query_param("featured", "true"))
-        .and(query_param("search", "synth"))
         .respond_with(ResponseTemplate::new(200).set_body_json(vec![fake_avatar()]))
         .expect(1)
         .mount(&server)
@@ -340,7 +385,6 @@ async fn avatar_search_detail_own_and_select() {
     let client = test_client(&server);
     let featured = client
         .search_avatars(&vrc_api::AvatarSearchQuery {
-            search: Some("synth".to_string()),
             featured: Some(true),
             ..Default::default()
         })
@@ -418,6 +462,34 @@ async fn favorites_list_add_and_remove() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/favorites"))
+        .and(query_param("type", "friend"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+            "id": "fvrt_00000000-0000-0000-0000-000000000003",
+            "type": "friend",
+            "favoriteId": USER_ID,
+            "tags": [],
+            "visibility": "friends"
+        })]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favorite/groups"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+            "id": "fvgrp_00000000-0000-0000-0000-000000000001",
+            "displayName": "Close friends",
+            "name": "group_0",
+            "ownerId": USER_ID,
+            "ownerDisplayName": "Test User",
+            "type": "friend",
+            "visibility": "friends",
+            "tags": []
+        })]))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/favorites"))
         .and(body_json(json!({
@@ -459,6 +531,14 @@ async fn favorites_list_add_and_remove() {
         .await
         .unwrap();
     assert!(avatar_records.is_empty());
+    let friend_records = client
+        .favorites(FavoriteKind::Friend, None, None)
+        .await
+        .unwrap();
+    assert_eq!(friend_records[0].favorite_id, USER_ID);
+    let groups = client.favorite_groups(None, None, None).await.unwrap();
+    assert_eq!(groups[0].display_name, "Close friends");
+    assert_eq!(groups[0].kind, "friend");
     let added = client
         .add_favorite(FavoriteKind::Avatar, AVATAR_ID, &["cool".to_string()])
         .await
@@ -490,6 +570,14 @@ async fn favorites_reject_bad_ids_without_request() {
     }
     assert!(client.remove_favorite("fv_123").await.is_err());
     assert!(client.remove_favorite("fvrt_../x").await.is_err());
+    assert!(client
+        .favorite_groups(None, None, Some("grp_123"))
+        .await
+        .is_err());
+    assert!(client
+        .favorite_groups(None, None, Some("usr_../x"))
+        .await
+        .is_err());
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 

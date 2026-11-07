@@ -272,6 +272,20 @@ pub enum Command {
         /// pass `page * BROWSE_PAGE_SIZE`).
         offset: usize,
     },
+    /// `GET /worlds/active` into `AppState.active_worlds` (debounced).
+    SearchActiveWorlds {
+        /// Free-text world-name filter (empty = browse defaults).
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /worlds/recent` into `AppState.recent_worlds` (debounced).
+    SearchRecentWorlds {
+        /// Free-text world-name filter (empty = browse defaults).
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
     /// `GET /worlds/{id}` into `AppState.world_details` (cached).
     LoadWorld {
         /// `wrld_…` world id.
@@ -284,6 +298,8 @@ pub enum Command {
         /// Zero-based offset.
         offset: usize,
     },
+    /// `GET /users/{me}/groups` into `AppState.own_groups`.
+    LoadOwnGroups,
     /// `GET /groups/{id}` into `AppState.group_details` (cached).
     LoadGroup {
         /// `grp_…` group id.
@@ -295,8 +311,6 @@ pub enum Command {
     JoinGroup {
         /// `grp_…` group id.
         group_id: String,
-        /// Manually override a blocked-group failure.
-        confirm_override_block: bool,
     },
     /// `POST /groups/{id}/leave` then reload the group detail.
     LeaveGroup {
@@ -307,15 +321,6 @@ pub enum Command {
     LoadGroupMembers {
         /// `grp_…` group id.
         group_id: String,
-        /// Zero-based offset.
-        offset: usize,
-    },
-    /// `GET /groups/{id}/members/search` into `AppState.group_member_searches`.
-    SearchGroupMembers {
-        /// `grp_…` group id.
-        group_id: String,
-        /// Member name filter (min 3 chars).
-        query: String,
         /// Zero-based offset.
         offset: usize,
     },
@@ -345,14 +350,13 @@ pub enum Command {
         /// `grp_…` group id.
         group_id: String,
     },
-    /// `GET /avatars` search into `AppState.avatar_search` (debounced).
-    /// `own` selects `user=me`; otherwise `featured=true`.
-    SearchAvatars {
-        /// Free-text avatar-name filter.
-        query: String,
+    /// `GET /avatars` page into `AppState.avatar_search` (debounced).
+    /// `own` selects `user=me`; otherwise `featured=true`. The documented
+    /// endpoint has no text search, so there is no query field.
+    LoadAvatars {
         /// Zero-based offset.
         offset: usize,
-        /// Search own avatars instead of featured ones.
+        /// List own avatars instead of featured ones.
         own: bool,
     },
     /// `GET /avatars/{id}` into `AppState.avatar_details` (cached).
@@ -379,6 +383,11 @@ pub enum Command {
     },
     /// `GET /avatars/favorites` page into `AppState.favorite_avatars`.
     LoadFavoriteAvatars {
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /favorite/groups` page into `AppState.favorite_groups`.
+    LoadFavoriteGroups {
         /// Zero-based offset.
         offset: usize,
     },
@@ -448,23 +457,26 @@ impl std::fmt::Debug for Command {
             Command::CancelMultiInvite => "CancelMultiInvite",
             Command::LoadInstance { .. } => "LoadInstance",
             Command::SearchWorlds { .. } => "SearchWorlds",
+            Command::SearchActiveWorlds { .. } => "SearchActiveWorlds",
+            Command::SearchRecentWorlds { .. } => "SearchRecentWorlds",
             Command::LoadWorld { .. } => "LoadWorld",
             Command::SearchGroups { .. } => "SearchGroups",
+            Command::LoadOwnGroups => "LoadOwnGroups",
             Command::LoadGroup { .. } => "LoadGroup",
             Command::JoinGroup { .. } => "JoinGroup",
             Command::LeaveGroup { .. } => "LeaveGroup",
             Command::LoadGroupMembers { .. } => "LoadGroupMembers",
-            Command::SearchGroupMembers { .. } => "SearchGroupMembers",
             Command::LoadGroupPosts { .. } => "LoadGroupPosts",
             Command::LoadGroupGalleryImages { .. } => "LoadGroupGalleryImages",
             Command::LoadGroupInstances { .. } => "LoadGroupInstances",
-            Command::SearchAvatars { .. } => "SearchAvatars",
+            Command::LoadAvatars { .. } => "LoadAvatars",
             Command::LoadAvatar { .. } => "LoadAvatar",
             Command::LoadOwnAvatar => "LoadOwnAvatar",
             Command::SelectAvatar { .. } => "SelectAvatar",
             Command::RefreshFavorites => "RefreshFavorites",
             Command::LoadFavoriteWorlds { .. } => "LoadFavoriteWorlds",
             Command::LoadFavoriteAvatars { .. } => "LoadFavoriteAvatars",
+            Command::LoadFavoriteGroups { .. } => "LoadFavoriteGroups",
             Command::AddFavorite { .. } => "AddFavorite",
             Command::RemoveFavorite { .. } => "RemoveFavorite",
             Command::CreateInstance { .. } => "CreateInstance",
@@ -752,6 +764,12 @@ fn clear_page_loading<T>(slot: &mut Option<BrowsePage<T>>) {
     }
 }
 
+/// Whether `page` is a loading page for exactly `key`/`offset` — the
+/// in-flight dedup check for debounced browse fetches.
+fn page_loading<T>(page: Option<&BrowsePage<T>>, key: &str, offset: usize) -> bool {
+    page.is_some_and(|p| p.loading && p.key == key && p.offset == offset)
+}
+
 /// Store the outcome of a debounced search into its `AppState` page slot.
 /// Stale generations (a newer command was queued) and post-logout writes
 /// are dropped; `Unauthorized` reports a dead session through
@@ -770,9 +788,6 @@ fn finish_search<T>(
     ok: impl FnOnce(&mut AppState, BrowsePage<T>),
     err: impl FnOnce(&mut AppState),
 ) {
-    if generation.load(Ordering::Relaxed) != expected {
-        return;
-    }
     match result {
         Ok(items) => {
             let page = BrowsePage {
@@ -783,7 +798,12 @@ fn finish_search<T>(
                 loading: false,
             };
             let mut state = state.write();
-            if state.auth != AuthState::Authenticated {
+            // Re-check the generation *inside* the write lock: a newer
+            // command may have bumped it while this task was waiting for
+            // the lock, and its results must win.
+            if generation.load(Ordering::Relaxed) != expected
+                || state.auth != AuthState::Authenticated
+            {
                 return;
             }
             ok(&mut state, page);
@@ -796,7 +816,9 @@ fn finish_search<T>(
         Err(e) => {
             let message = e.to_string();
             let mut state = state.write();
-            if state.auth != AuthState::Authenticated {
+            if generation.load(Ordering::Relaxed) != expected
+                || state.auth != AuthState::Authenticated
+            {
                 return;
             }
             err(&mut state);
@@ -904,27 +926,26 @@ impl Runtime {
             Command::SearchWorlds { query, offset } => {
                 self.queue_search(SearchKind::Worlds, query, offset, false)
             }
+            Command::SearchActiveWorlds { query, offset } => {
+                self.queue_search(SearchKind::ActiveWorlds, query, offset, false)
+            }
+            Command::SearchRecentWorlds { query, offset } => {
+                self.queue_search(SearchKind::RecentWorlds, query, offset, false)
+            }
             Command::LoadWorld { world_id } => self.load_world(&world_id).await,
             Command::SearchGroups { query, offset } => {
                 self.queue_search(SearchKind::Groups, query, offset, false)
             }
+            Command::LoadOwnGroups => self.load_own_groups().await,
             Command::LoadGroup {
                 group_id,
                 include_roles,
             } => self.load_group(&group_id, include_roles).await,
-            Command::JoinGroup {
-                group_id,
-                confirm_override_block,
-            } => self.join_group(&group_id, confirm_override_block).await,
+            Command::JoinGroup { group_id } => self.join_group(&group_id).await,
             Command::LeaveGroup { group_id } => self.leave_group(&group_id).await,
             Command::LoadGroupMembers { group_id, offset } => {
                 self.load_group_members(&group_id, offset).await
             }
-            Command::SearchGroupMembers {
-                group_id,
-                query,
-                offset,
-            } => self.search_group_members(&group_id, &query, offset).await,
             Command::LoadGroupPosts {
                 group_id,
                 offset,
@@ -940,8 +961,8 @@ impl Runtime {
                     .await
             }
             Command::LoadGroupInstances { group_id } => self.load_group_instances(&group_id).await,
-            Command::SearchAvatars { query, offset, own } => {
-                self.queue_search(SearchKind::Avatars, query, offset, own)
+            Command::LoadAvatars { offset, own } => {
+                self.queue_search(SearchKind::Avatars, String::new(), offset, own)
             }
             Command::LoadAvatar { avatar_id } => self.load_avatar(&avatar_id).await,
             Command::LoadOwnAvatar => self.load_own_avatar().await,
@@ -951,6 +972,7 @@ impl Runtime {
             Command::RefreshFavorites => self.refresh_favorites().await,
             Command::LoadFavoriteWorlds { offset } => self.load_favorite_worlds(offset).await,
             Command::LoadFavoriteAvatars { offset } => self.load_favorite_avatars(offset).await,
+            Command::LoadFavoriteGroups { offset } => self.load_favorite_groups(offset).await,
             Command::AddFavorite {
                 kind,
                 favorite_id,
@@ -1691,28 +1713,42 @@ impl Runtime {
             .clone()
     }
 
-    /// Queue a debounced search: mark the state page loading, bump the
-    /// generation, and spawn a task that sleeps [`SEARCH_DEBOUNCE`] then
+    /// Queue a debounced browse fetch: mark the state page loading, bump
+    /// the generation, and spawn a task that sleeps [`SEARCH_DEBOUNCE`] then
     /// performs the request only if it is still the newest command.
+    ///
+    /// `query` is the free-text filter for the worlds/groups feeds; the
+    /// avatars feed ignores it (the documented endpoint has no `search`
+    /// parameter) and keys its page on the `own` scope instead.
     fn queue_search(&mut self, kind: SearchKind, query: String, offset: usize, own: bool) {
         let query = browse::normalize_query(&query);
         let offset = offset.min(1_000_000);
-        // Dedup: an identical search already loading is not re-queued.
+        // The page key identifies *what* the page holds: the normalized
+        // query for text feeds, the own/featured scope for avatars — so an
+        // identical in-flight scope dedups while a scope switch does not.
+        let key = match kind {
+            SearchKind::Avatars => {
+                if own {
+                    "own".to_string()
+                } else {
+                    "featured".to_string()
+                }
+            }
+            _ => query.clone(),
+        };
+        // Dedup: an identical fetch already loading is not re-queued.
         let already_loading = {
             let state = self.state.read();
             match kind {
-                SearchKind::Worlds => state
-                    .world_search
-                    .as_ref()
-                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
-                SearchKind::Groups => state
-                    .group_search
-                    .as_ref()
-                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
-                SearchKind::Avatars => state
-                    .avatar_search
-                    .as_ref()
-                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
+                SearchKind::Worlds => page_loading(state.world_search.as_ref(), &key, offset),
+                SearchKind::ActiveWorlds => {
+                    page_loading(state.active_worlds.as_ref(), &key, offset)
+                }
+                SearchKind::RecentWorlds => {
+                    page_loading(state.recent_worlds.as_ref(), &key, offset)
+                }
+                SearchKind::Groups => page_loading(state.group_search.as_ref(), &key, offset),
+                SearchKind::Avatars => page_loading(state.avatar_search.as_ref(), &key, offset),
             }
         };
         if already_loading {
@@ -1724,13 +1760,19 @@ impl Runtime {
             let mut state = self.state.write();
             match kind {
                 SearchKind::Worlds => {
-                    state.world_search = Some(BrowsePage::loading(query.clone(), offset))
+                    state.world_search = Some(BrowsePage::loading(key.clone(), offset))
+                }
+                SearchKind::ActiveWorlds => {
+                    state.active_worlds = Some(BrowsePage::loading(key.clone(), offset))
+                }
+                SearchKind::RecentWorlds => {
+                    state.recent_worlds = Some(BrowsePage::loading(key.clone(), offset))
                 }
                 SearchKind::Groups => {
-                    state.group_search = Some(BrowsePage::loading(query.clone(), offset))
+                    state.group_search = Some(BrowsePage::loading(key.clone(), offset))
                 }
                 SearchKind::Avatars => {
-                    state.avatar_search = Some(BrowsePage::loading(query.clone(), offset))
+                    state.avatar_search = Some(BrowsePage::loading(key.clone(), offset))
                 }
             }
         }
@@ -1751,27 +1793,38 @@ impl Runtime {
             let n = BROWSE_PAGE_SIZE as u32;
             let off = offset as u64;
             match kind {
-                SearchKind::Worlds => {
-                    let result = client
-                        .search_worlds(&WorldSearchQuery {
-                            search: browse::non_empty_query(&query),
-                            n: Some(n),
-                            offset: Some(off),
-                            ..Default::default()
-                        })
-                        .await;
+                SearchKind::Worlds | SearchKind::ActiveWorlds | SearchKind::RecentWorlds => {
+                    let filters = WorldSearchQuery {
+                        search: browse::non_empty_query(&query),
+                        n: Some(n),
+                        offset: Some(off),
+                        ..Default::default()
+                    };
+                    let result = match kind {
+                        SearchKind::Worlds => client.search_worlds(&filters).await,
+                        SearchKind::ActiveWorlds => client.active_worlds(&filters).await,
+                        _ => client.recent_worlds(&filters).await,
+                    };
                     finish_search(
                         &state,
                         &events,
                         &session_expired_tx,
                         &generation,
                         expected,
-                        query.clone(),
+                        key.clone(),
                         offset,
                         None,
                         result,
-                        |s, page| s.world_search = Some(page),
-                        |s| clear_page_loading(&mut s.world_search),
+                        |s, page| match kind {
+                            SearchKind::Worlds => s.world_search = Some(page),
+                            SearchKind::ActiveWorlds => s.active_worlds = Some(page),
+                            _ => s.recent_worlds = Some(page),
+                        },
+                        |s| match kind {
+                            SearchKind::Worlds => clear_page_loading(&mut s.world_search),
+                            SearchKind::ActiveWorlds => clear_page_loading(&mut s.active_worlds),
+                            _ => clear_page_loading(&mut s.recent_worlds),
+                        },
                     );
                 }
                 SearchKind::Groups => {
@@ -1788,7 +1841,7 @@ impl Runtime {
                         &session_expired_tx,
                         &generation,
                         expected,
-                        query.clone(),
+                        key.clone(),
                         offset,
                         None,
                         result,
@@ -1799,7 +1852,6 @@ impl Runtime {
                 SearchKind::Avatars => {
                     let result = client
                         .search_avatars(&AvatarSearchQuery {
-                            search: browse::non_empty_query(&query),
                             user: own.then(|| "me".to_string()),
                             featured: (!own).then_some(true),
                             n: Some(n),
@@ -1813,7 +1865,7 @@ impl Runtime {
                         &session_expired_tx,
                         &generation,
                         expected,
-                        query.clone(),
+                        key.clone(),
                         offset,
                         None,
                         result,
@@ -1919,13 +1971,9 @@ impl Runtime {
     }
 
     /// `POST /groups/{id}/join` then reload the group detail.
-    async fn join_group(&mut self, group_id: &str, confirm_override_block: bool) {
+    async fn join_group(&mut self, group_id: &str) {
         if self
-            .attempt(
-                self.client
-                    .clone()
-                    .join_group(group_id, confirm_override_block),
-            )
+            .attempt(self.client.clone().join_group(group_id))
             .await
             .is_some()
         {
@@ -1975,35 +2023,28 @@ impl Runtime {
         }
     }
 
-    /// `GET /groups/{id}/members/search` → `group_member_searches` page.
-    async fn search_group_members(&mut self, group_id: &str, query: &str, offset: usize) {
-        let query = browse::normalize_query(query);
-        let offset = offset.min(1_000_000);
-        let n = BROWSE_PAGE_SIZE as u32;
-        if let Some(items) = self
-            .attempt(self.client.clone().search_group_members(
-                group_id,
-                &query,
-                Some(n),
-                Some(offset as u64),
-            ))
+    /// `GET /users/{me}/groups` → `own_groups`.
+    async fn load_own_groups(&mut self) {
+        let user_id = self
+            .state
+            .read()
+            .current_user
+            .as_ref()
+            .map(|u| u.id.clone());
+        let Some(user_id) = user_id else {
+            self.report_message("not logged in");
+            return;
+        };
+        if let Some(groups) = self
+            .attempt(self.client.clone().user_groups(&user_id))
             .await
         {
-            self.state.write().group_member_searches.insert(
-                group_id.to_string(),
-                BrowsePage {
-                    key: query,
-                    offset,
-                    items,
-                    total: None,
-                    loading: false,
-                },
-            );
+            self.state.write().own_groups = Some(groups);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
 
-    /// `GET /groups/{id}/posts` → `group_posts` page (keeps `total`).
+    /// `GET /groups/{id}/posts` → `group_posts` page.
     async fn load_group_posts(&mut self, group_id: &str, offset: usize, public_only: bool) {
         let offset = offset.min(1_000_000);
         let n = BROWSE_PAGE_SIZE as u32;
@@ -2022,7 +2063,7 @@ impl Runtime {
                     key: group_id.to_string(),
                     offset,
                     items: page.posts,
-                    total: Some(page.total.max(0) as u64),
+                    total: None,
                     loading: false,
                 },
             );
@@ -2170,8 +2211,36 @@ impl Runtime {
         }
     }
 
-    /// Load world/avatar favorites plus the `/favorites` records used to
-    /// add/remove them. All four calls must succeed for state to update.
+    /// Every `/favorites?type=…` record for `kind`, all pages (same
+    /// short-page/cap pattern as the friends fetch — `favorite_records`
+    /// must be complete or `RemoveFavorite` cannot resolve `fvrt_…` ids).
+    async fn all_favorite_records(&mut self, kind: FavoriteKind) -> Option<Vec<vrc_api::Favorite>> {
+        const PAGE_SIZE: u64 = 100;
+        const MAX_PAGES: u64 = 50;
+        let mut records = Vec::new();
+        let mut offset = 0u64;
+        for _ in 0..MAX_PAGES {
+            let page = self
+                .attempt(
+                    self.client
+                        .clone()
+                        .favorites(kind, Some(PAGE_SIZE as u32), Some(offset)),
+                )
+                .await?;
+            let len = page.len() as u64;
+            records.extend(page);
+            if len < PAGE_SIZE {
+                return Some(records);
+            }
+            offset += len;
+        }
+        tracing::warn!("favorite records pagination hit the page cap; returning partial list");
+        Some(records)
+    }
+
+    /// Load world/avatar favorites plus every `/favorites` record (all
+    /// kinds, all pages) used to add/remove them. All calls must succeed
+    /// for state to update.
     async fn refresh_favorites(&mut self) {
         let n = BROWSE_PAGE_SIZE as u32;
         let worlds = self
@@ -2180,27 +2249,17 @@ impl Runtime {
         let avatars = self
             .attempt(self.client.clone().favorite_avatars(Some(n), Some(0), None))
             .await;
-        let world_recs = self
-            .attempt(
-                self.client
-                    .clone()
-                    .favorites(FavoriteKind::World, Some(100), Some(0)),
-            )
-            .await;
-        let avatar_recs = self
-            .attempt(
-                self.client
-                    .clone()
-                    .favorites(FavoriteKind::Avatar, Some(100), Some(0)),
-            )
-            .await;
-        let (Some(worlds), Some(avatars), Some(world_recs), Some(avatar_recs)) =
-            (worlds, avatars, world_recs, avatar_recs)
+        let world_recs = self.all_favorite_records(FavoriteKind::World).await;
+        let avatar_recs = self.all_favorite_records(FavoriteKind::Avatar).await;
+        let friend_recs = self.all_favorite_records(FavoriteKind::Friend).await;
+        let (Some(worlds), Some(avatars), Some(world_recs), Some(avatar_recs), Some(friend_recs)) =
+            (worlds, avatars, world_recs, avatar_recs, friend_recs)
         else {
             return;
         };
         let mut records = world_recs;
         records.extend(avatar_recs);
+        records.extend(friend_recs);
         let mut state = self.state.write();
         state.favorite_worlds = Some(BrowsePage {
             key: "worlds".to_string(),
@@ -2258,6 +2317,29 @@ impl Runtime {
         {
             self.state.write().favorite_avatars = Some(BrowsePage {
                 key: "avatars".to_string(),
+                offset,
+                items,
+                total: None,
+                loading: false,
+            });
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /favorite/groups` page → `favorite_groups`.
+    async fn load_favorite_groups(&mut self, offset: usize) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(items) = self
+            .attempt(
+                self.client
+                    .clone()
+                    .favorite_groups(Some(n), Some(offset as u64), None),
+            )
+            .await
+        {
+            self.state.write().favorite_groups = Some(BrowsePage {
+                key: "groups".to_string(),
                 offset,
                 items,
                 total: None,
@@ -2539,17 +2621,20 @@ impl Runtime {
         state.instance = None;
         state.multi_invite = None;
         state.world_search = None;
+        state.active_worlds = None;
+        state.recent_worlds = None;
         state.group_search = None;
+        state.own_groups = None;
         state.avatar_search = None;
         state.favorite_worlds = None;
         state.favorite_avatars = None;
+        state.favorite_groups = None;
         state.favorite_records.clear();
         state.world_details.clear();
         state.group_details.clear();
         state.avatar_details.clear();
         state.own_avatar = None;
         state.group_members.clear();
-        state.group_member_searches.clear();
         state.group_posts.clear();
         state.group_gallery_images.clear();
         state.group_instances.clear();

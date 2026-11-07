@@ -33,11 +33,11 @@ pub use state::{
 // the leaf crates they legitimately need.
 pub use vrc_api::{
     ApiError, Avatar, Client, ClientBuilder, CookieVault, CreateInstanceRequest, Favorite,
-    FavoriteKind, FriendStatus, Group, GroupAccessType, GroupGalleryImage, GroupInstance,
-    GroupMember, GroupMemberUser, GroupPost, Instance, InstanceKind, InstanceRegion, KeyringVault,
-    LoginOutcome, MemoryVault, Notification, NotificationV2, PlayerModeration,
-    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, World,
-    USER_AGENT,
+    FavoriteGroup, FavoriteKind, FriendStatus, Group, GroupAccessType, GroupGalleryImage,
+    GroupInstance, GroupMember, GroupMemberUser, GroupPost, Instance, InstanceKind, InstanceRegion,
+    KeyringVault, LoginOutcome, MemoryVault, Notification, NotificationV2, PlayerModeration,
+    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserGroup, UserNote,
+    World, USER_AGENT,
 };
 pub use vrc_logs::{default_log_dir, LogEvent, LogTailer};
 pub use vrc_pipeline::PipelineConfig;

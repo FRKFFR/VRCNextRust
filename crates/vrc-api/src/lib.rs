@@ -46,11 +46,11 @@ pub use instances::{
     InstanceRegion,
 };
 pub use models::{
-    Avatar, CurrentUser, CurrentUserPresence, Favorite, FavoriteKind, FriendStatus, Group,
-    GroupGallery, GroupGalleryImage, GroupInstance, GroupMember, GroupMemberUser, GroupPost,
+    Avatar, CurrentUser, CurrentUserPresence, Favorite, FavoriteGroup, FavoriteKind, FriendStatus,
+    Group, GroupGallery, GroupGalleryImage, GroupInstance, GroupMember, GroupMemberUser, GroupPost,
     GroupPostPage, GroupRole, Instance, LimitedUser, Notification, NotificationV2,
     NotificationV2Response, PastDisplayName, PlayerModeration, PlayerModerationKind,
-    SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, World,
+    SuccessResponse, TrustRank, TwoFactorMethod, User, UserGroup, UserNote, World,
 };
 pub use notifications::valid_notification_id;
 pub use rate_limit::RateLimiter;

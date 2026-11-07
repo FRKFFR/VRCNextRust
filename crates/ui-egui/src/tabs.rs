@@ -119,22 +119,25 @@ pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
         Tab::FriendHistory => app.reload_history(),
         Tab::Stats => app.reload_stats(),
         Tab::Worlds => {
-            app.send(Command::SearchWorlds {
-                query: app.world_query.clone(),
-                offset: 0,
-            });
+            app.send(crate::browse::worlds_command(app, 0));
             ensure_favorite_records(app);
         }
-        Tab::Groups => {}
+        Tab::Groups => {
+            if app.groups_mine {
+                app.send(Command::LoadOwnGroups);
+            }
+        }
         Tab::Avatars => {
-            app.send(Command::SearchAvatars {
-                query: app.avatar_query.clone(),
+            app.send(Command::LoadAvatars {
                 offset: 0,
                 own: app.avatar_own,
             });
             ensure_favorite_records(app);
         }
-        Tab::Favorites => app.send(Command::RefreshFavorites),
+        Tab::Favorites => {
+            app.send(Command::RefreshFavorites);
+            app.send(Command::LoadFavoriteGroups { offset: 0 });
+        }
     }
 }
 

@@ -147,9 +147,9 @@ pub struct CreateInstanceRequest {
     /// Optional display name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Optional description.
+    /// Invite-only instance.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub invite_only: Option<bool>,
     /// Queue enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_enabled: Option<bool>,
@@ -175,7 +175,7 @@ impl CreateInstanceRequest {
             group_access_type: None,
             role_ids: Vec::new(),
             display_name: None,
-            description: None,
+            invite_only: None,
             queue_enabled: None,
             can_request_invite: None,
             age_gate: None,

@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use vrc_api::{
-    Avatar, CurrentUser, Favorite, FriendStatus, Group, GroupGalleryImage, GroupInstance,
-    GroupMember, GroupPost, Instance, LimitedUser, Notification, NotificationV2, PlayerModeration,
-    TrustRank, TwoFactorMethod, User, World,
+    Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupGalleryImage,
+    GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification, NotificationV2,
+    PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
 };
 use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
@@ -358,15 +358,25 @@ pub struct AppState {
     pub multi_invite: Option<MultiInviteProgress>,
     /// `GET /worlds` search/browse page.
     pub world_search: Option<BrowsePage<World>>,
+    /// `GET /worlds/active` page (currently active worlds).
+    pub active_worlds: Option<BrowsePage<World>>,
+    /// `GET /worlds/recent` page (recently visited worlds).
+    pub recent_worlds: Option<BrowsePage<World>>,
     /// `GET /groups` search page.
     pub group_search: Option<BrowsePage<Group>>,
-    /// `GET /avatars` search page.
+    /// `GET /users/{me}/groups` — the user's public groups (unpaged).
+    pub own_groups: Option<Vec<UserGroup>>,
+    /// `GET /avatars` page (featured or own scope; no text search — the
+    /// documented endpoint has no `search` parameter).
     pub avatar_search: Option<BrowsePage<Avatar>>,
     /// `GET /worlds/favorites` page.
     pub favorite_worlds: Option<BrowsePage<World>>,
     /// `GET /avatars/favorites` page.
     pub favorite_avatars: Option<BrowsePage<Avatar>>,
-    /// `/favorites?type=world|avatar` records used to add/remove favorites.
+    /// `GET /favorite/groups` page (favorite-group sets).
+    pub favorite_groups: Option<BrowsePage<FavoriteGroup>>,
+    /// `/favorites?type=world|avatar|friend` records used to add/remove
+    /// favorites (all pages, capped).
     pub favorite_records: Vec<Favorite>,
     /// `GET /worlds/{id}` detail cache keyed by world id.
     pub world_details: HashMap<String, DetailState<World>>,
@@ -378,8 +388,6 @@ pub struct AppState {
     pub own_avatar: Option<Avatar>,
     /// `GET /groups/{id}/members` pages keyed by group id.
     pub group_members: HashMap<String, BrowsePage<GroupMember>>,
-    /// `GET /groups/{id}/members/search` pages keyed by group id.
-    pub group_member_searches: HashMap<String, BrowsePage<GroupMember>>,
     /// `GET /groups/{id}/posts` pages keyed by group id.
     pub group_posts: HashMap<String, BrowsePage<GroupPost>>,
     /// `GET /groups/{id}/galleries/{galleryId}` pages keyed `group:gallery`.

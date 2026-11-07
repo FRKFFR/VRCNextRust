@@ -17,9 +17,22 @@ use secrecy::SecretString;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TrySendError;
 use vrc_core::{
-    search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend, InstanceKind,
-    InstanceRegion, PipelineStatus, StateHandle, TimelineKind, TrustRank, TwoFactorMethod,
+    search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
+    GroupAccessType, InstanceKind, InstanceRegion, PipelineStatus, StateHandle, TimelineKind,
+    TrustRank, TwoFactorMethod,
 };
+
+/// Which worlds feed the Worlds tab lists (`GET /worlds`, `/worlds/active`
+/// or `/worlds/recent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorldsFeed {
+    /// `GET /worlds` — free-text search/browse.
+    Search,
+    /// `GET /worlds/active` — currently active worlds.
+    Active,
+    /// `GET /worlds/recent` — recently visited worlds.
+    Recent,
+}
 
 /// A destructive action awaiting explicit user confirmation (RULES.md:
 /// unfriend/block never fire without one).
@@ -81,12 +94,14 @@ pub struct VrcNextApp {
     multi_invite_selected: HashSet<String>,
     /// Pending destructive action shown in the confirm dialog.
     confirm: Option<ConfirmAction>,
-    /// Worlds-tab live search query.
+    /// Worlds-tab live search query (applies to every worlds feed).
     world_query: String,
+    /// Worlds-tab feed selector.
+    worlds_feed: WorldsFeed,
+    /// Groups-tab mode: `true` = own groups, `false` = search.
+    groups_mine: bool,
     /// Groups-tab live search query.
     group_query: String,
-    /// Avatars-tab live search query.
-    avatar_query: String,
     /// Avatars-tab scope: `true` = own avatars, `false` = featured.
     avatar_own: bool,
     /// Open world-detail id on the worlds tab.
@@ -99,6 +114,10 @@ pub struct VrcNextApp {
     new_instance_kind: InstanceKind,
     /// Instance region for the world-detail create-instance picker.
     new_instance_region: InstanceRegion,
+    /// `grp_…` owner id for a group instance (kind = Group).
+    new_instance_group: String,
+    /// Group access type for a group instance (kind = Group).
+    new_instance_access: GroupAccessType,
 }
 
 impl VrcNextApp {
@@ -125,14 +144,17 @@ impl VrcNextApp {
             multi_invite_selected: HashSet::new(),
             confirm: None,
             world_query: String::new(),
+            worlds_feed: WorldsFeed::Search,
+            groups_mine: false,
             group_query: String::new(),
-            avatar_query: String::new(),
             avatar_own: false,
             world_detail: None,
             group_detail: None,
             avatar_detail: None,
             new_instance_kind: InstanceKind::Public,
             new_instance_region: InstanceRegion::Us,
+            new_instance_group: String::new(),
+            new_instance_access: GroupAccessType::Members,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).

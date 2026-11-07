@@ -25,12 +25,11 @@ fn check_avatar_id(id: &str) -> Result<(), ApiError> {
     }
 }
 
-/// Filters for `GET /avatars` (Search Avatars). The documented API only
-/// searches your own (`user=me`) or featured avatars.
+/// Filters for `GET /avatars` (`searchAvatars`). The documented API only
+/// lists your own (`user=me`) or featured avatars — there is no free-text
+/// `search` parameter on this endpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AvatarSearchQuery {
-    /// `search` — name/description filter.
-    pub search: Option<String>,
     /// `user` — documented `me` scope for own avatars.
     pub user: Option<String>,
     /// `userId` — `usr_…` author filter.
@@ -49,8 +48,6 @@ pub struct AvatarSearchQuery {
     pub notag: Option<String>,
     /// `platform` — supported platform filter.
     pub platform: Option<String>,
-    /// `isInternalVariant`.
-    pub is_internal_variant: Option<bool>,
     /// `n` — page size (clamped to 1–100).
     pub n: Option<u32>,
     /// `offset` — zero-based offset (clamped).
@@ -58,7 +55,7 @@ pub struct AvatarSearchQuery {
 }
 
 impl Client {
-    /// `GET /avatars` — search/list avatars (own or featured scope).
+    /// `GET /avatars` — list avatars (own `user=me` or `featured` scope).
     pub async fn search_avatars(&self, query: &AvatarSearchQuery) -> Result<Vec<Avatar>, ApiError> {
         if let Some(user) = &query.user {
             if user != "me" {
@@ -77,12 +74,10 @@ impl Client {
         append_query_opt(&mut path, "userId", query.user_id.as_deref());
         append_page(&mut path, query.n, query.offset);
         append_query_opt(&mut path, "order", query.order.as_deref());
-        append_query_opt(&mut path, "search", query.search.as_deref());
         append_query_opt(&mut path, "tag", query.tag.as_deref());
         append_query_opt(&mut path, "notag", query.notag.as_deref());
         append_query_opt(&mut path, "releaseStatus", query.release_status.as_deref());
         append_query_opt(&mut path, "platform", query.platform.as_deref());
-        append_bool(&mut path, "isInternalVariant", query.is_internal_variant);
         self.get_json(&path).await
     }
 
