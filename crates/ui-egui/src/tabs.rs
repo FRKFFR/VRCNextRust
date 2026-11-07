@@ -62,6 +62,14 @@ pub(crate) enum Tab {
     Favorites,
     /// Local photo library (M6).
     Media,
+    /// VRChat launcher + companions (M7).
+    Launcher,
+    /// OSC chatbox (M7).
+    Chatbox,
+    /// OSC avatar parameters (M7).
+    Osc,
+    /// Events calendar (M7).
+    Calendar,
 }
 
 /// Stats time-range presets.
@@ -142,6 +150,9 @@ pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
             app.send(Command::LoadFavoriteGroups { offset: 0 });
         }
         Tab::Media => app.reload_media(),
+        // M7 tabs need no initial load — they render persisted/local
+        // state and fire commands on interaction.
+        Tab::Launcher | Tab::Chatbox | Tab::Osc | Tab::Calendar => {}
     }
 }
 
@@ -161,6 +172,10 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
                 (Tab::Avatars, "Avatars"),
                 (Tab::Favorites, "Favorites"),
                 (Tab::Media, "Media"),
+                (Tab::Launcher, "Launcher"),
+                (Tab::Chatbox, "Chatbox"),
+                (Tab::Osc, "OSC"),
+                (Tab::Calendar, "Calendar"),
             ] {
                 if ui.selectable_label(app.tab == tab, label).clicked() {
                     select_tab(app, tab);
@@ -180,6 +195,10 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
             Tab::Avatars => crate::browse::avatars_tab(app, ui, state),
             Tab::Favorites => crate::browse::favorites_tab(app, ui, state),
             Tab::Media => crate::media::media_tab(app, ui, state),
+            Tab::Launcher => crate::tools::launcher_tab(app, ui, state),
+            Tab::Chatbox => crate::tools::chatbox_tab(app, ui, state),
+            Tab::Osc => crate::tools::osc_tab(app, ui, state),
+            Tab::Calendar => crate::tools::calendar_tab(app, ui, state),
         }
     });
 }

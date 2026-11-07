@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Deserialize an explicit JSON `null` as `T::default()`: `#[serde(default)]`
 /// only covers a missing key, while the API returns `null` for some optional
 /// fields.
-fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Default + Deserialize<'de>,
