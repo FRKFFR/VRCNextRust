@@ -19,8 +19,8 @@ use vrc_core::{
     format, friend_status_label, moderation_label, notification_kind_label, parse_param_value,
     sections, App, AppConfig, AppEvent, AppHandle, AuthState, BrowsePage, Client, Command,
     CreateInstanceRequest, DetailState, Favorite, FavoriteGroup, Group, GroupAccessType,
-    InstanceKind, InstanceRegion, KeyringVault, LaunchPrefs, MediaFilter, MemoryVault, ParamValue,
-    StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, World, USER_AGENT,
+    InstanceKind, InstanceRegion, KeyringVault, MediaFilter, MemoryVault, ParamValue, StatsRange,
+    TimelineFilter, TimelineKind, TwoFactorMethod, World, USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -1984,34 +1984,35 @@ async fn launch(cmd: LaunchCmd) -> Result<()> {
                 args: exe_args,
             })
             .await?;
-        wait_for(&mut handle, |e| {
-            matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
-        })
-        .await?;
+        wait_for(&mut handle, |e| matches!(e, AppEvent::ProcessLaunched)).await?;
         println!("Launched.");
         return Ok(());
     }
-    // Any explicit option becomes the persisted launch prefs (same store
-    // the desktop Launcher tab uses).
-    if path.is_some()
-        || no_vr
-        || profile.is_some()
-        || fps.is_some()
-        || world.is_some()
-        || instance.is_some()
-    {
+    // Passed options override the persisted launch prefs (same store the
+    // desktop Launcher tab uses); fields the user didn't pass — OSC
+    // ports, the untouched half of a world/instance pair — are kept.
+    let location_given = world.is_some() || instance.is_some();
+    if path.is_some() || no_vr || profile.is_some() || fps.is_some() || location_given {
+        wait_ready(&mut handle).await?;
+        let mut prefs = handle.state.snapshot().tools.launch;
+        if no_vr {
+            prefs.no_vr = true;
+        }
+        if let Some(profile) = profile {
+            prefs.profile = profile;
+        }
+        if let Some(fps) = fps {
+            prefs.fps = fps;
+        }
+        if location_given {
+            // The join location is a pair: providing either half replaces
+            // both (an omitted half means "no instance"/"no world").
+            prefs.world_id = world.unwrap_or_default();
+            prefs.instance_id = instance.unwrap_or_default();
+        }
         handle
             .commands
-            .send(Command::SetLaunchPrefs {
-                prefs: LaunchPrefs {
-                    no_vr,
-                    profile: profile.unwrap_or(0),
-                    fps: fps.unwrap_or(0),
-                    world_id: world.unwrap_or_default(),
-                    instance_id: instance.unwrap_or_default(),
-                    ..LaunchPrefs::default()
-                },
-            })
+            .send(Command::SetLaunchPrefs { prefs })
             .await?;
     }
     if let Some(path) = path {
@@ -2021,10 +2022,7 @@ async fn launch(cmd: LaunchCmd) -> Result<()> {
             .await?;
     }
     handle.commands.send(Command::LaunchVrchat).await?;
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
-    })
-    .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProcessLaunched)).await?;
     let state = handle.state.snapshot();
     println!(
         "Launched: {}",
@@ -2062,10 +2060,7 @@ async fn companions_add(name: &str, path: &str, args: Vec<String>) -> Result<()>
             },
         })
         .await?;
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::ToolsChanged | AppEvent::Error(_))
-    })
-    .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
     println!("Companion added.");
     Ok(())
 }
@@ -2076,10 +2071,7 @@ async fn companions_remove(index: usize) -> Result<()> {
         .commands
         .send(Command::RemoveCompanion { index })
         .await?;
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::ToolsChanged | AppEvent::Error(_))
-    })
-    .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
     println!("Companion removed.");
     Ok(())
 }
@@ -2090,10 +2082,7 @@ async fn companions_launch(index: usize) -> Result<()> {
         .commands
         .send(Command::LaunchCompanion { index })
         .await?;
-    wait_for(&mut handle, |e| {
-        matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
-    })
-    .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ProcessLaunched)).await?;
     println!("Launched.");
     Ok(())
 }

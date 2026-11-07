@@ -109,8 +109,9 @@ impl OscClient {
 
 /// A bound UDP socket receiving OSC messages as a stream.
 ///
-/// Created by [`OscListener::bind`]/[`OscListener::bind_addr`]; dropping it
-/// stops the receiver task (the socket closes and the stream ends).
+/// Created by [`OscListener::bind`]/[`OscListener::bind_addr`]. The
+/// receiver task exits when the returned stream is dropped (its channel
+/// receiver closes, the socket is released and the port freed).
 pub struct OscListener {
     local_addr: SocketAddr,
 }
@@ -160,28 +161,36 @@ impl OscListener {
         tokio::spawn(async move {
             let mut buf = vec![0u8; RECV_BUF];
             loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, _peer)) => match decoder::decode_udp(&buf[..n]) {
-                        Ok((_rest, packet)) => {
-                            let mut messages = Vec::new();
-                            flatten_packet(packet, &mut messages);
-                            for msg in messages {
-                                // Drop on a full queue rather than stalling
-                                // the socket reader.
-                                if tx.try_send(msg).is_err() {
-                                    tracing::debug!("OSC listener queue full, dropping message");
-                                    break;
+                tokio::select! {
+                    // The stream owns `rx`; dropping it (e.g. the caller
+                    // stops listening) resolves `closed` and frees the
+                    // socket/port instead of leaking the task.
+                    _ = tx.closed() => break,
+                    recv = socket.recv_from(&mut buf) => match recv {
+                        Ok((n, _peer)) => match decoder::decode_udp(&buf[..n]) {
+                            Ok((_rest, packet)) => {
+                                let mut messages = Vec::new();
+                                flatten_packet(packet, &mut messages);
+                                for msg in messages {
+                                    // Drop on a full queue rather than
+                                    // stalling the socket reader.
+                                    if tx.try_send(msg).is_err() {
+                                        tracing::debug!(
+                                            "OSC listener queue full, dropping message"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
-                        }
+                            Err(e) => {
+                                tracing::debug!("undecodable OSC datagram: {e}");
+                            }
+                        },
                         Err(e) => {
-                            tracing::debug!("undecodable OSC datagram: {e}");
+                            tracing::debug!("OSC listener recv error: {e}");
+                            break;
                         }
                     },
-                    Err(e) => {
-                        tracing::debug!("OSC listener recv error: {e}");
-                        break;
-                    }
                 }
             }
         });
@@ -227,6 +236,28 @@ mod tests {
         let (l1, _s1) = OscListener::bind(0).await.unwrap();
         let (l2, _s2) = OscListener::bind(0).await.unwrap();
         assert_ne!(l1.local_addr().port(), l2.local_addr().port());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_frees_the_port() {
+        let port = {
+            let (listener, stream) = OscListener::bind(0).await.unwrap();
+            let port = listener.local_addr().port();
+            drop(stream);
+            port
+        };
+        // The receiver task exits asynchronously once it notices the
+        // closed channel; poll until the port can be rebound.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match OscListener::bind(port).await {
+                Ok((_listener, _stream)) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("port {port} still bound after stream drop: {e}"),
+            }
+        }
     }
 
     #[tokio::test]

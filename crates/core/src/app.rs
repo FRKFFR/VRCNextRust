@@ -976,6 +976,11 @@ async fn run(
     );
 
     let (session_expired_tx, session_expired_rx) = mpsc::unbounded_channel();
+    // Chatbox/OSC sends target the persisted OSC input port (default 9000).
+    let chatbox_target = {
+        let guard = state.read().unwrap_or_else(|e| e.into_inner());
+        tools::osc_send_target(&guard.tools.launch)
+    };
     let mut rt = Runtime {
         commands,
         events,
@@ -997,7 +1002,7 @@ async fn run(
         thumbnails,
         webhook_vault,
         webhook_relay,
-        chatbox_relay: ChatboxRelay::new(vrc_osc::default_target()),
+        chatbox_relay: ChatboxRelay::new(chatbox_target),
         osc_listener: None,
     };
     rt.state.write().log_tail_active = rt.log_events.is_some();
@@ -1427,8 +1432,8 @@ impl Runtime {
             Command::SetWebhookAutopost { index, enabled } => {
                 self.set_webhook_autopost(index, enabled).await
             }
-            Command::LaunchVrchat => self.launch_vrchat(),
-            Command::LaunchCompanion { index } => self.launch_companion(index),
+            Command::LaunchVrchat => self.launch_vrchat().await,
+            Command::LaunchCompanion { index } => self.launch_companion(index).await,
             Command::LaunchPath { path, args } => self.launch_path(path, args).await,
             Command::AddCompanion { companion } => self.add_companion(companion).await,
             Command::RemoveCompanion { index } => self.remove_companion(index).await,
@@ -3664,8 +3669,9 @@ impl Runtime {
 
     /// Spawn VRChat with the persisted launch prefs; companions follow
     /// when auto-start is enabled. `spawn` only — never a shell, never
-    /// process inspection (RULES.md §5).
-    fn launch_vrchat(&mut self) {
+    /// process inspection (RULES.md §5). The Steam scan and the spawn
+    /// itself run off the async executor (`spawn_blocking`).
+    async fn launch_vrchat(&mut self) {
         let (override_path, prefs, companions, auto_start) = {
             let tools = &self.state.read().tools;
             (
@@ -3675,38 +3681,54 @@ impl Runtime {
                 tools.auto_start_companion,
             )
         };
-        let Some(dir) = tools::resolve_install_dir(override_path.as_deref()) else {
-            // Refresh the cached scan so the UI shows the real status.
-            let found = vrc_launcher::find_vrchat().map(|dir| dir.to_string_lossy().into_owned());
-            self.state.write().tools.vrchat_found = found;
-            self.report_message(
-                "VRChat installation not found — set a path override in the Launcher tab",
-            );
-            return;
-        };
-        match tools::launch_vrchat(&dir, &prefs, &companions, auto_start) {
-            Ok(summary) => {
+        let result = tokio::task::spawn_blocking(move || {
+            tools::resolve_install_dir(override_path.as_deref()).map(|dir| {
+                tools::launch_vrchat(&dir, &prefs, &companions, auto_start)
+                    .map(|summary| (summary, dir.to_string_lossy().into_owned()))
+            })
+        })
+        .await;
+        match result {
+            Ok(Some(Ok((summary, found)))) => {
                 {
                     let mut state = self.state.write();
                     state.tools.last_launch = Some(summary);
-                    state.tools.vrchat_found = Some(dir.to_string_lossy().into_owned());
+                    state.tools.vrchat_found = Some(found);
                 }
                 let _ = self.events.send(AppEvent::ProcessLaunched);
                 let _ = self.events.send(AppEvent::ToolsChanged);
             }
-            Err(message) => self.report_message(&message),
+            Ok(Some(Err(message))) => self.report_message(&message),
+            Ok(None) => {
+                // Refresh the cached scan so the UI shows the real status.
+                let found = tokio::task::spawn_blocking(vrc_launcher::find_vrchat)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|dir| dir.to_string_lossy().into_owned());
+                self.state.write().tools.vrchat_found = found;
+                self.report_message(
+                    "VRChat installation not found — set a path override in the Launcher tab",
+                );
+            }
+            Err(e) => self.report_message(&format!("launch task failed: {e}")),
         }
     }
 
-    /// Spawn one configured companion by index.
-    fn launch_companion(&mut self, index: usize) {
+    /// Spawn one configured companion by index (off the executor —
+    /// `spawn` is a blocking syscall).
+    async fn launch_companion(&mut self, index: usize) {
         let companions = self.state.read().tools.companions.clone();
-        match tools::launch_companion_at(&companions, index) {
-            Ok(name) => {
+        let result =
+            tokio::task::spawn_blocking(move || tools::launch_companion_at(&companions, index))
+                .await;
+        match result {
+            Ok(Ok(name)) => {
                 self.state.write().tools.last_launch = Some(name);
                 let _ = self.events.send(AppEvent::ProcessLaunched);
             }
-            Err(message) => self.report_message(&message),
+            Ok(Err(message)) => self.report_message(&message),
+            Err(e) => self.report_message(&format!("launch task failed: {e}")),
         }
     }
 
@@ -3834,18 +3856,27 @@ impl Runtime {
             normalized.clone().unwrap_or_default(),
         )
         .await;
-        {
-            let mut state = self.state.write();
-            state.tools.vrchat_path = normalized;
-            // The override may point somewhere the Steam scan never saw.
-            state.tools.vrchat_found =
-                state.tools.vrchat_path.clone().or_else(|| {
-                    vrc_launcher::find_vrchat().map(|d| d.to_string_lossy().into_owned())
-                });
-        }
+        // Clearing the override re-runs the Steam scan — filesystem I/O,
+        // keep it off the async executor.
+        let scanned = if normalized.is_none() {
+            tokio::task::spawn_blocking(vrc_launcher::find_vrchat)
+                .await
+                .ok()
+                .flatten()
+                .map(|d| d.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let mut state = self.state.write();
+        state.tools.vrchat_path = normalized;
+        // The override may point somewhere the Steam scan never saw.
+        state.tools.vrchat_found = state.tools.vrchat_path.clone().or(scanned);
     }
 
     async fn set_launch_prefs(&mut self, prefs: LaunchPrefs) {
+        // Chatbox/OSC sends follow the configured input port.
+        self.chatbox_relay
+            .set_target(tools::osc_send_target(&prefs));
         self.persist_tool_setting(tools::SETTING_LAUNCH, tools::launch_prefs_json(&prefs))
             .await;
         self.state.write().tools.launch = prefs;
@@ -3864,8 +3895,9 @@ impl Runtime {
     /// different OSC address and carries no message text).
     async fn send_chatbox_typing(&mut self, typing: bool) {
         let message = osc_chatbox::chatbox_typing(typing);
+        let target = tools::osc_send_target(&self.state.read().tools.launch);
         tokio::spawn(async move {
-            match OscClient::vrchat().await {
+            match OscClient::bind(target).await {
                 Ok(client) => {
                     if let Err(e) = client.send(&message).await {
                         tracing::debug!("chatbox typing send failed: {e}");
@@ -3892,8 +3924,9 @@ impl Runtime {
             .osc
             .params
             .insert(address.to_string(), value);
+        let target = tools::osc_send_target(&self.state.read().tools.launch);
         tokio::spawn(async move {
-            match OscClient::vrchat().await {
+            match OscClient::bind(target).await {
                 Ok(client) => {
                     if let Err(e) = client.send(&message).await {
                         tracing::debug!("OSC param send failed: {e}");

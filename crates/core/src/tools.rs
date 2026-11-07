@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use vrc_api::{valid_instance_id, valid_world_id};
 use vrc_launcher::{self, LaunchOptions, Location, OscEndpoints};
+pub use vrc_osc::chatbox::CHATBOX_MAX_CHARS;
 use vrc_osc::params::{param_value_of as osc_param_value_of, valid_param_address, ParamValue};
 use vrc_osc::{chatbox, OscClient, OscMessage};
 
@@ -123,14 +124,28 @@ pub fn launch_prefs_json(prefs: &LaunchPrefs) -> String {
 pub fn resolve_install_dir(overridden: Option<&str>) -> Option<std::path::PathBuf> {
     if let Some(path) = overridden.map(str::trim).filter(|p| !p.is_empty()) {
         let dir = std::path::PathBuf::from(path);
-        // The override is trusted only when it actually contains the exe;
-        // anything else falls back to the Steam scan.
         if dir.join("VRChat.exe").is_file() {
             return Some(dir);
         }
-        return None;
+        // Invalid override (e.g. hand-edited settings) — fall through to
+        // the Steam scan rather than reporting "not found".
     }
     vrc_launcher::find_vrchat()
+}
+
+/// The OSC input port chatbox/parameter traffic targets: the persisted
+/// launch pref, or VRChat's default 9000 when unset.
+pub fn osc_input_port(prefs: &LaunchPrefs) -> u16 {
+    if prefs.osc_input_port > 0 {
+        prefs.osc_input_port
+    } else {
+        vrc_osc::DEFAULT_INPUT_PORT
+    }
+}
+
+/// Where OSC messages are sent for these prefs (`127.0.0.1:<in-port>`).
+pub fn osc_send_target(prefs: &LaunchPrefs) -> SocketAddr {
+    vrc_osc::loopback(osc_input_port(prefs))
 }
 
 /// Build [`LaunchOptions`] from UI prefs; validates the join location with
@@ -144,16 +159,12 @@ pub fn launch_options(prefs: &LaunchPrefs) -> Result<LaunchOptions, String> {
     };
     if prefs.osc_input_port > 0 || prefs.osc_output_port > 0 {
         opts.osc = Some(OscEndpoints {
-            input_port: if prefs.osc_input_port > 0 {
-                prefs.osc_input_port
-            } else {
-                9000
-            },
+            input_port: osc_input_port(prefs),
             sender_ip: vrc_osc::LOOPBACK,
             output_port: if prefs.osc_output_port > 0 {
                 prefs.osc_output_port
             } else {
-                9001
+                vrc_osc::DEFAULT_OUTPUT_PORT
             },
         });
     }
@@ -216,8 +227,10 @@ pub fn launch_path(path: &str, args: &[String]) -> Result<(), String> {
 }
 
 /// Validate a chatbox payload and return the OSC message to send.
+/// Rejects text that sanitizes to nothing (whitespace- or
+/// control-char-only input would send an empty chatbox line).
 pub fn chatbox_message(text: &str, immediate: bool) -> Result<OscMessage, String> {
-    if text.trim().is_empty() {
+    if text.trim().is_empty() || chatbox::sanitize_chatbox(text).is_empty() {
         return Err("chatbox text is empty".to_string());
     }
     Ok(chatbox::chatbox_input(text, immediate))
@@ -260,27 +273,40 @@ pub fn param_value_of(message: &OscMessage) -> Option<(String, ParamValue)> {
 /// Shared chatbox relay state: at most one send per [`CHATBOX_INTERVAL`],
 /// latest message wins (bounded — never an unbounded queue). `draining`
 /// lives inside the mutex so `send` and the drain task can never race a
-/// message into a stranded slot.
-#[derive(Debug, Default)]
+/// message into a stranded slot. `target` is retargetable so launch-pref
+/// OSC port changes apply without rebuilding the relay.
 struct RelayState {
     last_sent: Option<Instant>,
     pending: Option<OscMessage>,
     draining: bool,
+    target: SocketAddr,
 }
 
-/// Throttled chatbox sender targeting `target` (VRChat's OSC input port).
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            last_sent: None,
+            pending: None,
+            draining: false,
+            target: vrc_osc::default_target(),
+        }
+    }
+}
+
+/// Throttled chatbox sender delivering to a configurable target (VRChat's
+/// OSC input port — [`osc_send_target`] of the launch prefs).
 /// [`Self::send`] is sync and cheap; the actual UDP write happens on the
 /// spawned drain task, which binds its own [`OscClient`].
 #[derive(Clone)]
 pub struct ChatboxRelay {
     inner: Arc<Mutex<RelayState>>,
-    target: SocketAddr,
 }
 
 impl std::fmt::Debug for ChatboxRelay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = self.inner.lock().unwrap_or_else(|e| e.into_inner()).target;
         f.debug_struct("ChatboxRelay")
-            .field("target", &self.target)
+            .field("target", &target)
             .finish_non_exhaustive()
     }
 }
@@ -290,9 +316,18 @@ impl ChatboxRelay {
     /// default VRChat OSC endpoint).
     pub fn new(target: SocketAddr) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RelayState::default())),
-            target,
+            inner: Arc::new(Mutex::new(RelayState {
+                target,
+                ..RelayState::default()
+            })),
         }
+    }
+
+    /// Point future sends at `target` (called when launch prefs change
+    /// the OSC input port). An in-flight drain keeps its bound client
+    /// until it goes idle — at most one interval of lag.
+    pub fn set_target(&self, target: SocketAddr) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).target = target;
     }
 
     /// Queue `message` for throttled delivery. If the interval has already
@@ -300,16 +335,16 @@ impl ChatboxRelay {
     /// it immediately); otherwise it replaces any pending message —
     /// latest wins, the queue never grows past one slot.
     pub fn send(&self, message: OscMessage) {
-        {
+        let target = {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             state.pending = Some(message);
             if state.draining {
                 return;
             }
             state.draining = true;
-        }
+            state.target
+        };
         let inner = self.inner.clone();
-        let target = self.target;
         tokio::spawn(async move {
             let client = match OscClient::bind(target).await {
                 Ok(client) => client,
@@ -423,6 +458,8 @@ mod tests {
     #[test]
     fn chatbox_message_rejects_empty() {
         assert!(chatbox_message("   ", true).is_err());
+        // Control-char-only input sanitizes to an empty OSC string.
+        assert!(chatbox_message("\u{7}\n\t", true).is_err());
         assert!(chatbox_message("hi", true).is_ok());
     }
 

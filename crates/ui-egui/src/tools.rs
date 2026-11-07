@@ -8,7 +8,7 @@
 use eframe::egui;
 use vrc_core::{
     parse_param_value, valid_param_addr, CalendarEvent, Command, Companion, DiscoverScope,
-    LaunchPrefs, ParamValue,
+    LaunchPrefs, ParamValue, CHATBOX_MAX_CHARS,
 };
 
 use crate::VrcNextApp;
@@ -272,6 +272,17 @@ pub(crate) fn chatbox_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, _state: &vrc_
         }
         let _ = out;
     });
+    // Char counter mirrors the core sanitizer (control chars stripped,
+    // clamped to CHATBOX_MAX_CHARS on send).
+    let len = app.chatbox_text.chars().filter(|c| !c.is_control()).count();
+    ui.colored_label(
+        if len > CHATBOX_MAX_CHARS {
+            egui::Color32::LIGHT_RED
+        } else {
+            egui::Color32::GRAY
+        },
+        format!("{len}/{CHATBOX_MAX_CHARS}"),
+    );
     ui.separator();
     ui.weak("Messages are sanitized (control chars stripped) and clamped to 144 characters.");
 }
@@ -366,6 +377,12 @@ fn event_row(app: &mut VrcNextApp, ui: &mut egui::Ui, event: &CalendarEvent, gro
             ));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Follow/unfollow only exists for group calendars — the
+            // endpoint is /calendar/{groupId}/{id}/follow and rejects
+            // usr_… owner ids, so hide the toggle for user-owned events.
+            if !group_id.starts_with("grp_") {
+                return;
+            }
             let following = event.user_interest.as_ref().is_some_and(|i| i.is_following);
             if ui
                 .selectable_label(following, if following { "following" } else { "follow" })

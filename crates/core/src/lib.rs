@@ -37,7 +37,7 @@ pub use state::{
 pub use thumbs::{ThumbSource, ThumbnailHandle, ThumbnailImage};
 pub use tools::{
     parse_param_value, valid_param_addr, ChatboxRelay, Companion, LaunchPrefs, OscUi, ToolsUi,
-    CHATBOX_INTERVAL,
+    CHATBOX_INTERVAL, CHATBOX_MAX_CHARS,
 };
 
 // Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
