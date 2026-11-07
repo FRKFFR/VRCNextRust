@@ -193,17 +193,17 @@ pub(crate) fn parse_vdf(input: &str) -> Option<VdfNode> {
 /// Steam install roots to probe, per platform.
 fn steam_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let mut push_env = |names: &[&str]| {
-        for name in names {
-            if let Some(value) = std::env::var_os(name) {
-                if !value.is_empty() {
-                    roots.push(PathBuf::from(value));
-                }
-            }
-        }
-    };
     #[cfg(windows)]
     {
+        let mut push_env = |names: &[&str]| {
+            for name in names {
+                if let Some(value) = std::env::var_os(name) {
+                    if !value.is_empty() {
+                        roots.push(PathBuf::from(value));
+                    }
+                }
+            }
+        };
         push_env(&["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"]);
         roots.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
         roots.push(PathBuf::from(r"C:\Program Files\Steam"));
