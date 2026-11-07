@@ -10,7 +10,7 @@ use vrc_core::browse;
 use vrc_core::{
     AppState, Avatar, Command, CreateInstanceRequest, DetailState, FavoriteGroup, FavoriteKind,
     Group, GroupAccessType, GroupInstance, GroupMember, GroupPost, InstanceKind, InstanceRegion,
-    UserGroup, World,
+    ThumbSource, UserGroup, World,
 };
 
 use crate::{ConfirmAction, VrcNextApp, WorldsFeed};
@@ -18,6 +18,22 @@ use crate::{ConfirmAction, VrcNextApp, WorldsFeed};
 // ---------------------------------------------------------------------------
 // Pure label helpers (unit-tested below)
 // ---------------------------------------------------------------------------
+
+/// First non-empty URL among the candidates (thumbnail preferred over
+/// full image, icon over banner for groups).
+fn thumb_url<'a>(candidates: &[&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|u| !u.is_empty())
+}
+
+/// Small remote thumbnail for a browse row/detail card (M6). Remote
+/// fetches are allowlist-checked and decoded by `vrc-core`; this only
+/// paints whatever the shared cache already holds.
+fn card_thumb(app: &mut VrcNextApp, ui: &mut egui::Ui, url: Option<&str>, size: f32) {
+    if let Some(url) = url {
+        crate::media::thumb_box(app, ui, &ThumbSource::Url(url.to_string()), size);
+        ui.add_space(6.0);
+    }
+}
 
 /// One-line summary for a world row: name — author — capacity — favorites.
 pub(crate) fn world_label(world: &World) -> String {
@@ -346,6 +362,12 @@ pub(crate) fn worlds_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
 
 fn world_row(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, world: &World) {
     ui.horizontal(|ui| {
+        card_thumb(
+            app,
+            ui,
+            thumb_url(&[&world.thumbnail_image_url, &world.image_url]),
+            40.0,
+        );
         if ui
             .strong(world_label(world))
             .on_hover_text("World details")
@@ -372,134 +394,145 @@ fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.strong(if world.name.is_empty() {
-                world.id.clone()
-            } else {
-                world.name.clone()
-            });
-            ui.small(egui::RichText::new(world.id.clone()).monospace().weak());
-            let mut meta = Vec::new();
-            if !world.author_name.is_empty() {
-                meta.push(format!("by {}", world.author_name));
-            }
-            if world.capacity > 0 {
-                meta.push(format!("capacity {}", world.capacity));
-            }
-            if world.favorites > 0 {
-                meta.push(format!("{} favorites", world.favorites));
-            }
-            if !world.release_status.is_empty() {
-                meta.push(world.release_status.clone());
-            }
-            if !meta.is_empty() {
-                ui.weak(meta.join(" · "));
-            }
-            if !world.description.is_empty() {
-                ui.label(world.description.lines().next().unwrap_or_default());
-            }
-            if !world.url.is_empty() {
-                ui.weak(world.url.clone());
-            }
-            ui.separator();
             ui.horizontal(|ui| {
-                egui::ComboBox::from_label("Type")
-                    .selected_text(instance_kind_label(app.new_instance_kind))
-                    .show_ui(ui, |ui| {
-                        for kind in [
-                            InstanceKind::Public,
-                            InstanceKind::Hidden,
-                            InstanceKind::Friends,
-                            InstanceKind::Private,
-                            InstanceKind::Group,
-                        ] {
-                            ui.selectable_value(
-                                &mut app.new_instance_kind,
-                                kind,
-                                instance_kind_label(kind),
-                            );
-                        }
+                card_thumb(
+                    app,
+                    ui,
+                    thumb_url(&[&world.thumbnail_image_url, &world.image_url]),
+                    64.0,
+                );
+                ui.vertical(|ui| {
+                    ui.strong(if world.name.is_empty() {
+                        world.id.clone()
+                    } else {
+                        world.name.clone()
                     });
-                egui::ComboBox::from_label("Region")
-                    .selected_text(instance_region_label(app.new_instance_region))
-                    .show_ui(ui, |ui| {
-                        for region in [
-                            InstanceRegion::Us,
-                            InstanceRegion::Use,
-                            InstanceRegion::Eu,
-                            InstanceRegion::Jp,
-                            InstanceRegion::Unknown,
-                        ] {
-                            ui.selectable_value(
-                                &mut app.new_instance_region,
-                                region,
-                                instance_region_label(region),
-                            );
-                        }
-                    });
-                if app.new_instance_kind == InstanceKind::Group {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.new_instance_group)
-                            .hint_text("grp_… owner id")
-                            .desired_width(140.0),
-                    );
-                    egui::ComboBox::from_label("Access")
-                        .selected_text(group_access_label(app.new_instance_access))
-                        .show_ui(ui, |ui| {
-                            for access in [
-                                GroupAccessType::Public,
-                                GroupAccessType::Plus,
-                                GroupAccessType::Members,
-                            ] {
-                                ui.selectable_value(
-                                    &mut app.new_instance_access,
-                                    access,
-                                    group_access_label(access),
-                                );
-                            }
-                        });
-                }
-                if app.new_instance_kind == InstanceKind::Private {
-                    ui.checkbox(&mut app.new_instance_can_request_invite, "Invite+")
-                        .on_hover_text("Invite+: others may request an invite");
-                }
-                if ui.button("Create instance").clicked() {
-                    let mut request = CreateInstanceRequest::new(
-                        world.id.clone(),
-                        app.new_instance_kind,
-                        app.new_instance_region,
-                    );
-                    if app.new_instance_kind == InstanceKind::Group {
-                        let group_id = app.new_instance_group.trim().to_string();
-                        if !group_id.is_empty() {
-                            request.owner_id = Some(group_id);
-                            request.group_access_type = Some(app.new_instance_access);
-                        }
+                    ui.small(egui::RichText::new(world.id.clone()).monospace().weak());
+                    let mut meta = Vec::new();
+                    if !world.author_name.is_empty() {
+                        meta.push(format!("by {}", world.author_name));
                     }
-                    if app.new_instance_kind == InstanceKind::Private {
-                        request.can_request_invite = Some(app.new_instance_can_request_invite);
+                    if world.capacity > 0 {
+                        meta.push(format!("capacity {}", world.capacity));
                     }
-                    app.send(Command::CreateInstance { request });
-                }
-            });
-            // The instance created (or loaded) for this world: show it and
-            // offer self-invite without leaving the detail panel.
-            if let Some(instance) = &state.instance {
-                if instance.world_id == world.id && !instance.instance_id.is_empty() {
+                    if world.favorites > 0 {
+                        meta.push(format!("{} favorites", world.favorites));
+                    }
+                    if !world.release_status.is_empty() {
+                        meta.push(world.release_status.clone());
+                    }
+                    if !meta.is_empty() {
+                        ui.weak(meta.join(" · "));
+                    }
+                    if !world.description.is_empty() {
+                        ui.label(world.description.lines().next().unwrap_or_default());
+                    }
+                    if !world.url.is_empty() {
+                        ui.weak(world.url.clone());
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(format!("Instance: {}", instance.instance_id));
-                        if !instance.location.is_empty() {
-                            ui.weak(instance.location.clone());
-                        }
-                        if ui.button("Invite myself").clicked() {
-                            app.send(Command::InviteMyselfToInstance {
-                                world_id: instance.world_id.clone(),
-                                instance_id: instance.instance_id.clone(),
+                        egui::ComboBox::from_label("Type")
+                            .selected_text(instance_kind_label(app.new_instance_kind))
+                            .show_ui(ui, |ui| {
+                                for kind in [
+                                    InstanceKind::Public,
+                                    InstanceKind::Hidden,
+                                    InstanceKind::Friends,
+                                    InstanceKind::Private,
+                                    InstanceKind::Group,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut app.new_instance_kind,
+                                        kind,
+                                        instance_kind_label(kind),
+                                    );
+                                }
                             });
+                        egui::ComboBox::from_label("Region")
+                            .selected_text(instance_region_label(app.new_instance_region))
+                            .show_ui(ui, |ui| {
+                                for region in [
+                                    InstanceRegion::Us,
+                                    InstanceRegion::Use,
+                                    InstanceRegion::Eu,
+                                    InstanceRegion::Jp,
+                                    InstanceRegion::Unknown,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut app.new_instance_region,
+                                        region,
+                                        instance_region_label(region),
+                                    );
+                                }
+                            });
+                        if app.new_instance_kind == InstanceKind::Group {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut app.new_instance_group)
+                                    .hint_text("grp_… owner id")
+                                    .desired_width(140.0),
+                            );
+                            egui::ComboBox::from_label("Access")
+                                .selected_text(group_access_label(app.new_instance_access))
+                                .show_ui(ui, |ui| {
+                                    for access in [
+                                        GroupAccessType::Public,
+                                        GroupAccessType::Plus,
+                                        GroupAccessType::Members,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut app.new_instance_access,
+                                            access,
+                                            group_access_label(access),
+                                        );
+                                    }
+                                });
+                        }
+                        if app.new_instance_kind == InstanceKind::Private {
+                            ui.checkbox(&mut app.new_instance_can_request_invite, "Invite+")
+                                .on_hover_text("Invite+: others may request an invite");
+                        }
+                        if ui.button("Create instance").clicked() {
+                            let mut request = CreateInstanceRequest::new(
+                                world.id.clone(),
+                                app.new_instance_kind,
+                                app.new_instance_region,
+                            );
+                            if app.new_instance_kind == InstanceKind::Group {
+                                let group_id = app.new_instance_group.trim().to_string();
+                                if !group_id.is_empty() {
+                                    request.owner_id = Some(group_id);
+                                    request.group_access_type = Some(app.new_instance_access);
+                                }
+                            }
+                            if app.new_instance_kind == InstanceKind::Private {
+                                request.can_request_invite =
+                                    Some(app.new_instance_can_request_invite);
+                            }
+                            app.send(Command::CreateInstance { request });
                         }
                     });
-                }
-            }
+                    // The instance created (or loaded) for this world: show it and
+                    // offer self-invite without leaving the detail panel.
+                    if let Some(instance) = &state.instance {
+                        if instance.world_id == world.id && !instance.instance_id.is_empty() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Instance: {}", instance.instance_id));
+                                if !instance.location.is_empty() {
+                                    ui.weak(instance.location.clone());
+                                }
+                                if ui.button("Invite myself").clicked() {
+                                    app.send(Command::InviteMyselfToInstance {
+                                        world_id: instance.world_id.clone(),
+                                        instance_id: instance.instance_id.clone(),
+                                    });
+                                }
+                            });
+                        }
+                    }
+                });
+            });
         });
 }
 
@@ -611,6 +644,12 @@ fn own_groups_list(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState) {
 
 fn group_row(app: &mut VrcNextApp, ui: &mut egui::Ui, group: &Group) {
     ui.horizontal(|ui| {
+        card_thumb(
+            app,
+            ui,
+            thumb_url(&[&group.icon_url, &group.banner_url]),
+            40.0,
+        );
         if ui
             .strong(group_label(group))
             .on_hover_text("Group details")
@@ -632,10 +671,18 @@ fn group_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, group: &Group) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.strong(if group.name.is_empty() {
-                group.id.clone()
-            } else {
-                group.name.clone()
+            ui.horizontal(|ui| {
+                card_thumb(
+                    app,
+                    ui,
+                    thumb_url(&[&group.icon_url, &group.banner_url]),
+                    64.0,
+                );
+                ui.strong(if group.name.is_empty() {
+                    group.id.clone()
+                } else {
+                    group.name.clone()
+                });
             });
             if !group.short_code.is_empty() {
                 ui.label(format!("Code: {}", group.short_code));
@@ -868,6 +915,12 @@ pub(crate) fn avatars_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSt
 
 fn avatar_row(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, avatar: &Avatar) {
     ui.horizontal(|ui| {
+        card_thumb(
+            app,
+            ui,
+            thumb_url(&[&avatar.thumbnail_image_url, &avatar.image_url]),
+            40.0,
+        );
         if ui
             .strong(avatar_label(avatar))
             .on_hover_text("Avatar details")
@@ -899,10 +952,18 @@ fn avatar_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState,
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.strong(if avatar.name.is_empty() {
-                avatar.id.clone()
-            } else {
-                avatar.name.clone()
+            ui.horizontal(|ui| {
+                card_thumb(
+                    app,
+                    ui,
+                    thumb_url(&[&avatar.thumbnail_image_url, &avatar.image_url]),
+                    64.0,
+                );
+                ui.strong(if avatar.name.is_empty() {
+                    avatar.id.clone()
+                } else {
+                    avatar.name.clone()
+                });
             });
             ui.small(egui::RichText::new(avatar.id.clone()).monospace().weak());
             let mut meta = Vec::new();

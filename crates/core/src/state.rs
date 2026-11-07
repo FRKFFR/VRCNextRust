@@ -7,12 +7,15 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use time::OffsetDateTime;
 use vrc_api::{
     Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupAnnouncement,
     GroupGalleryImage, GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification,
     NotificationV2, PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
 };
-use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
+use vrc_store::{FriendHistoryEntry, MediaItem, Stats, TimelineEntry};
+
+use crate::discord::WebhookSlot;
 
 /// Whether a session exists and in what stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -324,6 +327,33 @@ pub enum DetailState<T> {
     },
 }
 
+/// One scanned folder shown in the Media tab (M6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaFolderInfo {
+    /// Folder path as configured (the scan root stored on each row).
+    pub path: String,
+    /// `true` for user-added folders (removable); `false` for the
+    /// platform default Pictures/VRChat folder.
+    pub custom: bool,
+}
+
+/// Outcome of the last finished media scan.
+#[derive(Debug, Clone)]
+pub struct MediaScanInfo {
+    /// When the scan finished.
+    pub finished_at: OffsetDateTime,
+    /// Folders that existed and were walked.
+    pub folders: u32,
+    /// Image files seen.
+    pub files: u64,
+    /// Rows upserted.
+    pub upserted: u64,
+    /// Stale rows removed.
+    pub removed: u64,
+    /// Files that failed probing.
+    pub errors: u64,
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -405,6 +435,19 @@ pub struct AppState {
     pub group_gallery_images: HashMap<String, BrowsePage<GroupGalleryImage>>,
     /// `GET /groups/{id}/instances` pages keyed by group id.
     pub group_instances: HashMap<String, BrowsePage<GroupInstance>>,
+    /// One page of the local media library (M6), accumulated by offset.
+    pub media: Option<BrowsePage<MediaItem>>,
+    /// Effective scan folders (platform default + user-added customs).
+    pub media_folders: Vec<MediaFolderInfo>,
+    /// Whether a background media scan is running.
+    pub media_scanning: bool,
+    /// Outcome of the last finished media scan.
+    pub media_last_scan: Option<MediaScanInfo>,
+    /// Blur-until-hover for media thumbnails (persisted, default on).
+    pub media_blur: bool,
+    /// Configured Discord webhooks — URLs never leave the OS keyring;
+    /// only per-slot flags are exposed here.
+    pub webhooks: Vec<WebhookSlot>,
 }
 
 #[cfg(test)]

@@ -42,4 +42,11 @@ pub enum ApiError {
     /// A caller-supplied id was malformed; no request was sent.
     #[error("invalid id: {0}")]
     InvalidId(String),
+
+    /// A response body exceeded the caller's byte cap.
+    #[error("response exceeded the {limit} byte limit")]
+    PayloadTooLarge {
+        /// The configured cap in bytes.
+        limit: usize,
+    },
 }

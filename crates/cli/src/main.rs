@@ -18,8 +18,8 @@ use vrc_core::{
     format, friend_status_label, moderation_label, notification_kind_label, sections, App,
     AppConfig, AppEvent, AppHandle, AuthState, BrowsePage, Client, Command, CreateInstanceRequest,
     DetailState, Favorite, FavoriteGroup, Group, GroupAccessType, InstanceKind, InstanceRegion,
-    KeyringVault, MemoryVault, StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, World,
-    USER_AGENT,
+    KeyringVault, MediaFilter, MemoryVault, StatsRange, TimelineFilter, TimelineKind,
+    TwoFactorMethod, World, USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -183,6 +183,60 @@ enum Commands {
     SelfInvite {
         /// Instance location `wrld_…:instanceId`
         location: String,
+    },
+    /// Manage the local photo library (no login needed)
+    Media {
+        /// Action to perform
+        #[command(subcommand)]
+        command: MediaCommand,
+    },
+}
+
+/// `vrcnext-cli media …` actions.
+#[derive(Subcommand)]
+enum MediaCommand {
+    /// Rescan all configured folders
+    Scan,
+    /// List indexed photos
+    List {
+        /// Only favorited photos
+        #[arg(long)]
+        favorites: bool,
+        /// Only photos under this scan folder
+        #[arg(long)]
+        folder: Option<String>,
+        /// Case-insensitive text filter (path, world name)
+        #[arg(long)]
+        query: Option<String>,
+        /// Rows to return
+        #[arg(long, default_value_t = 60)]
+        limit: u32,
+        /// Rows to skip
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Manage scan folders
+    Folders {
+        /// Action to perform
+        #[command(subcommand)]
+        command: MediaFoldersCommand,
+    },
+}
+
+/// `vrcnext-cli media folders …` actions.
+#[derive(Subcommand)]
+enum MediaFoldersCommand {
+    /// List effective scan folders (platform default + custom)
+    List,
+    /// Add a custom scan folder and rescan
+    Add {
+        /// Absolute folder path to scan recursively
+        path: String,
+    },
+    /// Remove a custom scan folder and its index rows
+    Remove {
+        /// Folder path previously added with `add`
+        path: String,
     },
 }
 
@@ -482,6 +536,21 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::SelfInvite { location } => self_invite(&location).await,
+        Commands::Media { command } => match command {
+            MediaCommand::Scan => media_scan().await,
+            MediaCommand::List {
+                favorites,
+                folder,
+                query,
+                limit,
+                offset,
+            } => media_list(favorites, folder, query, limit, offset).await,
+            MediaCommand::Folders { command } => match command {
+                MediaFoldersCommand::List => media_folders_list().await,
+                MediaFoldersCommand::Add { path } => media_folders_add(&path).await,
+                MediaFoldersCommand::Remove { path } => media_folders_remove(&path).await,
+            },
+        },
     }
 }
 
@@ -684,6 +753,10 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::InviteSent) => println!("invite sent"),
                 Ok(AppEvent::MultiInviteProgress) => println!("multi-invite progress"),
                 Ok(AppEvent::BrowseChanged) => println!("browse data changed"),
+                Ok(AppEvent::MediaLoaded) => println!("media loaded"),
+                Ok(AppEvent::MediaScanFinished) => println!("media scan finished"),
+                Ok(AppEvent::MediaChanged) => println!("media settings changed"),
+                Ok(AppEvent::ThumbnailReady) => println!("thumbnail ready"),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }
@@ -1501,6 +1574,150 @@ async fn self_invite(location: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Media library (M6): local data only — no login required.
+// ---------------------------------------------------------------------------
+
+/// Human-readable file size (`1.4 MiB`).
+fn fmt_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+async fn media_scan() -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle.commands.send(Command::ScanMedia).await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::MediaScanFinished)).await?;
+    let state = handle.state.snapshot();
+    let scan = state
+        .media_last_scan
+        .context("scan finished without a result")?;
+    println!(
+        "Scan complete: {} folder(s), {} file(s) seen — {} upserted, {} removed, {} error(s)",
+        scan.folders, scan.files, scan.upserted, scan.removed, scan.errors
+    );
+    Ok(())
+}
+
+async fn media_list(
+    favorites: bool,
+    folder: Option<String>,
+    query: Option<String>,
+    limit: u32,
+    offset: u32,
+) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::LoadMedia {
+            filter: MediaFilter {
+                favorites_only: favorites,
+                folder,
+                query: query.filter(|q| !q.trim().is_empty()),
+                offset,
+                limit,
+                ..MediaFilter::default()
+            },
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::MediaLoaded)).await?;
+
+    let state = handle.state.snapshot();
+    let page = state
+        .media
+        .as_ref()
+        .context("media query returned nothing")?;
+    for item in &page.items {
+        let fav = if item.is_favorite { "*" } else { " " };
+        let dims = if item.width > 0 {
+            format!("{}x{}", item.width, item.height)
+        } else {
+            "?x?".to_string()
+        };
+        println!(
+            "{fav} {}  {:>10}  {:>7}  {}",
+            format::fmt_ts(item.taken_at),
+            dims,
+            fmt_bytes(item.size),
+            item.path
+        );
+        if !item.world_name.is_empty() || !item.world_id.is_empty() {
+            let world = if item.world_name.is_empty() {
+                item.world_id.as_str()
+            } else {
+                item.world_name.as_str()
+            };
+            println!("    world: {world}");
+        }
+    }
+    println!(
+        "-- {} of {} photo(s) --",
+        page.items.len(),
+        page.total.unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// Settings hydration runs before the command loop; give it a moment so
+/// `media folders list` doesn't race an empty snapshot.
+async fn wait_media_folders(handle: &AppHandle) {
+    for _ in 0..100 {
+        if !handle.state.snapshot().media_folders.is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn media_folders_list() -> Result<()> {
+    let handle = App::spawn(cli_config(build_local_client()?));
+    wait_media_folders(&handle).await;
+    for folder in &handle.state.snapshot().media_folders {
+        println!(
+            "{}  {}",
+            if folder.custom { "custom " } else { "default" },
+            folder.path
+        );
+    }
+    Ok(())
+}
+
+async fn media_folders_add(path: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::AddMediaFolder {
+            path: path.to_string(),
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::MediaChanged)).await?;
+    println!("Folder added; a rescan was queued.");
+    Ok(())
+}
+
+async fn media_folders_remove(path: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::RemoveMediaFolder {
+            path: path.to_string(),
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::MediaChanged)).await?;
+    println!("Folder removed.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,5 +1726,13 @@ mod tests {
     #[test]
     fn empty_vault_has_no_session_to_resume() {
         assert!(!vault_has_session(&MemoryVault::new()).unwrap());
+    }
+
+    #[test]
+    fn fmt_bytes_scales() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.0 KiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MiB");
     }
 }

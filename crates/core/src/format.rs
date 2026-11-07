@@ -137,6 +137,30 @@ fn world_label_parts(name: &str, id: &str, location: &str) -> String {
     }
 }
 
+/// Sorted key/value pairs from a media row's stored PNG-metadata JSON
+/// (`{}` or malformed input → empty). Used by the Media tab detail panel.
+pub fn media_metadata_pairs(json: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(String, String)> = map
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 fn player_label(name: &str, id: &str) -> String {
     if id.is_empty() {
         name.to_string()
