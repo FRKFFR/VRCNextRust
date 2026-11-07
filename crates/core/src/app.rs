@@ -3883,10 +3883,15 @@ impl Runtime {
     }
 
     /// Queue a chatbox message on the throttled relay (≤1 per 1.5 s,
-    /// latest wins — never an unbounded queue).
+    /// latest wins — never an unbounded queue). `ToolsChanged` marks
+    /// acceptance so CLI callers can tell validation failures (which
+    /// surface as `Error`) apart from a queued send.
     fn send_chatbox(&mut self, text: &str, immediate: bool) {
         match tools::chatbox_message(text, immediate) {
-            Ok(message) => self.chatbox_relay.send(message),
+            Ok(message) => {
+                self.chatbox_relay.send(message);
+                let _ = self.events.send(AppEvent::ToolsChanged);
+            }
             Err(message) => self.report_message(&message),
         }
     }
@@ -3906,6 +3911,7 @@ impl Runtime {
                 Err(e) => tracing::debug!("chatbox OSC client failed: {e}"),
             }
         });
+        let _ = self.events.send(AppEvent::ToolsChanged);
     }
 
     /// Send one avatar parameter immediately (not chatbox-throttled).
@@ -3924,6 +3930,7 @@ impl Runtime {
             .osc
             .params
             .insert(address.to_string(), value);
+        let _ = self.events.send(AppEvent::ToolsChanged);
         let target = tools::osc_send_target(&self.state.read().tools.launch);
         tokio::spawn(async move {
             match OscClient::bind(target).await {

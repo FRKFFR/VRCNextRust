@@ -1988,6 +1988,12 @@ async fn launch(cmd: LaunchCmd) -> Result<()> {
         println!("Launched.");
         return Ok(());
     }
+    // An instance id only makes sense paired with its world —
+    // `launch_options` drops the location entirely when world_id is
+    // empty, so reject the half-pair instead of silently ignoring it.
+    if instance.is_some() && world.is_none() {
+        bail!("--instance requires --world (a location is world:instance)");
+    }
     // Passed options override the persisted launch prefs (same store the
     // desktop Launcher tab uses); fields the user didn't pass — OSC
     // ports, the untouched half of a world/instance pair — are kept.
@@ -2088,12 +2094,15 @@ async fn companions_launch(index: usize) -> Result<()> {
 }
 
 async fn chatbox(text: Vec<String>, immediate: bool, typing: Option<bool>) -> Result<()> {
-    let handle = App::spawn(cli_config(build_local_client()?));
+    let mut handle = App::spawn(cli_config(build_local_client()?));
     if let Some(typing) = typing {
         handle
             .commands
             .send(Command::SendChatboxTyping { typing })
             .await?;
+        // Core emits ToolsChanged once the send is queued; an Error
+        // event (validation failure) makes wait_for bail instead.
+        wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
         // UDP send is fire-and-forget; give the socket a moment.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         println!("Typing indicator {}.", if typing { "on" } else { "off" });
@@ -2107,6 +2116,7 @@ async fn chatbox(text: Vec<String>, immediate: bool, typing: Option<bool>) -> Re
         .commands
         .send(Command::SendChatbox { text, immediate })
         .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
     // The relay enforces ≥1.5 s between sends; wait long enough for the
     // drain task to flush before the runtime shuts down.
     tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
@@ -2126,7 +2136,7 @@ fn fmt_param(value: ParamValue) -> String {
 async fn osc_send(address: &str, value: &str) -> Result<()> {
     let value = parse_param_value(value)
         .with_context(|| format!("invalid value {value:?} — use a number or true/false"))?;
-    let handle = App::spawn(cli_config(build_local_client()?));
+    let mut handle = App::spawn(cli_config(build_local_client()?));
     handle
         .commands
         .send(Command::SendOscParam {
@@ -2134,6 +2144,9 @@ async fn osc_send(address: &str, value: &str) -> Result<()> {
             value,
         })
         .await?;
+    // Core emits ToolsChanged once the send is accepted; an Error event
+    // (invalid address) makes wait_for bail instead of printing success.
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     println!("Sent {address} = {}", fmt_param(value));
     Ok(())

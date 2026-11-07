@@ -389,11 +389,17 @@ impl ChatboxRelay {
                     }
                     Err(e) => {
                         tracing::debug!("chatbox send failed: {e}");
-                        // Requeue only when nothing newer arrived.
-                        let mut state = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        if state.pending.is_none() {
-                            state.pending = Some(message);
+                        // Requeue only when nothing newer arrived, then
+                        // wait out a full interval before retrying —
+                        // `last_sent` isn't updated on failure, so
+                        // without this a persistent send error would spin.
+                        {
+                            let mut state = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            if state.pending.is_none() {
+                                state.pending = Some(message);
+                            }
                         }
+                        tokio::time::sleep(CHATBOX_INTERVAL).await;
                     }
                 }
             }

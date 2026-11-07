@@ -108,9 +108,15 @@ fn tokenize(input: &str) -> Vec<Token> {
     tokens
 }
 
+/// Deepest section nesting the parser accepts — real VDF nests ~4
+/// levels; a pathological file must not overflow the stack (the parser
+/// promises "never a panic").
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -125,8 +131,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `key value` pairs until `}` (or EOF). Returns `None` when the
-    /// stream does not start a section body.
+    /// stream does not start a section body or nesting exceeds
+    /// [`MAX_DEPTH`].
     fn section(&mut self) -> Option<Vec<(String, VdfNode)>> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let out = self.section_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn section_inner(&mut self) -> Option<Vec<(String, VdfNode)>> {
         let mut pairs = Vec::new();
         loop {
             match self.peek() {
@@ -163,6 +180,7 @@ pub(crate) fn parse_vdf(input: &str) -> Option<VdfNode> {
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
+        depth: 0,
     };
     // A document is `{ pairs }`; tolerate a missing outer brace by parsing
     // bare pairs too.
@@ -390,6 +408,17 @@ mod tests {
             Some("VRChat")
         );
         assert_eq!(appmanifest_installdir(lib, "999999"), None);
+    }
+
+    #[test]
+    fn deeply_nested_vdf_does_not_overflow() {
+        // "k" { repeated nests a section per pair; the depth cap must
+        // reject it cleanly instead of recursing until the stack dies.
+        let mut input = String::new();
+        for _ in 0..500 {
+            input.push_str("\"k\" {");
+        }
+        assert!(parse_vdf(&input).is_none());
     }
 
     #[test]

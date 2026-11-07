@@ -304,8 +304,16 @@ pub(crate) fn osc_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &vrc_core:
             }
         } else {
             ui.weak("listener stopped");
-            if ui.button("Listen on 9001").clicked() {
-                app.send(Command::StartOscListen { port: 9001 });
+            // VRChat sends avatar params to the configured OSC out-port
+            // (launch prefs; 0 = default 9001) — listen there.
+            let out_port = state.tools.launch.osc_output_port;
+            let listen_port = if out_port > 0 { out_port } else { 9001 };
+            if ui
+                .button(format!("Listen on {listen_port}"))
+                .on_hover_text("binds 127.0.0.1 — VRChat's OSC output port")
+                .clicked()
+            {
+                app.send(Command::StartOscListen { port: listen_port });
             }
         }
     });
