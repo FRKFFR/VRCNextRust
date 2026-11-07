@@ -5,6 +5,7 @@
 //! with `rpassword` and held in memory as `SecretString`s for the duration
 //! of the login call only.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -15,11 +16,11 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::broadcast;
 
 use vrc_core::{
-    format, friend_status_label, moderation_label, notification_kind_label, sections, App,
-    AppConfig, AppEvent, AppHandle, AuthState, BrowsePage, Client, Command, CreateInstanceRequest,
-    DetailState, Favorite, FavoriteGroup, Group, GroupAccessType, InstanceKind, InstanceRegion,
-    KeyringVault, MediaFilter, MemoryVault, StatsRange, TimelineFilter, TimelineKind,
-    TwoFactorMethod, World, USER_AGENT,
+    format, friend_status_label, moderation_label, notification_kind_label, parse_param_value,
+    sections, App, AppConfig, AppEvent, AppHandle, AuthState, BrowsePage, Client, Command,
+    CreateInstanceRequest, DetailState, Favorite, FavoriteGroup, Group, GroupAccessType,
+    InstanceKind, InstanceRegion, KeyringVault, LaunchPrefs, MediaFilter, MemoryVault, ParamValue,
+    StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, World, USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -190,6 +191,184 @@ enum Commands {
         #[command(subcommand)]
         command: MediaCommand,
     },
+    /// Launch VRChat or a companion app (no login needed)
+    Launch {
+        /// VRChat install dir override (default: Steam auto-detect)
+        #[arg(long)]
+        path: Option<String>,
+        /// `--no-vr`: start in desktop mode
+        #[arg(long)]
+        no_vr: bool,
+        /// `--profile=N` local profile number
+        #[arg(long)]
+        profile: Option<u32>,
+        /// `--fps=N` frame-rate cap
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Join a world: `wrld_…` (instance via --instance)
+        #[arg(long)]
+        world: Option<String>,
+        /// Instance id for --world
+        #[arg(long)]
+        instance: Option<String>,
+        /// Launch an arbitrary executable instead of VRChat
+        #[arg(long)]
+        exe: Option<String>,
+        /// Arguments for --exe (place after `--`)
+        #[arg(last = true)]
+        exe_args: Vec<String>,
+    },
+    /// Manage configured companion apps (no login needed)
+    Companions {
+        /// Action to perform
+        #[command(subcommand)]
+        command: CompanionsCommand,
+    },
+    /// Send a chatbox message or typing indicator (no login needed)
+    Chatbox {
+        /// Message text; omitted shows usage for the typing toggle
+        text: Vec<String>,
+        /// Send immediately instead of typing it out
+        #[arg(long)]
+        immediate: bool,
+        /// Toggle the typing indicator instead of sending text
+        #[arg(
+            long,
+            conflicts_with = "text",
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
+        typing: Option<bool>,
+    },
+    /// Send/listen for OSC avatar parameters (no login needed)
+    Osc {
+        /// Action to perform
+        #[command(subcommand)]
+        command: OscCommand,
+    },
+    /// Browse the events calendar (login needed)
+    Calendar {
+        /// Action to perform
+        #[command(subcommand)]
+        command: CalendarCommand,
+    },
+}
+
+/// `vrcnext-cli companions …` actions.
+#[derive(Subcommand)]
+enum CompanionsCommand {
+    /// List configured companions
+    List,
+    /// Add a companion (name, executable path, args after `--`)
+    Add {
+        /// Display name
+        name: String,
+        /// Executable path
+        path: String,
+        /// Arguments (place after `--`)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Remove a companion by index (`companions list` shows indices)
+    Remove {
+        /// Zero-based index
+        index: usize,
+    },
+    /// Launch a companion by index
+    Launch {
+        /// Zero-based index
+        index: usize,
+    },
+}
+
+/// `vrcnext-cli osc …` actions.
+#[derive(Subcommand)]
+enum OscCommand {
+    /// Send one avatar parameter: `/avatar/parameters/<name> <value>`
+    Send {
+        /// Full OSC address (must start with /avatar/parameters/)
+        address: String,
+        /// Value: float, int or true/false
+        value: String,
+    },
+    /// Listen for avatar parameters until Ctrl-C
+    Listen {
+        /// UDP port to bind (default: VRChat's 9001)
+        #[arg(long, default_value_t = 9001)]
+        port: u16,
+    },
+}
+
+/// `vrcnext-cli calendar …` actions.
+#[derive(Subcommand)]
+enum CalendarCommand {
+    /// Your calendar events for a month
+    Month {
+        /// Month key (API `date` value, e.g. 2026-03-01); default: current
+        #[arg(long)]
+        date: Option<String>,
+        /// Zero-based offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Discover public events
+    Discover {
+        /// Discovery scope
+        #[arg(long, value_enum, default_value_t = DiscoverScopeArg::Upcoming)]
+        scope: DiscoverScopeArg,
+        /// Cursor from a previous `discover` call
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Search events by title
+    Search {
+        /// Free-text search term
+        query: String,
+        /// Zero-based offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// A group's calendar events
+    Group {
+        /// `grp_…` group id
+        group_id: String,
+        /// Month key; default: API default
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// A group's next upcoming event
+    Next {
+        /// `grp_…` group id
+        group_id: String,
+    },
+    /// Follow or unfollow a group calendar event
+    Follow {
+        /// `grp_…` group id
+        group_id: String,
+        /// `cal_…` event id
+        calendar_id: String,
+        /// Unfollow instead of follow
+        #[arg(long)]
+        unfollow: bool,
+    },
+}
+
+/// `--scope` values for `calendar discover`.
+#[derive(Clone, Copy, ValueEnum)]
+enum DiscoverScopeArg {
+    All,
+    Live,
+    Upcoming,
+}
+
+impl From<DiscoverScopeArg> for vrc_core::DiscoverScope {
+    fn from(arg: DiscoverScopeArg) -> Self {
+        match arg {
+            DiscoverScopeArg::All => vrc_core::DiscoverScope::All,
+            DiscoverScopeArg::Live => vrc_core::DiscoverScope::Live,
+            DiscoverScopeArg::Upcoming => vrc_core::DiscoverScope::Upcoming,
+        }
+    }
 }
 
 /// `vrcnext-cli media …` actions.
@@ -551,6 +730,44 @@ async fn main() -> Result<()> {
                 MediaFoldersCommand::Remove { path } => media_folders_remove(&path).await,
             },
         },
+        Commands::Launch {
+            path,
+            no_vr,
+            profile,
+            fps,
+            world,
+            instance,
+            exe,
+            exe_args,
+        } => {
+            launch(LaunchCmd {
+                path,
+                no_vr,
+                profile,
+                fps,
+                world,
+                instance,
+                exe,
+                exe_args,
+            })
+            .await
+        }
+        Commands::Companions { command } => match command {
+            CompanionsCommand::List => companions_list().await,
+            CompanionsCommand::Add { name, path, args } => companions_add(&name, &path, args).await,
+            CompanionsCommand::Remove { index } => companions_remove(index).await,
+            CompanionsCommand::Launch { index } => companions_launch(index).await,
+        },
+        Commands::Chatbox {
+            text,
+            immediate,
+            typing,
+        } => chatbox(text, immediate, typing).await,
+        Commands::Osc { command } => match command {
+            OscCommand::Send { address, value } => osc_send(&address, &value).await,
+            OscCommand::Listen { port } => osc_listen(port).await,
+        },
+        Commands::Calendar { command } => calendar(command).await,
     }
 }
 
@@ -757,6 +974,10 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::MediaScanFinished) => println!("media scan finished"),
                 Ok(AppEvent::MediaChanged) => println!("media settings changed"),
                 Ok(AppEvent::ThumbnailReady) => println!("thumbnail ready"),
+                Ok(AppEvent::Ready) => println!("ready"),
+                Ok(AppEvent::ToolsChanged) => println!("tools changed"),
+                Ok(AppEvent::ProcessLaunched) => println!("process launched"),
+                Ok(AppEvent::CalendarChanged) => println!("calendar changed"),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }
@@ -1715,6 +1936,401 @@ async fn media_folders_remove(path: &str) -> Result<()> {
         .await?;
     wait_for(&mut handle, |e| matches!(e, AppEvent::MediaChanged)).await?;
     println!("Folder removed.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Launcher & tools (M7): local spawn/UDP only — no login required. Companion
+// settings persist in `vrc.db` like the desktop app's.
+// ---------------------------------------------------------------------------
+
+/// Wait for startup hydration (`AppEvent::Ready`) so persisted tools
+/// settings are visible in the snapshot.
+async fn wait_ready(handle: &mut AppHandle) -> Result<()> {
+    wait_for(handle, |e| matches!(e, AppEvent::Ready)).await?;
+    Ok(())
+}
+
+/// Bundled `launch` flag values (keeps the handler under clippy's
+/// argument-count limit).
+struct LaunchCmd {
+    path: Option<String>,
+    no_vr: bool,
+    profile: Option<u32>,
+    fps: Option<u32>,
+    world: Option<String>,
+    instance: Option<String>,
+    exe: Option<String>,
+    exe_args: Vec<String>,
+}
+
+async fn launch(cmd: LaunchCmd) -> Result<()> {
+    let LaunchCmd {
+        path,
+        no_vr,
+        profile,
+        fps,
+        world,
+        instance,
+        exe,
+        exe_args,
+    } = cmd;
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    if let Some(exe) = exe {
+        handle
+            .commands
+            .send(Command::LaunchPath {
+                path: exe,
+                args: exe_args,
+            })
+            .await?;
+        wait_for(&mut handle, |e| {
+            matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
+        })
+        .await?;
+        println!("Launched.");
+        return Ok(());
+    }
+    // Any explicit option becomes the persisted launch prefs (same store
+    // the desktop Launcher tab uses).
+    if path.is_some()
+        || no_vr
+        || profile.is_some()
+        || fps.is_some()
+        || world.is_some()
+        || instance.is_some()
+    {
+        handle
+            .commands
+            .send(Command::SetLaunchPrefs {
+                prefs: LaunchPrefs {
+                    no_vr,
+                    profile: profile.unwrap_or(0),
+                    fps: fps.unwrap_or(0),
+                    world_id: world.unwrap_or_default(),
+                    instance_id: instance.unwrap_or_default(),
+                    ..LaunchPrefs::default()
+                },
+            })
+            .await?;
+    }
+    if let Some(path) = path {
+        handle
+            .commands
+            .send(Command::SetVrchatPath { path: Some(path) })
+            .await?;
+    }
+    handle.commands.send(Command::LaunchVrchat).await?;
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
+    })
+    .await?;
+    let state = handle.state.snapshot();
+    println!(
+        "Launched: {}",
+        state
+            .tools
+            .last_launch
+            .unwrap_or_else(|| "VRChat".to_string())
+    );
+    Ok(())
+}
+
+async fn companions_list() -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    wait_ready(&mut handle).await?;
+    let companions = handle.state.snapshot().tools.companions;
+    if companions.is_empty() {
+        println!("(no companions configured)");
+        return Ok(());
+    }
+    for (index, c) in companions.iter().enumerate() {
+        println!("{index}: {} — {} {}", c.name, c.path, c.args.join(" "));
+    }
+    Ok(())
+}
+
+async fn companions_add(name: &str, path: &str, args: Vec<String>) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::AddCompanion {
+            companion: vrc_core::Companion {
+                name: name.to_string(),
+                path: path.to_string(),
+                args,
+            },
+        })
+        .await?;
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::ToolsChanged | AppEvent::Error(_))
+    })
+    .await?;
+    println!("Companion added.");
+    Ok(())
+}
+
+async fn companions_remove(index: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::RemoveCompanion { index })
+        .await?;
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::ToolsChanged | AppEvent::Error(_))
+    })
+    .await?;
+    println!("Companion removed.");
+    Ok(())
+}
+
+async fn companions_launch(index: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::LaunchCompanion { index })
+        .await?;
+    wait_for(&mut handle, |e| {
+        matches!(e, AppEvent::ProcessLaunched | AppEvent::Error(_))
+    })
+    .await?;
+    println!("Launched.");
+    Ok(())
+}
+
+async fn chatbox(text: Vec<String>, immediate: bool, typing: Option<bool>) -> Result<()> {
+    let handle = App::spawn(cli_config(build_local_client()?));
+    if let Some(typing) = typing {
+        handle
+            .commands
+            .send(Command::SendChatboxTyping { typing })
+            .await?;
+        // UDP send is fire-and-forget; give the socket a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        println!("Typing indicator {}.", if typing { "on" } else { "off" });
+        return Ok(());
+    }
+    let text = text.join(" ");
+    if text.trim().is_empty() {
+        bail!("chatbox text is empty — pass a message or --typing");
+    }
+    handle
+        .commands
+        .send(Command::SendChatbox { text, immediate })
+        .await?;
+    // The relay enforces ≥1.5 s between sends; wait long enough for the
+    // drain task to flush before the runtime shuts down.
+    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+    println!("Chatbox message sent.");
+    Ok(())
+}
+
+/// Display form for a parameter value (no `Debug` noise).
+fn fmt_param(value: ParamValue) -> String {
+    match value {
+        ParamValue::Float(v) => format!("{v}"),
+        ParamValue::Int(v) => v.to_string(),
+        ParamValue::Bool(v) => v.to_string(),
+    }
+}
+
+async fn osc_send(address: &str, value: &str) -> Result<()> {
+    let value = parse_param_value(value)
+        .with_context(|| format!("invalid value {value:?} — use a number or true/false"))?;
+    let handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::SendOscParam {
+            address: address.to_string(),
+            value,
+        })
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    println!("Sent {address} = {}", fmt_param(value));
+    Ok(())
+}
+
+async fn osc_listen(port: u16) -> Result<()> {
+    let mut handle = App::spawn(cli_config(build_local_client()?));
+    handle
+        .commands
+        .send(Command::StartOscListen { port })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::ToolsChanged)).await?;
+    let bound = handle.state.snapshot().tools.osc.listen_port;
+    println!("Listening for OSC on 127.0.0.1:{bound} (Ctrl-C to stop)");
+    let mut seen: HashMap<String, String> = HashMap::new();
+    loop {
+        tokio::select! {
+            event = handle.events.recv() => match event {
+                Ok(AppEvent::ToolsChanged) => {
+                    for (addr, value) in &handle.state.snapshot().tools.osc.params {
+                        let text = fmt_param(*value);
+                        if seen.get(addr) != Some(&text) {
+                            seen.insert(addr.clone(), text.clone());
+                            println!("{addr} = {text}");
+                        }
+                    }
+                }
+                Ok(AppEvent::Error(m)) => eprintln!("error: {m}"),
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            },
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    let _ = handle.commands.send(Command::StopOscListen).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Events calendar (M7): documented /calendar* endpoints — login required.
+// ---------------------------------------------------------------------------
+
+fn print_calendar_event(event: &vrc_core::CalendarEvent) {
+    let following = event.user_interest.as_ref().is_some_and(|i| i.is_following);
+    println!(
+        "{:<44} {:<22} {:<14}{}",
+        event.title,
+        event.starts_at,
+        event.category,
+        if following { " ★" } else { "" }
+    );
+    println!(
+        "    {}  ({} interested)",
+        event.id, event.interested_user_count
+    );
+}
+
+async fn calendar(command: CalendarCommand) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    match command {
+        CalendarCommand::Month { date, offset } => {
+            handle
+                .commands
+                .send(Command::LoadCalendarMonth { date, offset })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            let state = handle.state.snapshot();
+            let Some((key, page)) = &state.calendar.month else {
+                bail!("no calendar data");
+            };
+            println!(
+                "== calendar {} ==",
+                if key.is_empty() { "(current)" } else { key }
+            );
+            for event in &page.results {
+                print_calendar_event(event);
+            }
+            println!(
+                "-- {} event(s), total {} --",
+                page.results.len(),
+                page.total_count
+            );
+        }
+        CalendarCommand::Discover { scope, cursor } => {
+            handle
+                .commands
+                .send(Command::LoadCalendarDiscover {
+                    scope: scope.into(),
+                    cursor,
+                })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            let state = handle.state.snapshot();
+            let Some(d) = &state.calendar.discover else {
+                bail!("no discovery results");
+            };
+            for event in &d.events {
+                print_calendar_event(event);
+            }
+            println!(
+                "-- {} event(s){} --",
+                d.events.len(),
+                if d.next_cursor.is_some() {
+                    ", more available (--cursor)"
+                } else {
+                    ""
+                }
+            );
+        }
+        CalendarCommand::Search { query, offset } => {
+            handle
+                .commands
+                .send(Command::LoadCalendarSearch { query, offset })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            let state = handle.state.snapshot();
+            let Some((_, page)) = &state.calendar.search else {
+                bail!("no search results");
+            };
+            for event in &page.results {
+                print_calendar_event(event);
+            }
+            println!(
+                "-- {} event(s), total {} --",
+                page.results.len(),
+                page.total_count
+            );
+        }
+        CalendarCommand::Group { group_id, date } => {
+            handle
+                .commands
+                .send(Command::LoadGroupCalendar {
+                    group_id,
+                    date,
+                    offset: 0,
+                })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            let state = handle.state.snapshot();
+            let Some((_, page)) = &state.calendar.group else {
+                bail!("no group calendar data");
+            };
+            for event in &page.results {
+                print_calendar_event(event);
+            }
+            println!(
+                "-- {} event(s), total {} --",
+                page.results.len(),
+                page.total_count
+            );
+        }
+        CalendarCommand::Next { group_id } => {
+            handle
+                .commands
+                .send(Command::LoadGroupNextEvent { group_id })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            let state = handle.state.snapshot();
+            match state.calendar.next_events.values().next() {
+                Some(Some(event)) => {
+                    println!("Next event:");
+                    print_calendar_event(event);
+                }
+                Some(None) => println!("No upcoming events for that group."),
+                None => bail!("no result"),
+            }
+        }
+        CalendarCommand::Follow {
+            group_id,
+            calendar_id,
+            unfollow,
+        } => {
+            handle
+                .commands
+                .send(Command::FollowCalendarEvent {
+                    group_id,
+                    calendar_id,
+                    is_following: !unfollow,
+                })
+                .await?;
+            wait_for(&mut handle, |e| matches!(e, AppEvent::CalendarChanged)).await?;
+            println!("{}.", if unfollow { "Unfollowed" } else { "Following" });
+        }
+    }
     Ok(())
 }
 

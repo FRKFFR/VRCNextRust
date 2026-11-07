@@ -9,13 +9,15 @@ use std::time::Instant;
 
 use time::OffsetDateTime;
 use vrc_api::{
-    Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupAnnouncement,
-    GroupGalleryImage, GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification,
-    NotificationV2, PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
+    Avatar, CalendarEvent, CalendarEventPage, CurrentUser, Favorite, FavoriteGroup, FriendStatus,
+    Group, GroupAnnouncement, GroupGalleryImage, GroupInstance, GroupMember, GroupPost, Instance,
+    LimitedUser, Notification, NotificationV2, PlayerModeration, TrustRank, TwoFactorMethod, User,
+    UserGroup, World,
 };
 use vrc_store::{FriendHistoryEntry, MediaItem, Stats, TimelineEntry};
 
 use crate::discord::WebhookSlot;
+use crate::tools::ToolsUi;
 
 /// Whether a session exists and in what stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -354,6 +356,35 @@ pub struct MediaScanInfo {
     pub errors: u64,
 }
 
+/// Accumulated `GET /calendar/discover` results across cursor pages.
+#[derive(Debug, Clone, Default)]
+pub struct CalendarDiscoveryUi {
+    /// Scope label the results were fetched with (`upcoming`/`live`/`all`).
+    pub scope: String,
+    /// Events accumulated so far (newest page order preserved).
+    pub events: Vec<CalendarEvent>,
+    /// Cursor for the next page; `None` when exhausted.
+    pub next_cursor: Option<String>,
+    /// A fetch is in flight.
+    pub loading: bool,
+}
+
+/// M7 events-calendar view state (documented `/calendar*` endpoints).
+#[derive(Debug, Clone, Default)]
+pub struct CalendarUi {
+    /// `GET /calendar` month page keyed by the requested `date` value.
+    pub month: Option<(String, CalendarEventPage)>,
+    /// `GET /calendar/discover` accumulation.
+    pub discover: Option<CalendarDiscoveryUi>,
+    /// `GET /calendar/search` page keyed by the query string.
+    pub search: Option<(String, CalendarEventPage)>,
+    /// `GET /calendar/{groupId}` page keyed by group id.
+    pub group: Option<(String, CalendarEventPage)>,
+    /// `GET /calendar/{groupId}/next` per group id; `Some(None)` means the
+    /// group answered 404 (no upcoming event).
+    pub next_events: HashMap<String, Option<CalendarEvent>>,
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -448,6 +479,13 @@ pub struct AppState {
     /// Configured Discord webhooks — URLs never leave the OS keyring;
     /// only per-slot flags are exposed here.
     pub webhooks: Vec<WebhookSlot>,
+    /// M7 launcher/tools state (VRChat path, companions, launch prefs,
+    /// OSC listener + parameters). Persists across logout — it is local
+    /// configuration, not session data.
+    pub tools: ToolsUi,
+    /// M7 events-calendar state (cleared on logout like other session
+    /// data).
+    pub calendar: CalendarUi,
 }
 
 #[cfg(test)]

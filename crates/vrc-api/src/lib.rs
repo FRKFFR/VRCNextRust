@@ -17,6 +17,7 @@ pub const USER_AGENT: &str = concat!(
 
 mod auth;
 mod avatars;
+mod calendar;
 mod client;
 mod error;
 mod favorites;
@@ -35,6 +36,11 @@ mod worlds;
 
 pub use auth::LoginOutcome;
 pub use avatars::{valid_avatar_id, AvatarSearchQuery};
+pub use calendar::{
+    valid_calendar_event_id, valid_file_id, CalendarEvent, CalendarEventDiscovery,
+    CalendarEventPage, CalendarRecurrence, CalendarRecurrenceEnd, CalendarUserInterest,
+    DiscoverParams, DiscoverScope, GroupCalendarParams, ResultFilter,
+};
 pub use client::{Client, ClientBuilder, ExternalResponse, API_ROOT};
 pub use error::ApiError;
 pub use favorites::valid_favorite_id;

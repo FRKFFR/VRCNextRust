@@ -10,6 +10,7 @@ mod browse;
 mod media;
 mod social;
 mod tabs;
+mod tools;
 
 use std::collections::{HashMap, HashSet};
 
@@ -143,6 +144,36 @@ pub struct VrcNextApp {
     thumb_requested: HashSet<String>,
     /// Shared decoded-thumbnail cache owned by `vrc-core`.
     thumbnails: ThumbnailHandle,
+    /// M7 launcher tab: VRChat path-override input buffer.
+    vrchat_path_input: String,
+    /// M7 launcher tab: launch-option edit buffers (applied via
+    /// `SetLaunchPrefs` / used by `LaunchVrchat`).
+    launch_no_vr: bool,
+    launch_profile: String,
+    launch_fps: String,
+    launch_osc_in: String,
+    launch_osc_out: String,
+    launch_world: String,
+    launch_instance: String,
+    /// M7 launcher tab: auto-start companions toggle (mirrors state).
+    auto_start_companion: bool,
+    /// M7 launcher tab: companion add-form buffers.
+    companion_name: String,
+    companion_path: String,
+    companion_args: String,
+    /// M7 launcher tab: buffers seeded from persisted prefs on first visit.
+    tools_buf_ready: bool,
+    /// M7 chatbox tab: message buffer + immediate flag.
+    chatbox_text: String,
+    chatbox_immediate: bool,
+    /// M7 OSC tab: parameter send buffers.
+    osc_addr: String,
+    osc_value: String,
+    /// M7 calendar tab: input buffers.
+    calendar_month: String,
+    calendar_group: String,
+    calendar_search: String,
+    calendar_scope: vrc_core::DiscoverScope,
 }
 
 impl VrcNextApp {
@@ -191,6 +222,27 @@ impl VrcNextApp {
             tex: HashMap::new(),
             thumb_requested: HashSet::new(),
             thumbnails,
+            vrchat_path_input: String::new(),
+            launch_no_vr: false,
+            launch_profile: String::new(),
+            launch_fps: String::new(),
+            launch_osc_in: String::new(),
+            launch_osc_out: String::new(),
+            launch_world: String::new(),
+            launch_instance: String::new(),
+            auto_start_companion: false,
+            companion_name: String::new(),
+            companion_path: String::new(),
+            companion_args: String::new(),
+            tools_buf_ready: false,
+            chatbox_text: String::new(),
+            chatbox_immediate: true,
+            osc_addr: String::new(),
+            osc_value: String::new(),
+            calendar_month: String::new(),
+            calendar_group: String::new(),
+            calendar_search: String::new(),
+            calendar_scope: vrc_core::DiscoverScope::Upcoming,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).

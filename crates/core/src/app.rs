@@ -18,10 +18,13 @@ use secrecy::{ExposeSecret, SecretString};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use vrc_api::{
-    ApiError, AvatarSearchQuery, Client, CreateInstanceRequest, CurrentUser, FavoriteKind,
-    LoginOutcome, PlayerModerationKind, TwoFactorMethod, WorldSearchQuery,
+    ApiError, AvatarSearchQuery, Client, CreateInstanceRequest, CurrentUser, DiscoverParams,
+    DiscoverScope, FavoriteKind, GroupCalendarParams, LoginOutcome, PlayerModerationKind,
+    TwoFactorMethod, WorldSearchQuery,
 };
 use vrc_logs::{LogEvent, LogTailer};
+use vrc_osc::params::ParamValue;
+use vrc_osc::{chatbox as osc_chatbox, OscClient, OscListener};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
 use vrc_store::{FriendHistoryFilter, MediaFilter, StatsRange, Store, TimelineFilter};
 
@@ -32,10 +35,11 @@ use crate::media;
 use crate::sections::worlds_with_friends;
 use crate::social::{self, MULTI_INVITE_GAP};
 use crate::state::{
-    valid_world_id, AppState, AuthState, BrowsePage, DetailState, Friend, MultiInviteProgress,
-    PipelineStatus, ProfileView, WorldName,
+    valid_world_id, AppState, AuthState, BrowsePage, CalendarDiscoveryUi, DetailState, Friend,
+    MultiInviteProgress, PipelineStatus, ProfileView, WorldName,
 };
 use crate::thumbs::{self, ThumbSource, ThumbnailHandle, ThumbnailImage};
+use crate::tools::{self, ChatboxRelay, Companion, LaunchPrefs};
 
 /// Static configuration for [`App::spawn`].
 #[derive(Debug)]
@@ -498,6 +502,126 @@ pub enum Command {
         /// New flag value.
         enabled: bool,
     },
+    /// Spawn VRChat with the persisted launch prefs; companions follow
+    /// when auto-start is enabled. Local-only — no login required.
+    LaunchVrchat,
+    /// Spawn one configured companion by index.
+    LaunchCompanion {
+        /// Zero-based index into `AppState.tools.companions`.
+        index: usize,
+    },
+    /// Spawn an ad-hoc executable with arguments (CLI `launch -- <path>`).
+    LaunchPath {
+        /// Executable path.
+        path: String,
+        /// Arguments passed verbatim (no shell).
+        args: Vec<String>,
+    },
+    /// Add a companion definition (validated, persisted).
+    AddCompanion {
+        /// Companion to append.
+        companion: Companion,
+    },
+    /// Remove the companion at `index` (persisted).
+    RemoveCompanion {
+        /// Zero-based index into `AppState.tools.companions`.
+        index: usize,
+    },
+    /// Replace the companion at `index` (persisted).
+    UpdateCompanion {
+        /// Zero-based index.
+        index: usize,
+        /// Replacement definition.
+        companion: Companion,
+    },
+    /// Whether companions launch together with VRChat (persisted).
+    SetAutoStartCompanion {
+        /// New flag value.
+        enabled: bool,
+    },
+    /// Override the VRChat install dir (`None`/empty = Steam auto-detect,
+    /// persisted).
+    SetVrchatPath {
+        /// Install dir containing `VRChat.exe`.
+        path: Option<String>,
+    },
+    /// Replace the persisted launch preferences.
+    SetLaunchPrefs {
+        /// New preferences.
+        prefs: LaunchPrefs,
+    },
+    /// Queue a chatbox message — throttled to one per 1.5 s, latest wins.
+    SendChatbox {
+        /// Message text (sanitized + clamped by `vrc-osc`).
+        text: String,
+        /// `true` sends at once; `false` types it out.
+        immediate: bool,
+    },
+    /// Toggle the chatbox typing indicator (sent immediately, unthrottled).
+    SendChatboxTyping {
+        /// `true` = typing, `false` = finished.
+        typing: bool,
+    },
+    /// Send one avatar parameter (`/avatar/parameters/<name>`).
+    SendOscParam {
+        /// Full OSC address (validated).
+        address: String,
+        /// Float/int/bool value.
+        value: ParamValue,
+    },
+    /// Start the OSC listener on `127.0.0.1:port` (0 = ephemeral; the
+    /// bound port lands in `AppState.tools.osc.listen_port`).
+    StartOscListen {
+        /// UDP port to bind.
+        port: u16,
+    },
+    /// Stop the OSC listener.
+    StopOscListen,
+    /// `GET /calendar` for `date`'s month into `AppState.calendar.month`.
+    LoadCalendarMonth {
+        /// Documented month key; `None` = the API default (current month).
+        date: Option<String>,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /calendar/discover` — first page when `cursor` is `None`,
+    /// appended next page when `Some`.
+    LoadCalendarDiscover {
+        /// Discovery scope.
+        scope: DiscoverScope,
+        /// Cursor from a previous discovery response.
+        cursor: Option<String>,
+    },
+    /// `GET /calendar/search` into `AppState.calendar.search`.
+    LoadCalendarSearch {
+        /// Free-text search term.
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /calendar/{groupId}` into `AppState.calendar.group`.
+    LoadGroupCalendar {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Month `date` key; `None` = API default.
+        date: Option<String>,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /calendar/{groupId}/next` into `AppState.calendar.next_events`.
+    LoadGroupNextEvent {
+        /// `grp_…` group id.
+        group_id: String,
+    },
+    /// `POST /calendar/{groupId}/{calendarId}/follow`.
+    FollowCalendarEvent {
+        /// `grp_…` group id.
+        group_id: String,
+        /// `cal_…` event id.
+        calendar_id: String,
+        /// New follow state.
+        is_following: bool,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -569,6 +693,26 @@ impl std::fmt::Debug for Command {
             Command::AddWebhook { .. } => "AddWebhook",
             Command::RemoveWebhook { .. } => "RemoveWebhook",
             Command::SetWebhookAutopost { .. } => "SetWebhookAutopost",
+            Command::LaunchVrchat => "LaunchVrchat",
+            Command::LaunchCompanion { .. } => "LaunchCompanion",
+            Command::LaunchPath { .. } => "LaunchPath",
+            Command::AddCompanion { .. } => "AddCompanion",
+            Command::RemoveCompanion { .. } => "RemoveCompanion",
+            Command::UpdateCompanion { .. } => "UpdateCompanion",
+            Command::SetAutoStartCompanion { .. } => "SetAutoStartCompanion",
+            Command::SetVrchatPath { .. } => "SetVrchatPath",
+            Command::SetLaunchPrefs { .. } => "SetLaunchPrefs",
+            Command::SendChatbox { .. } => "SendChatbox",
+            Command::SendChatboxTyping { .. } => "SendChatboxTyping",
+            Command::SendOscParam { .. } => "SendOscParam",
+            Command::StartOscListen { .. } => "StartOscListen",
+            Command::StopOscListen => "StopOscListen",
+            Command::LoadCalendarMonth { .. } => "LoadCalendarMonth",
+            Command::LoadCalendarDiscover { .. } => "LoadCalendarDiscover",
+            Command::LoadCalendarSearch { .. } => "LoadCalendarSearch",
+            Command::LoadGroupCalendar { .. } => "LoadGroupCalendar",
+            Command::LoadGroupNextEvent { .. } => "LoadGroupNextEvent",
+            Command::FollowCalendarEvent { .. } => "FollowCalendarEvent",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -613,6 +757,16 @@ pub enum AppEvent {
     MediaChanged,
     /// A thumbnail finished decoding into the shared cache.
     ThumbnailReady,
+    /// Launcher/tools configuration or OSC listener state changed.
+    ToolsChanged,
+    /// A process was spawned (VRChat or a companion).
+    ProcessLaunched,
+    /// `AppState.calendar` changed.
+    CalendarChanged,
+    /// Startup hydration finished (settings applied, store opened) —
+    /// emitted once before the command loop; lets CLI callers snapshot
+    /// persisted state without racing the store thread.
+    Ready,
     /// A command failed (message carries no secrets).
     Error(String),
 }
@@ -701,6 +855,10 @@ struct Runtime {
     webhook_vault: Arc<dyn WebhookVault>,
     /// Sequential webhook sender; `None`-safe (jobs no-op when empty).
     webhook_relay: discord::WebhookRelay,
+    /// Throttled chatbox sender (M7; latest message wins, ≤1 per 1.5 s).
+    chatbox_relay: ChatboxRelay,
+    /// OSC listener task; `Some` while `AppState.tools.osc.listening`.
+    osc_listener: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn run(
@@ -778,6 +936,19 @@ async fn run(
         None => None,
     };
     apply_media_settings(&state, settings.as_ref());
+    apply_tools_settings(&state, settings.as_ref());
+    // One Steam scan at startup populates the Launcher tab's install-dir
+    // status (filesystem reads only — spawn-only rules unaffected).
+    let vrchat_found = tokio::task::spawn_blocking(vrc_launcher::find_vrchat)
+        .await
+        .ok()
+        .flatten()
+        .map(|dir| dir.to_string_lossy().into_owned());
+    state
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .tools
+        .vrchat_found = vrchat_found;
 
     // Webhook secrets live only in the OS keyring; a missing credential
     // store degrades to a session-only memory vault.
@@ -826,8 +997,11 @@ async fn run(
         thumbnails,
         webhook_vault,
         webhook_relay,
+        chatbox_relay: ChatboxRelay::new(vrc_osc::default_target()),
+        osc_listener: None,
     };
     rt.state.write().log_tail_active = rt.log_events.is_some();
+    let _ = rt.events.send(AppEvent::Ready);
     // Index the configured folders once at startup (desktop instance
     // only — CLI runs stay fast and read-only).
     if config.local_writes {
@@ -916,6 +1090,52 @@ fn apply_media_settings(
     let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
     guard.media_folders = media::effective_folders(&custom);
     guard.media_blur = blur;
+}
+
+/// Apply persisted tools settings to `AppState`: companion list, VRChat
+/// path override, launch prefs and the auto-start flag. All local config —
+/// works while logged out (M7).
+fn apply_tools_settings(
+    state: &Arc<RwLock<AppState>>,
+    settings: Option<&std::collections::HashMap<String, String>>,
+) {
+    let get = |key: &str| settings.and_then(|s| s.get(key)).map(String::as_str);
+    let companions = tools::parse_companions(get(tools::SETTING_COMPANIONS));
+    let vrchat_path = get(tools::SETTING_VRCHAT_PATH)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let auto_start = get(tools::SETTING_AUTO_START)
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let launch = tools::parse_launch_prefs(get(tools::SETTING_LAUNCH));
+    let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
+    guard.tools.companions = companions;
+    guard.tools.vrchat_path = vrchat_path;
+    guard.tools.auto_start_companion = auto_start;
+    guard.tools.launch = launch;
+}
+
+/// Mirror a follow/unfollow response into every loaded calendar list that
+/// contains the event (month, search, group, discovery).
+fn apply_followed_event(state: &mut AppState, event: &vrc_api::CalendarEvent) {
+    fn apply(events: &mut [vrc_api::CalendarEvent], event: &vrc_api::CalendarEvent) {
+        if let Some(slot) = events.iter_mut().find(|e| e.id == event.id) {
+            slot.user_interest = event.user_interest.clone();
+        }
+    }
+    if let Some((_, page)) = state.calendar.month.as_mut() {
+        apply(&mut page.results, event);
+    }
+    if let Some((_, page)) = state.calendar.search.as_mut() {
+        apply(&mut page.results, event);
+    }
+    if let Some((_, page)) = state.calendar.group.as_mut() {
+        apply(&mut page.results, event);
+    }
+    if let Some(discovery) = state.calendar.discover.as_mut() {
+        apply(&mut discovery.events, event);
+    }
 }
 
 /// Surface a local-store failure like a command error: `last_error` for
@@ -1206,6 +1426,47 @@ impl Runtime {
             Command::RemoveWebhook { index } => self.remove_webhook(index).await,
             Command::SetWebhookAutopost { index, enabled } => {
                 self.set_webhook_autopost(index, enabled).await
+            }
+            Command::LaunchVrchat => self.launch_vrchat(),
+            Command::LaunchCompanion { index } => self.launch_companion(index),
+            Command::LaunchPath { path, args } => self.launch_path(path, args).await,
+            Command::AddCompanion { companion } => self.add_companion(companion).await,
+            Command::RemoveCompanion { index } => self.remove_companion(index).await,
+            Command::UpdateCompanion { index, companion } => {
+                self.update_companion(index, companion).await
+            }
+            Command::SetAutoStartCompanion { enabled } => {
+                self.set_auto_start_companion(enabled).await
+            }
+            Command::SetVrchatPath { path } => self.set_vrchat_path(path).await,
+            Command::SetLaunchPrefs { prefs } => self.set_launch_prefs(prefs).await,
+            Command::SendChatbox { text, immediate } => self.send_chatbox(&text, immediate),
+            Command::SendChatboxTyping { typing } => self.send_chatbox_typing(typing).await,
+            Command::SendOscParam { address, value } => self.send_osc_param(&address, value).await,
+            Command::StartOscListen { port } => self.start_osc_listen(port).await,
+            Command::StopOscListen => self.stop_osc_listen(),
+            Command::LoadCalendarMonth { date, offset } => {
+                self.load_calendar_month(date, offset).await
+            }
+            Command::LoadCalendarDiscover { scope, cursor } => {
+                self.load_calendar_discover(scope, cursor).await
+            }
+            Command::LoadCalendarSearch { query, offset } => {
+                self.load_calendar_search(&query, offset).await
+            }
+            Command::LoadGroupCalendar {
+                group_id,
+                date,
+                offset,
+            } => self.load_group_calendar(&group_id, date, offset).await,
+            Command::LoadGroupNextEvent { group_id } => self.load_group_next_event(&group_id).await,
+            Command::FollowCalendarEvent {
+                group_id,
+                calendar_id,
+                is_following,
+            } => {
+                self.follow_calendar_event(&group_id, &calendar_id, is_following)
+                    .await
             }
         }
     }
@@ -3392,6 +3653,458 @@ impl Runtime {
         state.group_posts.clear();
         state.group_gallery_images.clear();
         state.group_instances.clear();
+        // Calendar data is session-scoped like the other API views;
+        // `tools` (launcher/OSC config) is local and survives logout.
+        state.calendar = Default::default();
+    }
+
+    // ------------------------------------------------------------------
+    // M7 launcher & tools (local, spawn-only — no login required)
+    // ------------------------------------------------------------------
+
+    /// Spawn VRChat with the persisted launch prefs; companions follow
+    /// when auto-start is enabled. `spawn` only — never a shell, never
+    /// process inspection (RULES.md §5).
+    fn launch_vrchat(&mut self) {
+        let (override_path, prefs, companions, auto_start) = {
+            let tools = &self.state.read().tools;
+            (
+                tools.vrchat_path.clone(),
+                tools.launch.clone(),
+                tools.companions.clone(),
+                tools.auto_start_companion,
+            )
+        };
+        let Some(dir) = tools::resolve_install_dir(override_path.as_deref()) else {
+            // Refresh the cached scan so the UI shows the real status.
+            let found = vrc_launcher::find_vrchat().map(|dir| dir.to_string_lossy().into_owned());
+            self.state.write().tools.vrchat_found = found;
+            self.report_message(
+                "VRChat installation not found — set a path override in the Launcher tab",
+            );
+            return;
+        };
+        match tools::launch_vrchat(&dir, &prefs, &companions, auto_start) {
+            Ok(summary) => {
+                {
+                    let mut state = self.state.write();
+                    state.tools.last_launch = Some(summary);
+                    state.tools.vrchat_found = Some(dir.to_string_lossy().into_owned());
+                }
+                let _ = self.events.send(AppEvent::ProcessLaunched);
+                let _ = self.events.send(AppEvent::ToolsChanged);
+            }
+            Err(message) => self.report_message(&message),
+        }
+    }
+
+    /// Spawn one configured companion by index.
+    fn launch_companion(&mut self, index: usize) {
+        let companions = self.state.read().tools.companions.clone();
+        match tools::launch_companion_at(&companions, index) {
+            Ok(name) => {
+                self.state.write().tools.last_launch = Some(name);
+                let _ = self.events.send(AppEvent::ProcessLaunched);
+            }
+            Err(message) => self.report_message(&message),
+        }
+    }
+
+    /// Spawn an ad-hoc path + args (CLI). Off the async executor because
+    /// `spawn` is a blocking syscall.
+    async fn launch_path(&mut self, path: String, args: Vec<String>) {
+        match tokio::task::spawn_blocking(move || tools::launch_path(&path, &args)).await {
+            Ok(Ok(())) => {
+                self.state.write().tools.last_launch = Some("process".to_string());
+                let _ = self.events.send(AppEvent::ProcessLaunched);
+            }
+            Ok(Err(message)) => self.report_message(&message),
+            Err(_) => self.report_message("launch task failed"),
+        }
+    }
+
+    /// Companion list mutations all funnel through here: persist the JSON
+    /// setting, flush the store barrier, then update state + notify.
+    async fn persist_companions(&self, companions: Vec<Companion>) {
+        if let Some(tx) = &self.store_tx {
+            let _ = tx.send(StoreOp::SetSetting {
+                key: tools::SETTING_COMPANIONS.to_string(),
+                value: tools::companions_json(&companions),
+            });
+        }
+        self.flush_store().await;
+        self.state.write().tools.companions = companions;
+        let _ = self.events.send(AppEvent::ToolsChanged);
+    }
+
+    /// Persist one tools setting and notify; callers update `AppState`
+    /// themselves before/after as needed.
+    async fn persist_tool_setting(&self, key: &str, value: String) {
+        if let Some(tx) = &self.store_tx {
+            let _ = tx.send(StoreOp::SetSetting {
+                key: key.to_string(),
+                value,
+            });
+        }
+        self.flush_store().await;
+        let _ = self.events.send(AppEvent::ToolsChanged);
+    }
+
+    fn validate_companion(companion: &Companion) -> Result<(), String> {
+        if companion.name.trim().is_empty() {
+            return Err("companion name is empty".to_string());
+        }
+        if companion.path.trim().is_empty() {
+            return Err("companion path is empty".to_string());
+        }
+        Ok(())
+    }
+
+    async fn add_companion(&mut self, mut companion: Companion) {
+        companion.name = companion.name.trim().to_string();
+        companion.path = companion.path.trim().to_string();
+        if let Err(message) = Self::validate_companion(&companion) {
+            self.report_message(&message);
+            return;
+        }
+        let mut companions = self.state.read().tools.companions.clone();
+        if companions.iter().any(|c| c.path == companion.path) {
+            self.report_message("that companion is already configured");
+            return;
+        }
+        companions.push(companion);
+        self.persist_companions(companions).await;
+    }
+
+    async fn remove_companion(&mut self, index: usize) {
+        let mut companions = self.state.read().tools.companions.clone();
+        if index >= companions.len() {
+            self.report_message("no companion at that index");
+            return;
+        }
+        companions.remove(index);
+        self.persist_companions(companions).await;
+    }
+
+    async fn update_companion(&mut self, index: usize, mut companion: Companion) {
+        companion.name = companion.name.trim().to_string();
+        companion.path = companion.path.trim().to_string();
+        if let Err(message) = Self::validate_companion(&companion) {
+            self.report_message(&message);
+            return;
+        }
+        let mut companions = self.state.read().tools.companions.clone();
+        if index >= companions.len() {
+            self.report_message("no companion at that index");
+            return;
+        }
+        if companions
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != index && c.path == companion.path)
+        {
+            self.report_message("another companion already uses that path");
+            return;
+        }
+        companions[index] = companion;
+        self.persist_companions(companions).await;
+    }
+
+    async fn set_auto_start_companion(&mut self, enabled: bool) {
+        self.persist_tool_setting(
+            tools::SETTING_AUTO_START,
+            if enabled { "1" } else { "0" }.to_string(),
+        )
+        .await;
+        self.state.write().tools.auto_start_companion = enabled;
+    }
+
+    async fn set_vrchat_path(&mut self, path: Option<String>) {
+        let normalized = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        if let Some(dir) = &normalized {
+            // Only accept a real install dir — anything else would make
+            // `launch` fail later with a confusing error.
+            if !Path::new(dir).join("VRChat.exe").is_file() {
+                self.report_message("path does not contain VRChat.exe");
+                return;
+            }
+        }
+        self.persist_tool_setting(
+            tools::SETTING_VRCHAT_PATH,
+            normalized.clone().unwrap_or_default(),
+        )
+        .await;
+        {
+            let mut state = self.state.write();
+            state.tools.vrchat_path = normalized;
+            // The override may point somewhere the Steam scan never saw.
+            state.tools.vrchat_found =
+                state.tools.vrchat_path.clone().or_else(|| {
+                    vrc_launcher::find_vrchat().map(|d| d.to_string_lossy().into_owned())
+                });
+        }
+    }
+
+    async fn set_launch_prefs(&mut self, prefs: LaunchPrefs) {
+        self.persist_tool_setting(tools::SETTING_LAUNCH, tools::launch_prefs_json(&prefs))
+            .await;
+        self.state.write().tools.launch = prefs;
+    }
+
+    /// Queue a chatbox message on the throttled relay (≤1 per 1.5 s,
+    /// latest wins — never an unbounded queue).
+    fn send_chatbox(&mut self, text: &str, immediate: bool) {
+        match tools::chatbox_message(text, immediate) {
+            Ok(message) => self.chatbox_relay.send(message),
+            Err(message) => self.report_message(&message),
+        }
+    }
+
+    /// The typing indicator bypasses the chatbox throttle (it is a
+    /// different OSC address and carries no message text).
+    async fn send_chatbox_typing(&mut self, typing: bool) {
+        let message = osc_chatbox::chatbox_typing(typing);
+        tokio::spawn(async move {
+            match OscClient::vrchat().await {
+                Ok(client) => {
+                    if let Err(e) = client.send(&message).await {
+                        tracing::debug!("chatbox typing send failed: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("chatbox OSC client failed: {e}"),
+            }
+        });
+    }
+
+    /// Send one avatar parameter immediately (not chatbox-throttled).
+    /// The sent value is mirrored into `tools.osc.params` right away.
+    async fn send_osc_param(&mut self, address: &str, value: ParamValue) {
+        let message = match tools::param_message(address, value) {
+            Ok(message) => message,
+            Err(message) => {
+                self.report_message(&message);
+                return;
+            }
+        };
+        self.state
+            .write()
+            .tools
+            .osc
+            .params
+            .insert(address.to_string(), value);
+        tokio::spawn(async move {
+            match OscClient::vrchat().await {
+                Ok(client) => {
+                    if let Err(e) = client.send(&message).await {
+                        tracing::debug!("OSC param send failed: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("OSC client failed: {e}"),
+            }
+        });
+    }
+
+    /// Bind the OSC listener and spawn its pump task. Parameter messages
+    /// update `tools.osc.params`; `ToolsChanged` is emitted at most every
+    /// 250 ms so a 60 Hz avatar stream can't flood subscribers.
+    async fn start_osc_listen(&mut self, port: u16) {
+        if self.osc_listener.is_some() {
+            self.report_message("OSC listener is already running");
+            return;
+        }
+        match OscListener::bind(port).await {
+            Ok((listener, mut stream)) => {
+                let bound = listener.local_addr().port();
+                let state = self.state.clone();
+                let events = self.events.clone();
+                let handle = tokio::spawn(async move {
+                    use futures_util::StreamExt;
+                    let mut last_emit = Instant::now() - Duration::from_secs(1);
+                    while let Some(message) = stream.next().await {
+                        let Some((addr, value)) = tools::param_value_of(&message) else {
+                            continue;
+                        };
+                        let is_new = {
+                            let mut guard = state.write();
+                            let is_new = !guard.tools.osc.params.contains_key(&addr);
+                            guard.tools.osc.params.insert(addr, value);
+                            is_new
+                        };
+                        if is_new || last_emit.elapsed() >= Duration::from_millis(250) {
+                            last_emit = Instant::now();
+                            let _ = events.send(AppEvent::ToolsChanged);
+                        }
+                    }
+                });
+                self.osc_listener = Some(handle);
+                {
+                    let mut guard = self.state.write();
+                    guard.tools.osc.listening = true;
+                    guard.tools.osc.listen_port = bound;
+                }
+                let _ = self.events.send(AppEvent::ToolsChanged);
+            }
+            Err(e) => self.report_message(&format!("OSC listen failed: {e}")),
+        }
+    }
+
+    fn stop_osc_listen(&mut self) {
+        if let Some(handle) = self.osc_listener.take() {
+            handle.abort();
+        }
+        {
+            let mut guard = self.state.write();
+            guard.tools.osc.listening = false;
+            guard.tools.osc.listen_port = 0;
+        }
+        let _ = self.events.send(AppEvent::ToolsChanged);
+    }
+
+    // ------------------------------------------------------------------
+    // M7 events calendar (documented /calendar* endpoints, needs login)
+    // ------------------------------------------------------------------
+
+    /// `GET /calendar` → `AppState.calendar.month`.
+    async fn load_calendar_month(&mut self, date: Option<String>, offset: usize) {
+        let date = date.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+        if let Some(page) = self
+            .attempt(self.client.clone().calendar_events(
+                date.as_deref(),
+                Some(60),
+                Some(offset as u64),
+            ))
+            .await
+        {
+            self.state.write().calendar.month = Some((date.unwrap_or_default(), page));
+            let _ = self.events.send(AppEvent::CalendarChanged);
+        }
+    }
+
+    /// `GET /calendar/discover` → accumulated `AppState.calendar.discover`.
+    async fn load_calendar_discover(&mut self, scope: DiscoverScope, cursor: Option<String>) {
+        let params = DiscoverParams {
+            scope: Some(scope),
+            n: Some(60),
+            next_cursor: cursor.as_deref(),
+            ..Default::default()
+        };
+        if let Some(discovery) = self
+            .attempt(self.client.clone().calendar_discover(&params))
+            .await
+        {
+            let mut state = self.state.write();
+            let entry = state
+                .calendar
+                .discover
+                .get_or_insert_with(CalendarDiscoveryUi::default);
+            if cursor.is_none() || entry.scope != scope.as_str() {
+                entry.scope = scope.as_str().to_string();
+                entry.events = discovery.results;
+            } else {
+                entry.events.extend(discovery.results);
+            }
+            entry.next_cursor = discovery.next_cursor;
+            drop(state);
+            let _ = self.events.send(AppEvent::CalendarChanged);
+        }
+    }
+
+    /// `GET /calendar/search` → `AppState.calendar.search`.
+    async fn load_calendar_search(&mut self, query: &str, offset: usize) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.report_message("calendar search term is empty");
+            return;
+        }
+        if let Some(page) = self
+            .attempt(self.client.clone().calendar_search(
+                &query,
+                None,
+                Some(60),
+                Some(offset as u64),
+            ))
+            .await
+        {
+            self.state.write().calendar.search = Some((query, page));
+            let _ = self.events.send(AppEvent::CalendarChanged);
+        }
+    }
+
+    /// `GET /calendar/{groupId}` → `AppState.calendar.group`.
+    async fn load_group_calendar(&mut self, group_id: &str, date: Option<String>, offset: usize) {
+        if !vrc_api::valid_group_id(group_id) {
+            self.report_message("invalid group id");
+            return;
+        }
+        let params = GroupCalendarParams {
+            date: date.as_deref(),
+            n: Some(60),
+            offset: Some(offset as u64),
+            ..Default::default()
+        };
+        if let Some(page) = self
+            .attempt(self.client.clone().group_calendar_events(group_id, &params))
+            .await
+        {
+            self.state.write().calendar.group = Some((group_id.to_string(), page));
+            let _ = self.events.send(AppEvent::CalendarChanged);
+        }
+    }
+
+    /// `GET /calendar/{groupId}/next` → `AppState.calendar.next_events`;
+    /// a 404 is stored as `Some(None)` ("no upcoming event").
+    async fn load_group_next_event(&mut self, group_id: &str) {
+        if !vrc_api::valid_group_id(group_id) {
+            self.report_message("invalid group id");
+            return;
+        }
+        match self
+            .client
+            .clone()
+            .group_next_calendar_event(group_id)
+            .await
+        {
+            Ok(event) => {
+                self.state
+                    .write()
+                    .calendar
+                    .next_events
+                    .insert(group_id.to_string(), Some(event));
+                let _ = self.events.send(AppEvent::CalendarChanged);
+            }
+            Err(ApiError::Http { status: 404, .. }) => {
+                self.state
+                    .write()
+                    .calendar
+                    .next_events
+                    .insert(group_id.to_string(), None);
+                let _ = self.events.send(AppEvent::CalendarChanged);
+            }
+            Err(ApiError::Unauthorized) => self.session_expired(),
+            Err(e) => self.report(e),
+        }
+    }
+
+    /// `POST /calendar/{groupId}/{calendarId}/follow`, then mirror the
+    /// returned `userInterest` into every loaded event list.
+    async fn follow_calendar_event(
+        &mut self,
+        group_id: &str,
+        calendar_id: &str,
+        is_following: bool,
+    ) {
+        let Some(event) = self
+            .attempt(
+                self.client
+                    .clone()
+                    .follow_calendar_event(group_id, calendar_id, is_following),
+            )
+            .await
+        else {
+            return;
+        };
+        apply_followed_event(&mut self.state.write(), &event);
+        let _ = self.events.send(AppEvent::CalendarChanged);
     }
 
     fn report(&mut self, error: ApiError) {
