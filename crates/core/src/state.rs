@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use vrc_api::{
-    CurrentUser, FriendStatus, Instance, LimitedUser, Notification, NotificationV2,
-    PlayerModeration, TrustRank, TwoFactorMethod, User,
+    Avatar, CurrentUser, Favorite, FavoriteGroup, FriendStatus, Group, GroupAnnouncement,
+    GroupGalleryImage, GroupInstance, GroupMember, GroupPost, Instance, LimitedUser, Notification,
+    NotificationV2, PlayerModeration, TrustRank, TwoFactorMethod, User, UserGroup, World,
 };
 use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
@@ -263,6 +264,66 @@ pub struct HistoryPage {
     pub total: u64,
 }
 
+/// One page of browse/search results (worlds, groups, avatars, favorites,
+/// group members/posts/galleries/instances). Pages accumulate: `offset` is
+/// the offset of the first item in `items`, so `offset + items.len()` is the
+/// next chunk offset. `total` is `Some` only for endpoints that return a
+/// `{…, total}` envelope.
+#[derive(Debug, Clone)]
+pub struct BrowsePage<T> {
+    /// Search query or resource key this page belongs to.
+    pub key: String,
+    /// Zero-based offset of the first item in `items`.
+    pub offset: usize,
+    /// Rows loaded so far (all fetched chunks appended).
+    pub items: Vec<T>,
+    /// Total matching rows when the endpoint reports one.
+    pub total: Option<u64>,
+    /// A request for the next chunk is in flight (or debouncing).
+    pub loading: bool,
+    /// The last fetched chunk was short — no further pages exist (only
+    /// meaningful when `total` is `None`).
+    pub exhausted: bool,
+}
+
+impl<T> BrowsePage<T> {
+    /// An empty loading page for `key`/`offset`.
+    pub fn loading(key: impl Into<String>, offset: usize) -> Self {
+        Self {
+            key: key.into(),
+            offset,
+            items: Vec::new(),
+            total: None,
+            loading: true,
+            exhausted: false,
+        }
+    }
+
+    /// Whether another page likely exists (a non-short last chunk or a
+    /// known total beyond the loaded rows).
+    pub fn has_more(&self) -> bool {
+        if let Some(total) = self.total {
+            return (self.offset + self.items.len()) < total as usize;
+        }
+        !self.exhausted
+    }
+}
+
+/// Resolution state of a lazily-fetched detail object (world/group/avatar),
+/// cached in-session with in-flight dedup like [`WorldName`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailState<T> {
+    /// A detail request is in flight.
+    Pending,
+    /// The fetched detail object.
+    Known(T),
+    /// The fetch failed; don't retry before `retry_at`.
+    Unknown {
+        /// Earliest instant a retry is allowed.
+        retry_at: Instant,
+    },
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -301,6 +362,49 @@ pub struct AppState {
     pub instance: Option<Instance>,
     /// Multi-invite batch progress (`None` until the first batch).
     pub multi_invite: Option<MultiInviteProgress>,
+    /// `GET /worlds` search/browse page.
+    pub world_search: Option<BrowsePage<World>>,
+    /// `GET /worlds/active` page (currently active worlds).
+    pub active_worlds: Option<BrowsePage<World>>,
+    /// `GET /worlds/recent` page (recently visited worlds).
+    pub recent_worlds: Option<BrowsePage<World>>,
+    /// `GET /groups` search page.
+    pub group_search: Option<BrowsePage<Group>>,
+    /// `GET /users/{me}/groups` — the user's public groups (unpaged).
+    pub own_groups: Option<Vec<UserGroup>>,
+    /// `GET /avatars` page (featured or own scope; no text search — the
+    /// documented endpoint has no `search` parameter).
+    pub avatar_search: Option<BrowsePage<Avatar>>,
+    /// `GET /worlds/favorites` page.
+    pub favorite_worlds: Option<BrowsePage<World>>,
+    /// `GET /avatars/favorites` page.
+    pub favorite_avatars: Option<BrowsePage<Avatar>>,
+    /// `GET /favorite/groups` page (favorite-group sets).
+    pub favorite_groups: Option<BrowsePage<FavoriteGroup>>,
+    /// `/favorites?type=world|avatar|friend` records used to add/remove
+    /// favorites (all pages, capped).
+    pub favorite_records: Vec<Favorite>,
+    /// `RefreshFavorites` completed at least once this session — distinct
+    /// from `favorite_records` being non-empty (a user may have none).
+    pub favorite_records_loaded: bool,
+    /// `GET /worlds/{id}` detail cache keyed by world id.
+    pub world_details: HashMap<String, DetailState<World>>,
+    /// `GET /groups/{id}` detail cache keyed by group id.
+    pub group_details: HashMap<String, DetailState<Group>>,
+    /// Pinned announcement per group (`None`-absent = none or unfetched).
+    pub group_announcements: HashMap<String, GroupAnnouncement>,
+    /// `GET /avatars/{id}` detail cache keyed by avatar id.
+    pub avatar_details: HashMap<String, DetailState<Avatar>>,
+    /// `GET /users/{me}/avatar` — the current user's active avatar.
+    pub own_avatar: Option<Avatar>,
+    /// `GET /groups/{id}/members` pages keyed by group id.
+    pub group_members: HashMap<String, BrowsePage<GroupMember>>,
+    /// `GET /groups/{id}/posts` pages keyed by group id.
+    pub group_posts: HashMap<String, BrowsePage<GroupPost>>,
+    /// `GET /groups/{id}/galleries/{galleryId}` pages keyed `group:gallery`.
+    pub group_gallery_images: HashMap<String, BrowsePage<GroupGalleryImage>>,
+    /// `GET /groups/{id}/instances` pages keyed by group id.
+    pub group_instances: HashMap<String, BrowsePage<GroupInstance>>,
 }
 
 #[cfg(test)]

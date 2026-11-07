@@ -52,6 +52,14 @@ pub(crate) enum Tab {
     FriendHistory,
     /// Time-spent statistics.
     Stats,
+    /// World search/browse (M5).
+    Worlds,
+    /// Group search/browse (M5).
+    Groups,
+    /// Avatar search/switch (M5).
+    Avatars,
+    /// World/avatar favorites (M5).
+    Favorites,
 }
 
 /// Stats time-range presets.
@@ -89,6 +97,15 @@ impl StatsPreset {
     }
 }
 
+/// Favorite records power the favorite toggles on the M5 tabs; load them
+/// once per session (they are cheap and rarely change). The loaded flag —
+/// not record count — decides, so users with zero favorites don't refire.
+fn ensure_favorite_records(app: &VrcNextApp) {
+    if !app.state.snapshot().favorite_records_loaded {
+        app.send(Command::RefreshFavorites);
+    }
+}
+
 /// Switch tabs; entering a data tab (re)loads its current page.
 pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
     if app.tab == tab {
@@ -102,6 +119,26 @@ pub(crate) fn select_tab(app: &mut VrcNextApp, tab: Tab) {
         Tab::Timeline => app.reload_timeline(),
         Tab::FriendHistory => app.reload_history(),
         Tab::Stats => app.reload_stats(),
+        Tab::Worlds => {
+            app.send(crate::browse::worlds_command(app, 0));
+            ensure_favorite_records(app);
+        }
+        Tab::Groups => {
+            if app.groups_mine {
+                app.send(Command::LoadOwnGroups);
+            }
+        }
+        Tab::Avatars => {
+            app.send(Command::LoadAvatars {
+                offset: 0,
+                own: app.avatar_own,
+            });
+            ensure_favorite_records(app);
+        }
+        Tab::Favorites => {
+            app.send(Command::RefreshFavorites);
+            app.send(Command::LoadFavoriteGroups { offset: 0 });
+        }
     }
 }
 
@@ -116,6 +153,10 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
                 (Tab::Timeline, "Timeline"),
                 (Tab::FriendHistory, "Friend history"),
                 (Tab::Stats, "Stats"),
+                (Tab::Worlds, "Worlds"),
+                (Tab::Groups, "Groups"),
+                (Tab::Avatars, "Avatars"),
+                (Tab::Favorites, "Favorites"),
             ] {
                 if ui.selectable_label(app.tab == tab, label).clicked() {
                     select_tab(app, tab);
@@ -130,6 +171,10 @@ pub(crate) fn central_panel(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &App
             Tab::Timeline => timeline_tab(app, ui, state),
             Tab::FriendHistory => history_tab(app, ui, state),
             Tab::Stats => stats_tab(app, ui, state),
+            Tab::Worlds => crate::browse::worlds_tab(app, ui, state),
+            Tab::Groups => crate::browse::groups_tab(app, ui, state),
+            Tab::Avatars => crate::browse::avatars_tab(app, ui, state),
+            Tab::Favorites => crate::browse::favorites_tab(app, ui, state),
         }
     });
 }
@@ -236,6 +281,17 @@ fn instance_card(
                         }
                     });
                 }
+            }
+            ui.separator();
+            if ui
+                .small_button("Invite myself")
+                .on_hover_text("Send yourself an invite to this instance")
+                .clicked()
+            {
+                app.send(Command::InviteMyselfToInstance {
+                    world_id: instance.world_id.clone(),
+                    instance_id: instance.instance_id.clone(),
+                });
             }
         });
 }

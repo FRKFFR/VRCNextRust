@@ -203,6 +203,28 @@ impl Client {
         self.decode(resp).await
     }
 
+    /// `METHOD path` with no body and no JSON response (documented empty
+    /// 200s, e.g. `POST /groups/{id}/leave`). Still travels through
+    /// [`Client::send`]; error statuses map to [`ApiError::Http`].
+    pub(crate) async fn send_empty(&self, method: Method, path: &str) -> Result<(), ApiError> {
+        let url = self.url(path);
+        let request_method = method.clone();
+        let resp = self
+            .send(method, move |http| {
+                http.request(request_method.clone(), &url)
+            })
+            .await?;
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.bytes().await.map_err(ApiError::Network)?;
+            return Err(ApiError::Http {
+                status: status.as_u16(),
+                message: extract_error_message(&body),
+            });
+        }
+        Ok(())
+    }
+
     /// Single send path for every request: rate limit, retry, 401 handling.
     ///
     /// `make` rebuilds the [`reqwest::RequestBuilder`] on each attempt. Retries

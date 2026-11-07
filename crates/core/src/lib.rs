@@ -7,6 +7,7 @@
 //! `vrc-pipeline` events — never re-fetched per event (RULES.md §3).
 
 mod app;
+pub mod browse;
 mod dashboard;
 pub mod format;
 mod local;
@@ -24,16 +25,19 @@ pub use social::{
     validate_multi_invite_targets, MULTI_INVITE_GAP, MULTI_INVITE_MAX_TARGETS,
 };
 pub use state::{
-    AppState, AuthState, Friend, HistoryPage, MultiInviteProgress, PipelineStatus, ProfileView,
-    TimelinePage, WorldName,
+    AppState, AuthState, BrowsePage, DetailState, Friend, HistoryPage, MultiInviteProgress,
+    PipelineStatus, ProfileView, TimelinePage, WorldName,
 };
 
 // Front ends (cli/ui-egui) only depend on vrc-core; re-export the pieces of
 // the leaf crates they legitimately need.
 pub use vrc_api::{
-    ApiError, Client, ClientBuilder, CookieVault, FriendStatus, Instance, KeyringVault,
-    LoginOutcome, MemoryVault, Notification, NotificationV2, PlayerModeration,
-    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, USER_AGENT,
+    ApiError, Avatar, Client, ClientBuilder, CookieVault, CreateInstanceRequest, Favorite,
+    FavoriteGroup, FavoriteKind, FriendStatus, Group, GroupAccessType, GroupGalleryImage,
+    GroupInstance, GroupMember, GroupMemberUser, GroupPost, Instance, InstanceKind, InstanceRegion,
+    KeyringVault, LoginOutcome, MemoryVault, Notification, NotificationV2, PlayerModeration,
+    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserGroup, UserNote,
+    World, USER_AGENT,
 };
 pub use vrc_logs::{default_log_dir, LogEvent, LogTailer};
 pub use vrc_pipeline::PipelineConfig;

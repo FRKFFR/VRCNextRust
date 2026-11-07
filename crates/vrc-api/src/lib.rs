@@ -16,33 +16,48 @@ pub const USER_AGENT: &str = concat!(
 );
 
 mod auth;
+mod avatars;
 mod client;
 mod error;
+mod favorites;
 mod friends;
+mod groups;
 mod instances;
 mod invites;
 pub mod models;
 mod moderation;
 mod notifications;
+mod query;
 mod rate_limit;
 mod users;
 mod vault;
 mod worlds;
 
 pub use auth::LoginOutcome;
+pub use avatars::{valid_avatar_id, AvatarSearchQuery};
 pub use client::{Client, ClientBuilder, API_ROOT};
 pub use error::ApiError;
-pub use instances::valid_instance_id;
+pub use favorites::valid_favorite_id;
+pub use groups::{
+    valid_group_gallery_id, valid_group_id, valid_group_member_id, valid_group_role_id,
+};
+pub use instances::{
+    valid_instance_id, valid_world_segment, CreateInstanceRequest, GroupAccessType, InstanceKind,
+    InstanceRegion,
+};
 pub use models::{
-    CurrentUser, CurrentUserPresence, Favorite, FriendStatus, Instance, LimitedUser, Notification,
+    Avatar, CurrentUser, CurrentUserPresence, Favorite, FavoriteGroup, FavoriteKind, FriendStatus,
+    Group, GroupAnnouncement, GroupGallery, GroupGalleryImage, GroupInstance, GroupMember,
+    GroupMemberUser, GroupPost, GroupPostPage, GroupRole, Instance, LimitedUser, Notification,
     NotificationV2, NotificationV2Response, PastDisplayName, PlayerModeration,
-    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserNote, World,
+    PlayerModerationKind, SuccessResponse, TrustRank, TwoFactorMethod, User, UserGroup, UserNote,
+    World,
 };
 pub use notifications::valid_notification_id;
 pub use rate_limit::RateLimiter;
 pub use users::valid_user_id;
 pub use vault::{CookieVault, KeyringVault, MemoryVault};
-pub use worlds::valid_world_id;
+pub use worlds::{valid_world_id, WorldSearchQuery};
 
 #[cfg(test)]
 mod tests {
