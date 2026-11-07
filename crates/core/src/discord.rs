@@ -429,7 +429,11 @@ mod tests {
         // endpoint_for rewrites the host to the wiremock server while
         // keeping the webhook path; the env var is read per send.
         std::env::set_var("VRC_WEBHOOK_BASE", server.uri());
-        let client = Client::builder().rate_limit(1_000.0, 100).build().unwrap();
+        let client = Client::builder()
+            .rate_limit(1_000.0, 100)
+            .allow_loopback_http()
+            .build()
+            .unwrap();
         let state = crate::app::StateHandle::detached();
         let (events, _rx) = tokio::sync::broadcast::channel(8);
         let job = RelayJob {

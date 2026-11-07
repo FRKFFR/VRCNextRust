@@ -141,6 +141,12 @@ pub fn media_filter_key(filter: &MediaFilter) -> String {
     format!("folder={folder}\x1ffav={fav}\x1fworld={world}\x1fq={query}\x1fsince={since}\x1funtil={until}")
 }
 
+/// Whether a [`media_filter_key`] encodes `favorites_only`. Segments
+/// are `\x1f`-separated so folder/query text can't spoof the flag.
+pub fn media_key_favorites_only(key: &str) -> bool {
+    key.split('\x1f').any(|seg| seg == "fav=true")
+}
+
 /// Parse PNG `tEXt`/`iTXt` chunks into a JSON object string. Tolerant of
 /// truncated or malformed input: parsing stops at the first structural
 /// error and whatever was collected is returned (`"{}"` when empty).
@@ -379,6 +385,11 @@ fn walk_dir(
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
+        // A failed root listing means "couldn't scan", not "empty
+        // folder" — propagating keeps `sync_folder` from wiping the
+        // folder's index rows (favorites, world links). Subdirectory
+        // failures are still skipped individually.
+        Err(e) if depth == 0 => return Err(e),
         Err(_) => return Ok(()),
     };
     for entry in entries.flatten() {
@@ -553,5 +564,31 @@ mod tests {
         assert!(!folders[0].custom);
         let dup = vec![folders[0].path.clone()];
         assert_eq!(effective_folders(&dup).len(), folders.len());
+    }
+
+    #[test]
+    fn scan_folder_unreadable_root_is_error_not_empty() {
+        // A root that cannot be listed must surface as Err so
+        // `sync_folder` skips it — otherwise an empty walk would be
+        // treated as "all files deleted" and wipe the index.
+        let missing = Path::new("\\\\definitely-not-a-real-share\\nope");
+        let signatures = HashMap::new();
+        assert!(scan_folder(missing, &signatures).is_err());
+    }
+
+    #[test]
+    fn filter_key_favorites_flag_not_spoofable() {
+        let filter = MediaFilter {
+            favorites_only: true,
+            folder: Some("fav=true".to_string()),
+            ..Default::default()
+        };
+        assert!(media_key_favorites_only(&media_filter_key(&filter)));
+
+        let plain = MediaFilter {
+            folder: Some("fav=true".to_string()),
+            ..Default::default()
+        };
+        assert!(!media_key_favorites_only(&media_filter_key(&plain)));
     }
 }

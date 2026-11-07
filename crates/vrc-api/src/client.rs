@@ -89,6 +89,7 @@ pub(crate) struct Inner {
     vault: Option<Arc<dyn CookieVault>>,
     limiter: RateLimiter,
     base_url: String,
+    allow_loopback_http: bool,
 }
 
 impl fmt::Debug for Client {
@@ -107,6 +108,7 @@ pub struct ClientBuilder {
     vault: Option<Arc<dyn CookieVault>>,
     requests_per_second: f64,
     burst: u32,
+    allow_loopback_http: bool,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -126,6 +128,7 @@ impl Default for ClientBuilder {
             vault: None,
             requests_per_second: 1.0,
             burst: 3,
+            allow_loopback_http: false,
         }
     }
 }
@@ -150,6 +153,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Permit plain-`http` loopback URLs (`127.0.0.0/8`, `localhost`,
+    /// `::1`) in [`Client::get_bytes`]/[`Client::post_external`]. For
+    /// tests that point at a local mock — production clients must not
+    /// enable this.
+    pub fn allow_loopback_http(mut self) -> Self {
+        self.allow_loopback_http = true;
+        self
+    }
+
     pub fn build(self) -> Result<Client, ApiError> {
         let cookies = Arc::new(CookieStoreMutex::default());
         let http = reqwest::Client::builder()
@@ -164,6 +176,7 @@ impl ClientBuilder {
                 vault: self.vault,
                 limiter: RateLimiter::new(self.requests_per_second, self.burst),
                 base_url: self.base_url.trim_end_matches('/').to_string(),
+                allow_loopback_http: self.allow_loopback_http,
             }),
         })
     }
@@ -284,11 +297,14 @@ impl Client {
     /// even reach it) must not clear a healthy VRChat session. A
     /// genuinely dead session is still cleared by the next real API
     /// call. Only `https` URLs are accepted; plain `http` is allowed for
-    /// loopback hosts so tests can use a local mock (callers still
-    /// enforce the VRChat host allowlist).
+    /// loopback hosts only when the client opted in via
+    /// [`ClientBuilder::allow_loopback_http`] (callers still enforce the
+    /// VRChat host allowlist).
     pub async fn get_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
         let parsed = Url::parse(url).map_err(|_| ApiError::InvalidId(url.to_string()))?;
-        let loopback_http = parsed.scheme() == "http" && is_loopback_host(&parsed);
+        let loopback_http = self.inner.allow_loopback_http
+            && parsed.scheme() == "http"
+            && is_loopback_host(&parsed);
         if parsed.scheme() != "https" && !loopback_http {
             return Err(ApiError::InvalidId(format!("non-https url: {url}")));
         }
@@ -315,7 +331,8 @@ impl Client {
     /// `Retry-After` policy of [`Client::send`], but a 401 from the remote
     /// host is reported as a plain status and never clears VRChat auth
     /// state (the host is not VRChat). `https` is required; plain `http`
-    /// is accepted only for loopback hosts so tests can use a local mock.
+    /// is accepted only for loopback hosts when the client opted in via
+    /// [`ClientBuilder::allow_loopback_http`] (tests use a local mock).
     pub async fn post_external(
         &self,
         url: &str,
@@ -324,7 +341,8 @@ impl Client {
     ) -> Result<ExternalResponse, ApiError> {
         let parsed = Url::parse(url).map_err(|_| ApiError::InvalidId(url.to_string()))?;
         let scheme = parsed.scheme();
-        let loopback_http = scheme == "http" && is_loopback_host(&parsed);
+        let loopback_http =
+            self.inner.allow_loopback_http && scheme == "http" && is_loopback_host(&parsed);
         if scheme != "https" && !loopback_http {
             return Err(ApiError::InvalidId(format!("non-https url: {url}")));
         }
@@ -622,7 +640,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Client::builder().build().unwrap();
+        let client = Client::builder().allow_loopback_http().build().unwrap();
         let url = format!("{}/api/webhooks/1/abc", server.uri());
         let resp = client
             .post_external(&url, b"payload".to_vec(), "text/plain")
@@ -664,7 +682,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Client::builder().build().unwrap();
+        let client = Client::builder().allow_loopback_http().build().unwrap();
         let url = format!("{}/img.png", server.uri());
         let bytes = client.get_bytes(&url, 1024).await.unwrap();
         assert_eq!(bytes, b"\x89PNGfake");
@@ -682,7 +700,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Client::builder().build().unwrap();
+        let client = Client::builder().allow_loopback_http().build().unwrap();
         client.inject_auth_cookies("auth=synthetic-token").unwrap();
         assert!(client.auth_token().is_some());
 

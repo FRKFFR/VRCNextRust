@@ -687,6 +687,10 @@ struct Runtime {
     /// Per-kind generation counters for debounced searches; a newer command
     /// bumps the counter so stale tasks drop their results.
     search_generations: std::collections::HashMap<SearchKind, Arc<AtomicU64>>,
+    /// Generation counter for media page loads — same stale-drop
+    /// semantics as `search_generations` (media isn't debounced, but
+    /// filter changes and paging can still race on the store thread).
+    media_generation: Arc<AtomicU64>,
     /// Detached tasks (multi-invite) report a dead session here; the
     /// command loop performs the actual teardown.
     session_expired_tx: mpsc::UnboundedSender<()>,
@@ -816,6 +820,7 @@ async fn run(
         local_writes: config.local_writes,
         multi_invite_cancel: None,
         search_generations: Default::default(),
+        media_generation: Arc::new(AtomicU64::new(0)),
         session_expired_tx,
         session_expired_rx,
         thumbnails,
@@ -1370,6 +1375,10 @@ impl Runtime {
                 offset,
             ));
         }
+        // Bump *after* the in-flight dedup: a dropped duplicate must not
+        // invalidate the query it piggybacks on.
+        let generation = self.media_generation.clone();
+        let expected = generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply_tx, reply_rx) = oneshot::channel();
         if tx
             .send(StoreOp::QueryMedia {
@@ -1395,7 +1404,15 @@ impl Runtime {
                         loading: false,
                         exhausted,
                     };
-                    browse::merge_page(&mut state.write().media, page);
+                    // Re-check the generation inside the write lock: a
+                    // newer LoadMedia may have landed while this reply
+                    // was in flight — its results must win.
+                    let mut guard = state.write();
+                    if generation.load(Ordering::Relaxed) != expected {
+                        return;
+                    }
+                    browse::merge_page(&mut guard.media, page);
+                    drop(guard);
                     let _ = events.send(AppEvent::MediaLoaded);
                 }
                 Ok(Err(message)) => report_store_error(&state, &events, message),
@@ -1427,11 +1444,18 @@ impl Runtime {
         tokio::spawn(async move {
             match reply_rx.await {
                 Ok(Ok(())) => {
-                    if let Some(page) = state.write().media.as_mut() {
-                        if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
+                    let mut guard = state.write();
+                    if let Some(page) = guard.media.as_mut() {
+                        if !favorite && media::media_key_favorites_only(&page.key) {
+                            // Un-favoriting inside the favorites view
+                            // removes the row and shrinks the total.
+                            page.items.retain(|i| i.id != id);
+                            page.total = page.total.map(|t| t.saturating_sub(1));
+                        } else if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
                             item.is_favorite = favorite;
                         }
                     }
+                    drop(guard);
                     let _ = events.send(AppEvent::MediaChanged);
                 }
                 Ok(Err(message)) => report_store_error(&state, &events, message),
@@ -1626,6 +1650,13 @@ impl Runtime {
             ));
             return;
         }
+        if entries
+            .iter()
+            .any(|e| e.url.expose_secret() == url.expose_secret())
+        {
+            self.report_message("that webhook is already configured");
+            return;
+        }
         let mut entries = entries;
         entries.push(WebhookEntry { url, autopost });
         if !self.vault_save(&entries).await {
@@ -1717,12 +1748,16 @@ impl Runtime {
         if let LogEvent::PhotoTaken { path, .. } = event {
             // Link the photo to its media row + the world session
             // covering the timestamp, and auto-post to flagged webhooks.
+            // Photos outside every scan folder get no row — the library
+            // only indexes configured folders.
             let folder = self.media_folder_for(path);
-            let _ = tx.send(StoreOp::LinkPhoto {
-                path: path.clone(),
-                ts: event.at(),
-                folder,
-            });
+            if !folder.is_empty() {
+                let _ = tx.send(StoreOp::LinkPhoto {
+                    path: path.clone(),
+                    ts: event.at(),
+                    folder,
+                });
+            }
             if self.state.read().webhooks.iter().any(|w| w.autopost) {
                 self.webhook_relay.send(PathBuf::from(path), true);
             }
