@@ -175,6 +175,9 @@ enum Commands {
         /// `grol_…` role ids allowed to join a members-only group instance
         #[arg(long)]
         roles: Vec<String>,
+        /// Invite+ (only with --kind private): others may request an invite
+        #[arg(long)]
+        can_request_invite: bool,
     },
     /// Send yourself an invite to an instance (`wrld_…:instanceId`)
     SelfInvite {
@@ -189,7 +192,6 @@ enum WorldsCommand {
     /// Search/browse worlds by name
     Search {
         /// Free-text world-name filter (empty = browse defaults)
-        #[arg(long)]
         query: Option<String>,
         /// Zero-based item offset for paging
         #[arg(long, default_value_t = 0)]
@@ -198,7 +200,6 @@ enum WorldsCommand {
     /// Worlds currently active near you
     Active {
         /// Free-text world-name filter
-        #[arg(long)]
         query: Option<String>,
         /// Zero-based item offset for paging
         #[arg(long, default_value_t = 0)]
@@ -207,7 +208,6 @@ enum WorldsCommand {
     /// Worlds you recently visited
     Recent {
         /// Free-text world-name filter
-        #[arg(long)]
         query: Option<String>,
         /// Zero-based item offset for paging
         #[arg(long, default_value_t = 0)]
@@ -468,7 +468,19 @@ async fn main() -> Result<()> {
             group,
             access,
             roles,
-        } => instance_create(world_id, kind, region, group, access, roles).await,
+            can_request_invite,
+        } => {
+            instance_create(
+                world_id,
+                kind,
+                region,
+                group,
+                access,
+                roles,
+                can_request_invite,
+            )
+            .await
+        }
         Commands::SelfInvite { location } => self_invite(&location).await,
     }
 }
@@ -1433,6 +1445,7 @@ async fn instance_create(
     group: Option<String>,
     access: Option<GroupAccessArg>,
     roles: Vec<String>,
+    can_request_invite: bool,
 ) -> Result<()> {
     let kind = InstanceKind::from(kind);
     let mut request = CreateInstanceRequest::new(world_id, kind, InstanceRegion::from(region));
@@ -1445,6 +1458,12 @@ async fn instance_create(
         request.role_ids = roles;
     } else if group.is_some() || access.is_some() || !roles.is_empty() {
         bail!("--group/--access/--roles only apply to --kind group");
+    }
+    if can_request_invite {
+        if kind != InstanceKind::Private {
+            bail!("--can-request-invite only applies to --kind private");
+        }
+        request.can_request_invite = Some(true);
     }
     let mut handle = App::spawn(cli_config(logged_in_client()?));
     ensure_session(&mut handle).await?;

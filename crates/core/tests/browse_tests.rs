@@ -479,6 +479,7 @@ async fn favorites_refresh_add_and_remove() {
     {
         let state = handle.state.snapshot();
         assert_eq!(state.favorite_records.len(), 1);
+        assert!(state.favorite_records_loaded);
         assert_eq!(state.favorite_worlds.as_ref().unwrap().items.len(), 1);
         assert!(vrc_core::browse::is_favorite(
             &state,
@@ -777,6 +778,107 @@ async fn avatar_scope_switch_during_debounce_uses_newest() {
         .count();
     assert_eq!(avatar_requests, 1, "only the newest scope may hit the wire");
     server.verify().await;
+}
+
+/// `count` synthetic worlds named `{name} {i}` for pagination tests.
+fn worlds_page(name: &str, count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|i| {
+            let mut world = fake_world();
+            world["name"] = json!(format!("{name} {i}"));
+            world
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn world_search_load_more_appends_pages() {
+    let server = MockServer::start().await;
+    for (offset, name, count) in [(0, "First", 24), (24, "Second", 24), (48, "Third", 0)] {
+        Mock::given(method("GET"))
+            .and(path("/worlds"))
+            .and(query_param("offset", offset.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(worlds_page(name, count)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut handle = authed_handle(&server).await;
+    login(&mut handle).await;
+
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: String::new(),
+            offset: 0,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    {
+        let state = handle.state.snapshot();
+        let page = state.world_search.as_ref().expect("world page");
+        assert_eq!(page.items.len(), 24);
+        assert!(vrc_core::browse::page_has_more(page));
+    }
+
+    // "More" appends the next chunk instead of replacing the page.
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: String::new(),
+            offset: 24,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    {
+        let state = handle.state.snapshot();
+        let page = state.world_search.as_ref().expect("world page");
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.items.len(), 48);
+        assert_eq!(page.items[0].name, "First 0");
+        assert_eq!(page.items[24].name, "Second 0");
+        assert!(vrc_core::browse::page_has_more(page));
+    }
+
+    // A short final chunk marks the feed exhausted.
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: String::new(),
+            offset: 48,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    let state = handle.state.snapshot();
+    let page = state.world_search.as_ref().expect("world page");
+    assert_eq!(page.items.len(), 48);
+    assert!(!vrc_core::browse::page_has_more(page));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn search_while_logged_out_clears_loading() {
+    let server = MockServer::start().await;
+    // No mocks at all: the app is never logged in, so no request may fire.
+    let mut handle = authed_handle(&server).await;
+
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: "synthetic".to_string(),
+            offset: 0,
+        })
+        .await
+        .unwrap();
+    wait_browse(&mut handle).await;
+    let state = handle.state.snapshot();
+    let page = state.world_search.as_ref().expect("loading page installed");
+    assert!(!page.loading, "logged-out search must not stay loading");
+    assert!(page.items.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

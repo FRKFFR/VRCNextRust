@@ -143,13 +143,14 @@ pub(crate) fn group_action_label(group: &Group) -> &'static str {
     }
 }
 
-/// Display label for an instance kind (create-instance picker).
+/// Display label for an instance kind (create-instance picker). The wire
+/// `hidden`/`private` types are the user-facing Friends+/Invite(+) kinds.
 pub(crate) fn instance_kind_label(kind: InstanceKind) -> &'static str {
     match kind {
         InstanceKind::Public => "Public",
-        InstanceKind::Hidden => "Hidden",
+        InstanceKind::Hidden => "Friends+",
         InstanceKind::Friends => "Friends",
-        InstanceKind::Private => "Private",
+        InstanceKind::Private => "Invite",
         InstanceKind::Group => "Group",
     }
 }
@@ -309,7 +310,7 @@ pub(crate) fn worlds_tab(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppSta
 
     if let Some(id) = app.world_detail.clone() {
         match state.world_details.get(&id) {
-            Some(DetailState::Known(world)) => world_detail_card(app, ui, world),
+            Some(DetailState::Known(world)) => world_detail_card(app, ui, state, world),
             Some(DetailState::Pending) => {
                 ui.label("Loading world details…");
             }
@@ -365,8 +366,9 @@ fn world_row(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, world: &
     }
 }
 
-/// Detail card for a loaded world: metadata + instance creation.
-fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, world: &World) {
+/// Detail card for a loaded world: metadata + instance creation and
+/// self-invite for the instance created here.
+fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, world: &World) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
@@ -456,6 +458,10 @@ fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, world: &World) {
                             }
                         });
                 }
+                if app.new_instance_kind == InstanceKind::Private {
+                    ui.checkbox(&mut app.new_instance_can_request_invite, "Invite+")
+                        .on_hover_text("Invite+: others may request an invite");
+                }
                 if ui.button("Create instance").clicked() {
                     let mut request = CreateInstanceRequest::new(
                         world.id.clone(),
@@ -469,9 +475,31 @@ fn world_detail_card(app: &mut VrcNextApp, ui: &mut egui::Ui, world: &World) {
                             request.group_access_type = Some(app.new_instance_access);
                         }
                     }
+                    if app.new_instance_kind == InstanceKind::Private {
+                        request.can_request_invite = Some(app.new_instance_can_request_invite);
+                    }
                     app.send(Command::CreateInstance { request });
                 }
             });
+            // The instance created (or loaded) for this world: show it and
+            // offer self-invite without leaving the detail panel.
+            if let Some(instance) = &state.instance {
+                if instance.world_id == world.id && !instance.instance_id.is_empty() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Instance: {}", instance.instance_id));
+                        if !instance.location.is_empty() {
+                            ui.weak(instance.location.clone());
+                        }
+                        if ui.button("Invite myself").clicked() {
+                            app.send(Command::InviteMyselfToInstance {
+                                world_id: instance.world_id.clone(),
+                                instance_id: instance.instance_id.clone(),
+                            });
+                        }
+                    });
+                }
+            }
         });
 }
 
@@ -699,6 +727,12 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
                 ui.label(format!("• {}", member_label(member)));
             }
         }
+        more_button(app, ui, page, |app, offset| {
+            app.send(Command::LoadGroupMembers {
+                group_id: group_id.to_string(),
+                offset,
+            });
+        });
     }
     if let Some(page) = state.group_posts.get(group_id) {
         if !page.items.is_empty() {
@@ -707,6 +741,13 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
                 ui.label(format!("• {}", post_label(post)));
             }
         }
+        more_button(app, ui, page, |app, offset| {
+            app.send(Command::LoadGroupPosts {
+                group_id: group_id.to_string(),
+                offset,
+                public_only: false,
+            });
+        });
     }
     if let Some(page) = state.group_instances.get(group_id) {
         if !page.items.is_empty() {
@@ -729,6 +770,16 @@ fn group_subsections(app: &mut VrcNextApp, ui: &mut egui::Ui, state: &AppState, 
                 if !image.image_url.is_empty() {
                     ui.weak(image.image_url.clone());
                 }
+            });
+        }
+        if let Some((gid, gal)) = browse::parse_gallery_key(key) {
+            more_button(app, ui, page, |app, offset| {
+                app.send(Command::LoadGroupGalleryImages {
+                    group_id: gid.to_string(),
+                    gallery_id: gal.to_string(),
+                    offset,
+                    approved: None,
+                });
             });
         }
     }
@@ -1116,15 +1167,12 @@ mod tests {
 
     #[test]
     fn instance_labels_cover_all_kinds() {
-        for kind in [
-            InstanceKind::Public,
-            InstanceKind::Hidden,
-            InstanceKind::Friends,
-            InstanceKind::Private,
-            InstanceKind::Group,
-        ] {
-            assert!(!instance_kind_label(kind).is_empty());
-        }
+        // Wire `hidden`/`private` surface as the user-facing Friends+/Invite.
+        assert_eq!(instance_kind_label(InstanceKind::Public), "Public");
+        assert_eq!(instance_kind_label(InstanceKind::Hidden), "Friends+");
+        assert_eq!(instance_kind_label(InstanceKind::Friends), "Friends");
+        assert_eq!(instance_kind_label(InstanceKind::Private), "Invite");
+        assert_eq!(instance_kind_label(InstanceKind::Group), "Group");
         for region in [
             InstanceRegion::Us,
             InstanceRegion::Use,

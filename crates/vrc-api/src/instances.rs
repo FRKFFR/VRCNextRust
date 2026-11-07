@@ -210,6 +210,11 @@ impl CreateInstanceRequest {
                 "groupAccessType requires a group instance".to_string(),
             ));
         }
+        if self.can_request_invite == Some(true) && self.kind != InstanceKind::Private {
+            return Err(ApiError::InvalidId(
+                "canRequestInvite requires a private instance".to_string(),
+            ));
+        }
         for role in &self.role_ids {
             if !valid_group_role_id(role) {
                 return Err(ApiError::InvalidId(role.chars().take(64).collect()));

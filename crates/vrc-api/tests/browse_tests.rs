@@ -613,6 +613,34 @@ async fn create_instance_posts_documented_body() {
 }
 
 #[tokio::test]
+async fn create_instance_invite_plus_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/instances"))
+        .and(body_json(json!({
+            "worldId": WORLD_ID,
+            "type": "private",
+            "region": "us",
+            "canRequestInvite": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_instance()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Invite+ is a private instance with canRequestInvite on the wire.
+    let mut request =
+        CreateInstanceRequest::new(WORLD_ID, InstanceKind::Private, InstanceRegion::Us);
+    request.can_request_invite = Some(true);
+
+    test_client(&server)
+        .create_instance(&request)
+        .await
+        .unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn create_instance_validates_before_request() {
     let server = MockServer::start().await;
     let client = test_client(&server);
@@ -630,6 +658,10 @@ async fn create_instance_validates_before_request() {
     let mut bad4 = CreateInstanceRequest::new(WORLD_ID, InstanceKind::Public, InstanceRegion::Us);
     bad4.group_access_type = Some(GroupAccessType::Public);
     assert!(client.create_instance(&bad4).await.is_err());
+    // canRequestInvite on a non-private instance.
+    let mut bad5 = CreateInstanceRequest::new(WORLD_ID, InstanceKind::Friends, InstanceRegion::Us);
+    bad5.can_request_invite = Some(true);
+    assert!(client.create_instance(&bad5).await.is_err());
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 

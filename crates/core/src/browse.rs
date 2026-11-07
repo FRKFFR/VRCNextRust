@@ -83,7 +83,68 @@ pub fn favorite_kind_label(kind: FavoriteKind) -> &'static str {
 
 /// A page's items plus a "more pages may exist" hint for pagers.
 pub fn page_has_more<T>(page: &BrowsePage<T>) -> bool {
-    page.has_more(BROWSE_PAGE_SIZE)
+    page.has_more()
+}
+
+/// Store a fetched [`BrowsePage`] into `slot`: a contiguous continuation
+/// (`offset == prev.offset + prev.items.len()`, same key) appends to the
+/// loaded items; anything else replaces the slot (new query, scope or a
+/// non-contiguous jump).
+pub fn merge_page<T>(slot: &mut Option<BrowsePage<T>>, page: BrowsePage<T>) {
+    match slot.as_mut() {
+        Some(prev) => merge_into(prev, page),
+        None => *slot = Some(page),
+    }
+}
+
+/// [`merge_page`] for `HashMap`-keyed page slots (group sub-resources).
+pub fn merge_page_map<T>(
+    map: &mut std::collections::HashMap<String, BrowsePage<T>>,
+    id: &str,
+    page: BrowsePage<T>,
+) {
+    match map.get_mut(id) {
+        Some(prev) => merge_into(prev, page),
+        None => {
+            map.insert(id.to_string(), page);
+        }
+    }
+}
+
+/// Loading page for a debounced fetch: a continuation (`offset > 0` over a
+/// loaded page with the same key) keeps the already-loaded items visible
+/// and keeps `offset` at the base so `offset + items.len()` still equals
+/// the in-flight chunk offset (the in-flight dedup key).
+pub fn continuation_loading<T: Clone>(
+    prev: Option<&BrowsePage<T>>,
+    key: &str,
+    offset: usize,
+) -> BrowsePage<T> {
+    let mut page = BrowsePage::loading(key, offset);
+    if offset > 0 {
+        if let Some(p) = prev {
+            if p.key == page.key && !p.loading {
+                page.items = p.items.clone();
+                page.offset = p.offset;
+            }
+        }
+    }
+    page
+}
+
+fn merge_into<T>(prev: &mut BrowsePage<T>, page: BrowsePage<T>) {
+    let append =
+        page.offset > 0 && prev.key == page.key && prev.offset + prev.items.len() == page.offset;
+    if append {
+        prev.items.extend(page.items);
+        prev.exhausted = page.exhausted;
+        if page.total.is_some() {
+            prev.total = page.total;
+        }
+        prev.loading = false;
+    } else {
+        *prev = page;
+    }
 }
 
 #[cfg(test)]

@@ -764,10 +764,12 @@ fn clear_page_loading<T>(slot: &mut Option<BrowsePage<T>>) {
     }
 }
 
-/// Whether `page` is a loading page for exactly `key`/`offset` — the
-/// in-flight dedup check for debounced browse fetches.
+/// Whether `page` is a loading page whose in-flight chunk is exactly
+/// `offset` — the in-flight dedup check for debounced browse fetches.
+/// `offset + items.len()` is the next chunk offset for both loaded and
+/// loading pages (loading continuations keep the loaded items).
 fn page_loading<T>(page: Option<&BrowsePage<T>>, key: &str, offset: usize) -> bool {
-    page.is_some_and(|p| p.loading && p.key == key && p.offset == offset)
+    page.is_some_and(|p| p.loading && p.key == key && p.offset + p.items.len() == offset)
 }
 
 /// Store the outcome of a debounced search into its `AppState` page slot.
@@ -790,12 +792,14 @@ fn finish_search<T>(
 ) {
     match result {
         Ok(items) => {
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
             let page = BrowsePage {
                 key,
                 offset,
                 items,
                 total,
                 loading: false,
+                exhausted,
             };
             let mut state = state.write();
             // Re-check the generation *inside* the write lock: a newer
@@ -1760,19 +1764,39 @@ impl Runtime {
             let mut state = self.state.write();
             match kind {
                 SearchKind::Worlds => {
-                    state.world_search = Some(BrowsePage::loading(key.clone(), offset))
+                    state.world_search = Some(browse::continuation_loading(
+                        state.world_search.as_ref(),
+                        &key,
+                        offset,
+                    ));
                 }
                 SearchKind::ActiveWorlds => {
-                    state.active_worlds = Some(BrowsePage::loading(key.clone(), offset))
+                    state.active_worlds = Some(browse::continuation_loading(
+                        state.active_worlds.as_ref(),
+                        &key,
+                        offset,
+                    ));
                 }
                 SearchKind::RecentWorlds => {
-                    state.recent_worlds = Some(BrowsePage::loading(key.clone(), offset))
+                    state.recent_worlds = Some(browse::continuation_loading(
+                        state.recent_worlds.as_ref(),
+                        &key,
+                        offset,
+                    ));
                 }
                 SearchKind::Groups => {
-                    state.group_search = Some(BrowsePage::loading(key.clone(), offset))
+                    state.group_search = Some(browse::continuation_loading(
+                        state.group_search.as_ref(),
+                        &key,
+                        offset,
+                    ));
                 }
                 SearchKind::Avatars => {
-                    state.avatar_search = Some(BrowsePage::loading(key.clone(), offset))
+                    state.avatar_search = Some(browse::continuation_loading(
+                        state.avatar_search.as_ref(),
+                        &key,
+                        offset,
+                    ));
                 }
             }
         }
@@ -1788,6 +1812,20 @@ impl Runtime {
                 return;
             }
             if state.read().auth != AuthState::Authenticated {
+                // The command was queued while logged out (or the session
+                // ended without teardown clearing this slot): don't leave
+                // the loading page installed forever.
+                {
+                    let mut s = state.write();
+                    match kind {
+                        SearchKind::Worlds => clear_page_loading(&mut s.world_search),
+                        SearchKind::ActiveWorlds => clear_page_loading(&mut s.active_worlds),
+                        SearchKind::RecentWorlds => clear_page_loading(&mut s.recent_worlds),
+                        SearchKind::Groups => clear_page_loading(&mut s.group_search),
+                        SearchKind::Avatars => clear_page_loading(&mut s.avatar_search),
+                    }
+                }
+                let _ = events.send(AppEvent::BrowseChanged);
                 return;
             }
             let n = BROWSE_PAGE_SIZE as u32;
@@ -1816,9 +1854,11 @@ impl Runtime {
                         None,
                         result,
                         |s, page| match kind {
-                            SearchKind::Worlds => s.world_search = Some(page),
-                            SearchKind::ActiveWorlds => s.active_worlds = Some(page),
-                            _ => s.recent_worlds = Some(page),
+                            SearchKind::Worlds => browse::merge_page(&mut s.world_search, page),
+                            SearchKind::ActiveWorlds => {
+                                browse::merge_page(&mut s.active_worlds, page)
+                            }
+                            _ => browse::merge_page(&mut s.recent_worlds, page),
                         },
                         |s| match kind {
                             SearchKind::Worlds => clear_page_loading(&mut s.world_search),
@@ -1845,7 +1885,7 @@ impl Runtime {
                         offset,
                         None,
                         result,
-                        |s, page| s.group_search = Some(page),
+                        |s, page| browse::merge_page(&mut s.group_search, page),
                         |s| clear_page_loading(&mut s.group_search),
                     );
                 }
@@ -1869,7 +1909,7 @@ impl Runtime {
                         offset,
                         None,
                         result,
-                        |s, page| s.avatar_search = Some(page),
+                        |s, page| browse::merge_page(&mut s.avatar_search, page),
                         |s| clear_page_loading(&mut s.avatar_search),
                     );
                 }
@@ -2009,16 +2049,21 @@ impl Runtime {
             ))
             .await
         {
-            self.state.write().group_members.insert(
-                group_id.to_string(),
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page_map(
+                &mut state.group_members,
+                group_id,
                 BrowsePage {
                     key: group_id.to_string(),
                     offset,
                     items,
                     total: None,
                     loading: false,
+                    exhausted,
                 },
             );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2057,16 +2102,22 @@ impl Runtime {
             ))
             .await
         {
-            self.state.write().group_posts.insert(
-                group_id.to_string(),
+            let posts = page.posts;
+            let exhausted = posts.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page_map(
+                &mut state.group_posts,
+                group_id,
                 BrowsePage {
                     key: group_id.to_string(),
                     offset,
-                    items: page.posts,
+                    items: posts,
                     total: None,
                     loading: false,
+                    exhausted,
                 },
             );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2093,16 +2144,21 @@ impl Runtime {
             ))
             .await
         {
-            self.state.write().group_gallery_images.insert(
-                key.clone(),
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page_map(
+                &mut state.group_gallery_images,
+                &key,
                 BrowsePage {
-                    key,
+                    key: key.clone(),
                     offset,
                     items,
                     total: None,
                     loading: false,
+                    exhausted,
                 },
             );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2113,16 +2169,21 @@ impl Runtime {
             .attempt(self.client.clone().group_instances(group_id))
             .await
         {
-            self.state.write().group_instances.insert(
-                group_id.to_string(),
+            let mut state = self.state.write();
+            // Unpaged endpoint: the returned list is complete.
+            browse::merge_page_map(
+                &mut state.group_instances,
+                group_id,
                 BrowsePage {
                     key: group_id.to_string(),
                     offset: 0,
                     items,
                     total: None,
                     loading: false,
+                    exhausted: true,
                 },
             );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2260,6 +2321,8 @@ impl Runtime {
         let mut records = world_recs;
         records.extend(avatar_recs);
         records.extend(friend_recs);
+        let worlds_exhausted = worlds.len() < BROWSE_PAGE_SIZE;
+        let avatars_exhausted = avatars.len() < BROWSE_PAGE_SIZE;
         let mut state = self.state.write();
         state.favorite_worlds = Some(BrowsePage {
             key: "worlds".to_string(),
@@ -2267,6 +2330,7 @@ impl Runtime {
             items: worlds,
             total: None,
             loading: false,
+            exhausted: worlds_exhausted,
         });
         state.favorite_avatars = Some(BrowsePage {
             key: "avatars".to_string(),
@@ -2274,8 +2338,10 @@ impl Runtime {
             items: avatars,
             total: None,
             loading: false,
+            exhausted: avatars_exhausted,
         });
         state.favorite_records = records;
+        state.favorite_records_loaded = true;
         drop(state);
         let _ = self.events.send(AppEvent::BrowseChanged);
     }
@@ -2292,13 +2358,20 @@ impl Runtime {
             )
             .await
         {
-            self.state.write().favorite_worlds = Some(BrowsePage {
-                key: "worlds".to_string(),
-                offset,
-                items,
-                total: None,
-                loading: false,
-            });
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page(
+                &mut state.favorite_worlds,
+                BrowsePage {
+                    key: "worlds".to_string(),
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                    exhausted,
+                },
+            );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2315,13 +2388,20 @@ impl Runtime {
             )
             .await
         {
-            self.state.write().favorite_avatars = Some(BrowsePage {
-                key: "avatars".to_string(),
-                offset,
-                items,
-                total: None,
-                loading: false,
-            });
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page(
+                &mut state.favorite_avatars,
+                BrowsePage {
+                    key: "avatars".to_string(),
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                    exhausted,
+                },
+            );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2338,13 +2418,20 @@ impl Runtime {
             )
             .await
         {
-            self.state.write().favorite_groups = Some(BrowsePage {
-                key: "groups".to_string(),
-                offset,
-                items,
-                total: None,
-                loading: false,
-            });
+            let exhausted = items.len() < BROWSE_PAGE_SIZE;
+            let mut state = self.state.write();
+            browse::merge_page(
+                &mut state.favorite_groups,
+                BrowsePage {
+                    key: "groups".to_string(),
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                    exhausted,
+                },
+            );
+            drop(state);
             let _ = self.events.send(AppEvent::BrowseChanged);
         }
     }
@@ -2630,6 +2717,7 @@ impl Runtime {
         state.favorite_avatars = None;
         state.favorite_groups = None;
         state.favorite_records.clear();
+        state.favorite_records_loaded = false;
         state.world_details.clear();
         state.group_details.clear();
         state.avatar_details.clear();

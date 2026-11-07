@@ -118,6 +118,8 @@ pub struct VrcNextApp {
     new_instance_group: String,
     /// Group access type for a group instance (kind = Group).
     new_instance_access: GroupAccessType,
+    /// `canRequestInvite` for a private instance (Invite+ vs Invite).
+    new_instance_can_request_invite: bool,
 }
 
 impl VrcNextApp {
@@ -155,6 +157,7 @@ impl VrcNextApp {
             new_instance_region: InstanceRegion::Us,
             new_instance_group: String::new(),
             new_instance_access: GroupAccessType::Members,
+            new_instance_can_request_invite: false,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).

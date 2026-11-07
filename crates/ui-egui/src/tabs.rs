@@ -98,9 +98,10 @@ impl StatsPreset {
 }
 
 /// Favorite records power the favorite toggles on the M5 tabs; load them
-/// once per session (they are cheap and rarely change).
+/// once per session (they are cheap and rarely change). The loaded flag —
+/// not record count — decides, so users with zero favorites don't refire.
 fn ensure_favorite_records(app: &VrcNextApp) {
-    if app.state.snapshot().favorite_records.is_empty() {
+    if !app.state.snapshot().favorite_records_loaded {
         app.send(Command::RefreshFavorites);
     }
 }
