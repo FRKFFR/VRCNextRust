@@ -9,7 +9,7 @@
 //! are never logged (RULES.md §4).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -17,17 +17,21 @@ use futures_util::StreamExt;
 use secrecy::SecretString;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use vrc_api::{ApiError, Client, CurrentUser, LoginOutcome, PlayerModerationKind, TwoFactorMethod};
+use vrc_api::{
+    ApiError, AvatarSearchQuery, Client, CreateInstanceRequest, CurrentUser, FavoriteKind,
+    LoginOutcome, PlayerModerationKind, TwoFactorMethod, WorldSearchQuery,
+};
 use vrc_logs::{LogEvent, LogTailer};
 use vrc_pipeline::{Pipeline, PipelineConfig, PipelineEvent, PipelineHandle};
 use vrc_store::{FriendHistoryFilter, StatsRange, Store, TimelineFilter};
 
+use crate::browse::{self, SearchKind, BROWSE_PAGE_SIZE, DETAIL_RETRY, SEARCH_DEBOUNCE};
 use crate::local::{self, StoreOp};
 use crate::sections::worlds_with_friends;
 use crate::social::{self, MULTI_INVITE_GAP};
 use crate::state::{
-    valid_world_id, AppState, AuthState, Friend, MultiInviteProgress, PipelineStatus, ProfileView,
-    WorldName,
+    valid_world_id, AppState, AuthState, BrowsePage, DetailState, Friend, MultiInviteProgress,
+    PipelineStatus, ProfileView, WorldName,
 };
 
 /// Static configuration for [`App::spawn`].
@@ -260,6 +264,154 @@ pub enum Command {
         /// Instance id.
         instance_id: String,
     },
+    /// `GET /worlds` search/browse into `AppState.world_search` (debounced).
+    SearchWorlds {
+        /// Free-text world-name filter (empty = browse defaults).
+        query: String,
+        /// Zero-based offset (multiplied by the page size is *not* applied —
+        /// pass `page * BROWSE_PAGE_SIZE`).
+        offset: usize,
+    },
+    /// `GET /worlds/{id}` into `AppState.world_details` (cached).
+    LoadWorld {
+        /// `wrld_…` world id.
+        world_id: String,
+    },
+    /// `GET /groups` search into `AppState.group_search` (debounced).
+    SearchGroups {
+        /// Free-text group-name filter.
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /groups/{id}` into `AppState.group_details` (cached).
+    LoadGroup {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Include roles in the group object.
+        include_roles: bool,
+    },
+    /// `POST /groups/{id}/join` then reload the group detail.
+    JoinGroup {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Manually override a blocked-group failure.
+        confirm_override_block: bool,
+    },
+    /// `POST /groups/{id}/leave` then reload the group detail.
+    LeaveGroup {
+        /// `grp_…` group id.
+        group_id: String,
+    },
+    /// `GET /groups/{id}/members` into `AppState.group_members`.
+    LoadGroupMembers {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /groups/{id}/members/search` into `AppState.group_member_searches`.
+    SearchGroupMembers {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Member name filter (min 3 chars).
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /groups/{id}/posts` into `AppState.group_posts`.
+    LoadGroupPosts {
+        /// `grp_…` group id.
+        group_id: String,
+        /// Zero-based offset.
+        offset: usize,
+        /// Public posts only.
+        public_only: bool,
+    },
+    /// `GET /groups/{id}/galleries/{galleryId}` into
+    /// `AppState.group_gallery_images`.
+    LoadGroupGalleryImages {
+        /// `grp_…` group id.
+        group_id: String,
+        /// `ggal_…` gallery id.
+        gallery_id: String,
+        /// Zero-based offset.
+        offset: usize,
+        /// Approved filter (`None` = all).
+        approved: Option<bool>,
+    },
+    /// `GET /groups/{id}/instances` into `AppState.group_instances`.
+    LoadGroupInstances {
+        /// `grp_…` group id.
+        group_id: String,
+    },
+    /// `GET /avatars` search into `AppState.avatar_search` (debounced).
+    /// `own` selects `user=me`; otherwise `featured=true`.
+    SearchAvatars {
+        /// Free-text avatar-name filter.
+        query: String,
+        /// Zero-based offset.
+        offset: usize,
+        /// Search own avatars instead of featured ones.
+        own: bool,
+    },
+    /// `GET /avatars/{id}` into `AppState.avatar_details` (cached).
+    LoadAvatar {
+        /// `avtr_…` avatar id.
+        avatar_id: String,
+    },
+    /// `GET /users/{me}/avatar` into `AppState.own_avatar`.
+    LoadOwnAvatar,
+    /// `PUT /avatars/{id}/select` — switch avatar. Requires `confirm: true`
+    /// (UI shows a confirmation dialog first).
+    SelectAvatar {
+        /// `avtr_…` avatar id.
+        avatar_id: String,
+        /// Must be `true`; anything else is rejected without an API call.
+        confirm: bool,
+    },
+    /// Load world/avatar favorites + favorite records into state.
+    RefreshFavorites,
+    /// `GET /worlds/favorites` page into `AppState.favorite_worlds`.
+    LoadFavoriteWorlds {
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `GET /avatars/favorites` page into `AppState.favorite_avatars`.
+    LoadFavoriteAvatars {
+        /// Zero-based offset.
+        offset: usize,
+    },
+    /// `POST /favorites` — favorite a world/avatar (`friend` too, though the
+    /// UI only exposes world/avatar).
+    AddFavorite {
+        /// Favorite kind.
+        kind: FavoriteKind,
+        /// `wrld_…`/`avtr_…`/`usr_…` object id.
+        favorite_id: String,
+        /// Favorite tags.
+        tags: Vec<String>,
+    },
+    /// `DELETE /favorites/{fvrt_…}` resolved from `kind`+`object_id`.
+    RemoveFavorite {
+        /// Favorite kind.
+        kind: FavoriteKind,
+        /// `wrld_…`/`avtr_…`/`usr_…` object id.
+        object_id: String,
+    },
+    /// `POST /instances` — create a world/group instance into
+    /// `AppState.instance`.
+    CreateInstance {
+        /// Validated create request.
+        request: CreateInstanceRequest,
+    },
+    /// `POST /invite/myself/to/{world}:{instance}` — self-invite.
+    InviteMyselfToInstance {
+        /// `wrld_…` world id.
+        world_id: String,
+        /// Instance id.
+        instance_id: String,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -295,6 +447,28 @@ impl std::fmt::Debug for Command {
             Command::MultiInvite { .. } => "MultiInvite",
             Command::CancelMultiInvite => "CancelMultiInvite",
             Command::LoadInstance { .. } => "LoadInstance",
+            Command::SearchWorlds { .. } => "SearchWorlds",
+            Command::LoadWorld { .. } => "LoadWorld",
+            Command::SearchGroups { .. } => "SearchGroups",
+            Command::LoadGroup { .. } => "LoadGroup",
+            Command::JoinGroup { .. } => "JoinGroup",
+            Command::LeaveGroup { .. } => "LeaveGroup",
+            Command::LoadGroupMembers { .. } => "LoadGroupMembers",
+            Command::SearchGroupMembers { .. } => "SearchGroupMembers",
+            Command::LoadGroupPosts { .. } => "LoadGroupPosts",
+            Command::LoadGroupGalleryImages { .. } => "LoadGroupGalleryImages",
+            Command::LoadGroupInstances { .. } => "LoadGroupInstances",
+            Command::SearchAvatars { .. } => "SearchAvatars",
+            Command::LoadAvatar { .. } => "LoadAvatar",
+            Command::LoadOwnAvatar => "LoadOwnAvatar",
+            Command::SelectAvatar { .. } => "SelectAvatar",
+            Command::RefreshFavorites => "RefreshFavorites",
+            Command::LoadFavoriteWorlds { .. } => "LoadFavoriteWorlds",
+            Command::LoadFavoriteAvatars { .. } => "LoadFavoriteAvatars",
+            Command::AddFavorite { .. } => "AddFavorite",
+            Command::RemoveFavorite { .. } => "RemoveFavorite",
+            Command::CreateInstance { .. } => "CreateInstance",
+            Command::InviteMyselfToInstance { .. } => "InviteMyselfToInstance",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -329,6 +503,8 @@ pub enum AppEvent {
     InviteSent,
     /// `AppState.multi_invite` progress changed.
     MultiInviteProgress,
+    /// Any M5 browse/detail/favorite/instance state changed.
+    BrowseChanged,
     /// A command failed (message carries no secrets).
     Error(String),
 }
@@ -391,6 +567,9 @@ struct Runtime {
     /// Cancellation flag for the running multi-invite batch; `None` when
     /// no batch is active.
     multi_invite_cancel: Option<Arc<AtomicBool>>,
+    /// Per-kind generation counters for debounced searches; a newer command
+    /// bumps the counter so stale tasks drop their results.
+    search_generations: std::collections::HashMap<SearchKind, Arc<AtomicU64>>,
     /// Detached tasks (multi-invite) report a dead session here; the
     /// command loop performs the actual teardown.
     session_expired_tx: mpsc::UnboundedSender<()>,
@@ -472,6 +651,7 @@ async fn run(
         log_events,
         local_writes: config.local_writes,
         multi_invite_cancel: None,
+        search_generations: Default::default(),
         session_expired_tx,
         session_expired_rx,
     };
@@ -552,6 +732,79 @@ fn report_store_error(
     tracing::debug!("vrc-core: local store query failed: {message}");
     state.write().last_error = Some(message.clone());
     let _ = events.send(AppEvent::Error(message));
+}
+
+/// Whether a detail id still needs a fetch: unknown ids and `Unknown`
+/// entries past their retry window are fetchable; `Pending`/`Known` and
+/// recently-failed entries are not (in-flight dedup, RULES.md §3).
+fn detail_needed<T>(map: &std::collections::HashMap<String, DetailState<T>>, id: &str) -> bool {
+    match map.get(id) {
+        Some(DetailState::Known(_)) | Some(DetailState::Pending) => false,
+        Some(DetailState::Unknown { retry_at }) => *retry_at <= Instant::now(),
+        None => true,
+    }
+}
+
+/// Mark a [`BrowsePage`] slot not-loading (used on debounced-search errors).
+fn clear_page_loading<T>(slot: &mut Option<BrowsePage<T>>) {
+    if let Some(page) = slot.as_mut() {
+        page.loading = false;
+    }
+}
+
+/// Store the outcome of a debounced search into its `AppState` page slot.
+/// Stale generations (a newer command was queued) and post-logout writes
+/// are dropped; `Unauthorized` reports a dead session through
+/// `session_expired_tx` like every other detached task.
+#[allow(clippy::too_many_arguments)]
+fn finish_search<T>(
+    state: &StateHandle,
+    events: &broadcast::Sender<AppEvent>,
+    session_expired_tx: &mpsc::UnboundedSender<()>,
+    generation: &Arc<AtomicU64>,
+    expected: u64,
+    key: String,
+    offset: usize,
+    total: Option<u64>,
+    result: Result<Vec<T>, ApiError>,
+    ok: impl FnOnce(&mut AppState, BrowsePage<T>),
+    err: impl FnOnce(&mut AppState),
+) {
+    if generation.load(Ordering::Relaxed) != expected {
+        return;
+    }
+    match result {
+        Ok(items) => {
+            let page = BrowsePage {
+                key,
+                offset,
+                items,
+                total,
+                loading: false,
+            };
+            let mut state = state.write();
+            if state.auth != AuthState::Authenticated {
+                return;
+            }
+            ok(&mut state, page);
+            drop(state);
+            let _ = events.send(AppEvent::BrowseChanged);
+        }
+        Err(ApiError::Unauthorized) => {
+            let _ = session_expired_tx.send(());
+        }
+        Err(e) => {
+            let message = e.to_string();
+            let mut state = state.write();
+            if state.auth != AuthState::Authenticated {
+                return;
+            }
+            err(&mut state);
+            state.last_error = Some(message.clone());
+            drop(state);
+            let _ = events.send(AppEvent::Error(message));
+        }
+    }
 }
 
 impl Runtime {
@@ -648,6 +901,72 @@ impl Runtime {
                 world_id,
                 instance_id,
             } => self.load_instance(&world_id, &instance_id).await,
+            Command::SearchWorlds { query, offset } => {
+                self.queue_search(SearchKind::Worlds, query, offset, false)
+            }
+            Command::LoadWorld { world_id } => self.load_world(&world_id).await,
+            Command::SearchGroups { query, offset } => {
+                self.queue_search(SearchKind::Groups, query, offset, false)
+            }
+            Command::LoadGroup {
+                group_id,
+                include_roles,
+            } => self.load_group(&group_id, include_roles).await,
+            Command::JoinGroup {
+                group_id,
+                confirm_override_block,
+            } => self.join_group(&group_id, confirm_override_block).await,
+            Command::LeaveGroup { group_id } => self.leave_group(&group_id).await,
+            Command::LoadGroupMembers { group_id, offset } => {
+                self.load_group_members(&group_id, offset).await
+            }
+            Command::SearchGroupMembers {
+                group_id,
+                query,
+                offset,
+            } => self.search_group_members(&group_id, &query, offset).await,
+            Command::LoadGroupPosts {
+                group_id,
+                offset,
+                public_only,
+            } => self.load_group_posts(&group_id, offset, public_only).await,
+            Command::LoadGroupGalleryImages {
+                group_id,
+                gallery_id,
+                offset,
+                approved,
+            } => {
+                self.load_group_gallery_images(&group_id, &gallery_id, offset, approved)
+                    .await
+            }
+            Command::LoadGroupInstances { group_id } => self.load_group_instances(&group_id).await,
+            Command::SearchAvatars { query, offset, own } => {
+                self.queue_search(SearchKind::Avatars, query, offset, own)
+            }
+            Command::LoadAvatar { avatar_id } => self.load_avatar(&avatar_id).await,
+            Command::LoadOwnAvatar => self.load_own_avatar().await,
+            Command::SelectAvatar { avatar_id, confirm } => {
+                self.select_avatar(&avatar_id, confirm).await
+            }
+            Command::RefreshFavorites => self.refresh_favorites().await,
+            Command::LoadFavoriteWorlds { offset } => self.load_favorite_worlds(offset).await,
+            Command::LoadFavoriteAvatars { offset } => self.load_favorite_avatars(offset).await,
+            Command::AddFavorite {
+                kind,
+                favorite_id,
+                tags,
+            } => self.add_favorite(kind, &favorite_id, tags).await,
+            Command::RemoveFavorite { kind, object_id } => {
+                self.remove_favorite(kind, &object_id).await
+            }
+            Command::CreateInstance { request } => self.create_instance(request).await,
+            Command::InviteMyselfToInstance {
+                world_id,
+                instance_id,
+            } => {
+                self.invite_myself_to_instance(&world_id, &instance_id)
+                    .await
+            }
         }
     }
 
@@ -1363,6 +1682,658 @@ impl Runtime {
         }
     }
 
+    /// Generation counter for a debounced search kind (shared with the
+    /// detached task so a newer command can cancel stale results).
+    fn search_generation(&mut self, kind: SearchKind) -> Arc<AtomicU64> {
+        self.search_generations
+            .entry(kind)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
+    }
+
+    /// Queue a debounced search: mark the state page loading, bump the
+    /// generation, and spawn a task that sleeps [`SEARCH_DEBOUNCE`] then
+    /// performs the request only if it is still the newest command.
+    fn queue_search(&mut self, kind: SearchKind, query: String, offset: usize, own: bool) {
+        let query = browse::normalize_query(&query);
+        let offset = offset.min(1_000_000);
+        // Dedup: an identical search already loading is not re-queued.
+        let already_loading = {
+            let state = self.state.read();
+            match kind {
+                SearchKind::Worlds => state
+                    .world_search
+                    .as_ref()
+                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
+                SearchKind::Groups => state
+                    .group_search
+                    .as_ref()
+                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
+                SearchKind::Avatars => state
+                    .avatar_search
+                    .as_ref()
+                    .is_some_and(|p| p.loading && p.key == query && p.offset == offset),
+            }
+        };
+        if already_loading {
+            return;
+        }
+        let generation = self.search_generation(kind);
+        let expected = generation.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut state = self.state.write();
+            match kind {
+                SearchKind::Worlds => {
+                    state.world_search = Some(BrowsePage::loading(query.clone(), offset))
+                }
+                SearchKind::Groups => {
+                    state.group_search = Some(BrowsePage::loading(query.clone(), offset))
+                }
+                SearchKind::Avatars => {
+                    state.avatar_search = Some(BrowsePage::loading(query.clone(), offset))
+                }
+            }
+        }
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let events = self.events.clone();
+        let session_expired_tx = self.session_expired_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SEARCH_DEBOUNCE).await;
+            // A newer command superseded this one during the debounce
+            // window — drop it before it ever hits the wire.
+            if generation.load(Ordering::Relaxed) != expected {
+                return;
+            }
+            if state.read().auth != AuthState::Authenticated {
+                return;
+            }
+            let n = BROWSE_PAGE_SIZE as u32;
+            let off = offset as u64;
+            match kind {
+                SearchKind::Worlds => {
+                    let result = client
+                        .search_worlds(&WorldSearchQuery {
+                            search: browse::non_empty_query(&query),
+                            n: Some(n),
+                            offset: Some(off),
+                            ..Default::default()
+                        })
+                        .await;
+                    finish_search(
+                        &state,
+                        &events,
+                        &session_expired_tx,
+                        &generation,
+                        expected,
+                        query.clone(),
+                        offset,
+                        None,
+                        result,
+                        |s, page| s.world_search = Some(page),
+                        |s| clear_page_loading(&mut s.world_search),
+                    );
+                }
+                SearchKind::Groups => {
+                    let result = client
+                        .search_groups(
+                            browse::non_empty_query(&query).as_deref(),
+                            Some(n),
+                            Some(off),
+                        )
+                        .await;
+                    finish_search(
+                        &state,
+                        &events,
+                        &session_expired_tx,
+                        &generation,
+                        expected,
+                        query.clone(),
+                        offset,
+                        None,
+                        result,
+                        |s, page| s.group_search = Some(page),
+                        |s| clear_page_loading(&mut s.group_search),
+                    );
+                }
+                SearchKind::Avatars => {
+                    let result = client
+                        .search_avatars(&AvatarSearchQuery {
+                            search: browse::non_empty_query(&query),
+                            user: own.then(|| "me".to_string()),
+                            featured: (!own).then_some(true),
+                            n: Some(n),
+                            offset: Some(off),
+                            ..Default::default()
+                        })
+                        .await;
+                    finish_search(
+                        &state,
+                        &events,
+                        &session_expired_tx,
+                        &generation,
+                        expected,
+                        query.clone(),
+                        offset,
+                        None,
+                        result,
+                        |s, page| s.avatar_search = Some(page),
+                        |s| clear_page_loading(&mut s.avatar_search),
+                    );
+                }
+            }
+        });
+    }
+
+    /// `GET /worlds/{id}` → `world_details` cache (dedup + failure cache,
+    /// same pattern as `world_names`).
+    async fn load_world(&mut self, world_id: &str) {
+        if !valid_world_id(world_id) {
+            self.report_message("invalid world id");
+            return;
+        }
+        {
+            let state = self.state.read();
+            if !detail_needed(&state.world_details, world_id) {
+                return;
+            }
+        }
+        self.state
+            .write()
+            .world_details
+            .insert(world_id.to_string(), DetailState::Pending);
+        match self.client.clone().world(world_id).await {
+            Ok(world) => {
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state
+                        .world_details
+                        .insert(world_id.to_string(), DetailState::Known(world));
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::BrowseChanged);
+            }
+            Err(ApiError::Unauthorized) => self.session_expired(),
+            Err(e) => {
+                let message = e.to_string();
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state.world_details.insert(
+                        world_id.to_string(),
+                        DetailState::Unknown {
+                            retry_at: Instant::now() + DETAIL_RETRY,
+                        },
+                    );
+                    state.last_error = Some(message.clone());
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::Error(message));
+            }
+        }
+    }
+
+    /// `GET /groups/{id}` → `group_details` cache.
+    async fn load_group(&mut self, group_id: &str, include_roles: bool) {
+        if !vrc_api::valid_group_id(group_id) {
+            self.report_message("invalid group id");
+            return;
+        }
+        {
+            let state = self.state.read();
+            if !detail_needed(&state.group_details, group_id) {
+                return;
+            }
+        }
+        self.state
+            .write()
+            .group_details
+            .insert(group_id.to_string(), DetailState::Pending);
+        match self.client.clone().group(group_id, include_roles).await {
+            Ok(group) => {
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state
+                        .group_details
+                        .insert(group_id.to_string(), DetailState::Known(group));
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::BrowseChanged);
+            }
+            Err(ApiError::Unauthorized) => self.session_expired(),
+            Err(e) => {
+                let message = e.to_string();
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state.group_details.insert(
+                        group_id.to_string(),
+                        DetailState::Unknown {
+                            retry_at: Instant::now() + DETAIL_RETRY,
+                        },
+                    );
+                    state.last_error = Some(message.clone());
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::Error(message));
+            }
+        }
+    }
+
+    /// `POST /groups/{id}/join` then reload the group detail.
+    async fn join_group(&mut self, group_id: &str, confirm_override_block: bool) {
+        if self
+            .attempt(
+                self.client
+                    .clone()
+                    .join_group(group_id, confirm_override_block),
+            )
+            .await
+            .is_some()
+        {
+            // Membership changed — force a fresh detail fetch past the cache.
+            self.state.write().group_details.remove(group_id);
+            self.load_group(group_id, true).await;
+        }
+    }
+
+    /// `POST /groups/{id}/leave` then reload the group detail.
+    async fn leave_group(&mut self, group_id: &str) {
+        if self
+            .attempt(self.client.clone().leave_group(group_id))
+            .await
+            .is_some()
+        {
+            self.state.write().group_details.remove(group_id);
+            self.load_group(group_id, true).await;
+        }
+    }
+
+    /// `GET /groups/{id}/members` → `group_members` page.
+    async fn load_group_members(&mut self, group_id: &str, offset: usize) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(items) = self
+            .attempt(self.client.clone().group_members(
+                group_id,
+                Some(n),
+                Some(offset as u64),
+                None,
+                None,
+            ))
+            .await
+        {
+            self.state.write().group_members.insert(
+                group_id.to_string(),
+                BrowsePage {
+                    key: group_id.to_string(),
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                },
+            );
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /groups/{id}/members/search` → `group_member_searches` page.
+    async fn search_group_members(&mut self, group_id: &str, query: &str, offset: usize) {
+        let query = browse::normalize_query(query);
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(items) = self
+            .attempt(self.client.clone().search_group_members(
+                group_id,
+                &query,
+                Some(n),
+                Some(offset as u64),
+            ))
+            .await
+        {
+            self.state.write().group_member_searches.insert(
+                group_id.to_string(),
+                BrowsePage {
+                    key: query,
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                },
+            );
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /groups/{id}/posts` → `group_posts` page (keeps `total`).
+    async fn load_group_posts(&mut self, group_id: &str, offset: usize, public_only: bool) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(page) = self
+            .attempt(self.client.clone().group_posts(
+                group_id,
+                Some(n),
+                Some(offset as u64),
+                public_only,
+            ))
+            .await
+        {
+            self.state.write().group_posts.insert(
+                group_id.to_string(),
+                BrowsePage {
+                    key: group_id.to_string(),
+                    offset,
+                    items: page.posts,
+                    total: Some(page.total.max(0) as u64),
+                    loading: false,
+                },
+            );
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /groups/{id}/galleries/{galleryId}` → `group_gallery_images`
+    /// page keyed `group:gallery`.
+    async fn load_group_gallery_images(
+        &mut self,
+        group_id: &str,
+        gallery_id: &str,
+        offset: usize,
+        approved: Option<bool>,
+    ) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        let key = browse::gallery_key(group_id, gallery_id);
+        if let Some(items) = self
+            .attempt(self.client.clone().group_gallery_images(
+                group_id,
+                gallery_id,
+                Some(n),
+                Some(offset as u64),
+                approved,
+            ))
+            .await
+        {
+            self.state.write().group_gallery_images.insert(
+                key.clone(),
+                BrowsePage {
+                    key,
+                    offset,
+                    items,
+                    total: None,
+                    loading: false,
+                },
+            );
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /groups/{id}/instances` → `group_instances` page.
+    async fn load_group_instances(&mut self, group_id: &str) {
+        if let Some(items) = self
+            .attempt(self.client.clone().group_instances(group_id))
+            .await
+        {
+            self.state.write().group_instances.insert(
+                group_id.to_string(),
+                BrowsePage {
+                    key: group_id.to_string(),
+                    offset: 0,
+                    items,
+                    total: None,
+                    loading: false,
+                },
+            );
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /avatars/{id}` → `avatar_details` cache.
+    async fn load_avatar(&mut self, avatar_id: &str) {
+        if !vrc_api::valid_avatar_id(avatar_id) {
+            self.report_message("invalid avatar id");
+            return;
+        }
+        {
+            let state = self.state.read();
+            if !detail_needed(&state.avatar_details, avatar_id) {
+                return;
+            }
+        }
+        self.state
+            .write()
+            .avatar_details
+            .insert(avatar_id.to_string(), DetailState::Pending);
+        match self.client.clone().avatar(avatar_id).await {
+            Ok(avatar) => {
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state
+                        .avatar_details
+                        .insert(avatar_id.to_string(), DetailState::Known(avatar));
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::BrowseChanged);
+            }
+            Err(ApiError::Unauthorized) => self.session_expired(),
+            Err(e) => {
+                let message = e.to_string();
+                let mut state = self.state.write();
+                if state.auth == AuthState::Authenticated {
+                    state.avatar_details.insert(
+                        avatar_id.to_string(),
+                        DetailState::Unknown {
+                            retry_at: Instant::now() + DETAIL_RETRY,
+                        },
+                    );
+                    state.last_error = Some(message.clone());
+                }
+                drop(state);
+                let _ = self.events.send(AppEvent::Error(message));
+            }
+        }
+    }
+
+    /// `GET /users/{me}/avatar` → `own_avatar`.
+    async fn load_own_avatar(&mut self) {
+        let user_id = self
+            .state
+            .read()
+            .current_user
+            .as_ref()
+            .map(|u| u.id.clone());
+        let Some(user_id) = user_id else {
+            self.report_message("not logged in");
+            return;
+        };
+        if let Some(avatar) = self.attempt(self.client.clone().own_avatar(&user_id)).await {
+            self.state.write().own_avatar = Some(avatar);
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `PUT /avatars/{id}/select` — guarded by `confirm` (the UI shows a
+    /// confirmation dialog first). Updates `current_user` from the
+    /// response and invalidates `own_avatar` so it reloads fresh.
+    async fn select_avatar(&mut self, avatar_id: &str, confirm: bool) {
+        if !confirm {
+            self.report_message("selecting an avatar requires confirmation");
+            return;
+        }
+        if let Some(user) = self
+            .attempt(self.client.clone().select_avatar(avatar_id))
+            .await
+        {
+            let mut state = self.state.write();
+            state.current_user = Some(user);
+            state.own_avatar = None;
+            drop(state);
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// Load world/avatar favorites plus the `/favorites` records used to
+    /// add/remove them. All four calls must succeed for state to update.
+    async fn refresh_favorites(&mut self) {
+        let n = BROWSE_PAGE_SIZE as u32;
+        let worlds = self
+            .attempt(self.client.clone().favorite_worlds(Some(n), Some(0), None))
+            .await;
+        let avatars = self
+            .attempt(self.client.clone().favorite_avatars(Some(n), Some(0), None))
+            .await;
+        let world_recs = self
+            .attempt(
+                self.client
+                    .clone()
+                    .favorites(FavoriteKind::World, Some(100), Some(0)),
+            )
+            .await;
+        let avatar_recs = self
+            .attempt(
+                self.client
+                    .clone()
+                    .favorites(FavoriteKind::Avatar, Some(100), Some(0)),
+            )
+            .await;
+        let (Some(worlds), Some(avatars), Some(world_recs), Some(avatar_recs)) =
+            (worlds, avatars, world_recs, avatar_recs)
+        else {
+            return;
+        };
+        let mut records = world_recs;
+        records.extend(avatar_recs);
+        let mut state = self.state.write();
+        state.favorite_worlds = Some(BrowsePage {
+            key: "worlds".to_string(),
+            offset: 0,
+            items: worlds,
+            total: None,
+            loading: false,
+        });
+        state.favorite_avatars = Some(BrowsePage {
+            key: "avatars".to_string(),
+            offset: 0,
+            items: avatars,
+            total: None,
+            loading: false,
+        });
+        state.favorite_records = records;
+        drop(state);
+        let _ = self.events.send(AppEvent::BrowseChanged);
+    }
+
+    /// `GET /worlds/favorites` page → `favorite_worlds`.
+    async fn load_favorite_worlds(&mut self, offset: usize) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(items) = self
+            .attempt(
+                self.client
+                    .clone()
+                    .favorite_worlds(Some(n), Some(offset as u64), None),
+            )
+            .await
+        {
+            self.state.write().favorite_worlds = Some(BrowsePage {
+                key: "worlds".to_string(),
+                offset,
+                items,
+                total: None,
+                loading: false,
+            });
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `GET /avatars/favorites` page → `favorite_avatars`.
+    async fn load_favorite_avatars(&mut self, offset: usize) {
+        let offset = offset.min(1_000_000);
+        let n = BROWSE_PAGE_SIZE as u32;
+        if let Some(items) = self
+            .attempt(
+                self.client
+                    .clone()
+                    .favorite_avatars(Some(n), Some(offset as u64), None),
+            )
+            .await
+        {
+            self.state.write().favorite_avatars = Some(BrowsePage {
+                key: "avatars".to_string(),
+                offset,
+                items,
+                total: None,
+                loading: false,
+            });
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `POST /favorites` — update `favorite_records` so `is_favorite`
+    /// flips immediately; typed favorite lists refresh on next load.
+    async fn add_favorite(&mut self, kind: FavoriteKind, favorite_id: &str, tags: Vec<String>) {
+        if let Some(fav) = self
+            .attempt(self.client.clone().add_favorite(kind, favorite_id, &tags))
+            .await
+        {
+            let mut state = self.state.write();
+            state
+                .favorite_records
+                .retain(|r| !(r.kind == kind.as_str() && r.favorite_id == favorite_id));
+            state.favorite_records.push(fav);
+            drop(state);
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `DELETE /favorites/{fvrt_…}` — resolves the record id from
+    /// `favorite_records` (loaded by `RefreshFavorites`).
+    async fn remove_favorite(&mut self, kind: FavoriteKind, object_id: &str) {
+        let record_id = {
+            let state = self.state.read();
+            browse::favorite_record(&state, kind, object_id).map(|f| f.id.clone())
+        };
+        let Some(record_id) = record_id else {
+            self.report_message("favorite record not loaded — refresh favorites first");
+            return;
+        };
+        if self
+            .attempt(self.client.clone().remove_favorite(&record_id))
+            .await
+            .is_some()
+        {
+            let mut state = self.state.write();
+            state.favorite_records.retain(|r| r.id != record_id);
+            drop(state);
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `POST /instances` — create a world/group instance into
+    /// `AppState.instance`.
+    async fn create_instance(&mut self, request: CreateInstanceRequest) {
+        if let Some(instance) = self
+            .attempt(self.client.clone().create_instance(&request))
+            .await
+        {
+            self.state.write().instance = Some(instance);
+            let _ = self.events.send(AppEvent::BrowseChanged);
+        }
+    }
+
+    /// `POST /invite/myself/to/{world}:{instance}` — self-invite.
+    async fn invite_myself_to_instance(&mut self, world_id: &str, instance_id: &str) {
+        if self
+            .attempt(
+                self.client
+                    .clone()
+                    .invite_myself_to_instance(world_id, instance_id),
+            )
+            .await
+            .is_some()
+        {
+            let _ = self.events.send(AppEvent::InviteSent);
+        }
+    }
+
     /// Merge one pipeline event into `AppState` (never re-fetches).
     fn apply_pipeline_event(&mut self, event: &PipelineEvent) {
         let mut state = self.state.write();
@@ -1567,6 +2538,21 @@ impl Runtime {
         state.profile = None;
         state.instance = None;
         state.multi_invite = None;
+        state.world_search = None;
+        state.group_search = None;
+        state.avatar_search = None;
+        state.favorite_worlds = None;
+        state.favorite_avatars = None;
+        state.favorite_records.clear();
+        state.world_details.clear();
+        state.group_details.clear();
+        state.avatar_details.clear();
+        state.own_avatar = None;
+        state.group_members.clear();
+        state.group_member_searches.clear();
+        state.group_posts.clear();
+        state.group_gallery_images.clear();
+        state.group_instances.clear();
     }
 
     fn report(&mut self, error: ApiError) {

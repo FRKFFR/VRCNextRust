@@ -492,6 +492,14 @@ pub(crate) fn confirm_dialog(app: &mut VrcNextApp, ui: &mut egui::Ui) {
             "Delete every notification?".to_string(),
             Command::ClearNotifications,
         ),
+        ConfirmAction::SelectAvatar { avatar_id, name } => (
+            "Switch avatar?",
+            format!("Switch into avatar \"{name}\" ({avatar_id})?"),
+            Command::SelectAvatar {
+                avatar_id: avatar_id.clone(),
+                confirm: true,
+            },
+        ),
     };
     let mut open = true;
     egui::Window::new(title)

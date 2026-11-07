@@ -6,6 +6,7 @@
 //! local form buffers, are moved into `SecretString`s on submit, and are
 //! never stored in `AppState` or logged (RULES.md §4).
 
+mod browse;
 mod social;
 mod tabs;
 
@@ -16,8 +17,8 @@ use secrecy::SecretString;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TrySendError;
 use vrc_core::{
-    search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend,
-    PipelineStatus, StateHandle, TimelineKind, TrustRank, TwoFactorMethod,
+    search, sections, AppHandle, AppState, AuthState, Command, CommandSender, Friend, InstanceKind,
+    InstanceRegion, PipelineStatus, StateHandle, TimelineKind, TrustRank, TwoFactorMethod,
 };
 
 /// A destructive action awaiting explicit user confirmation (RULES.md:
@@ -36,6 +37,13 @@ pub(crate) enum ConfirmAction {
     },
     /// `Command::ClearNotifications` — destructive, needs the dialog.
     ClearNotifications,
+    /// `Command::SelectAvatar { confirm: true }` — avatar switch.
+    SelectAvatar {
+        /// `avtr_…` avatar id.
+        avatar_id: String,
+        /// Display name shown in the dialog.
+        name: String,
+    },
 }
 
 /// Root eframe application.
@@ -73,6 +81,24 @@ pub struct VrcNextApp {
     multi_invite_selected: HashSet<String>,
     /// Pending destructive action shown in the confirm dialog.
     confirm: Option<ConfirmAction>,
+    /// Worlds-tab live search query.
+    world_query: String,
+    /// Groups-tab live search query.
+    group_query: String,
+    /// Avatars-tab live search query.
+    avatar_query: String,
+    /// Avatars-tab scope: `true` = own avatars, `false` = featured.
+    avatar_own: bool,
+    /// Open world-detail id on the worlds tab.
+    world_detail: Option<String>,
+    /// Open group-detail id on the groups tab.
+    group_detail: Option<String>,
+    /// Open avatar-detail id on the avatars tab.
+    avatar_detail: Option<String>,
+    /// Instance kind for the world-detail create-instance picker.
+    new_instance_kind: InstanceKind,
+    /// Instance region for the world-detail create-instance picker.
+    new_instance_region: InstanceRegion,
 }
 
 impl VrcNextApp {
@@ -98,6 +124,15 @@ impl VrcNextApp {
             multi_invite_open: false,
             multi_invite_selected: HashSet::new(),
             confirm: None,
+            world_query: String::new(),
+            group_query: String::new(),
+            avatar_query: String::new(),
+            avatar_own: false,
+            world_detail: None,
+            group_detail: None,
+            avatar_detail: None,
+            new_instance_kind: InstanceKind::Public,
+            new_instance_region: InstanceRegion::Us,
         };
         // Resume a persisted session on startup. With an empty vault this
         // resolves to `LoggedOut` without any network call (RULES.md §4).

@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use vrc_api::{
-    CurrentUser, FriendStatus, Instance, LimitedUser, Notification, NotificationV2,
-    PlayerModeration, TrustRank, TwoFactorMethod, User,
+    Avatar, CurrentUser, Favorite, FriendStatus, Group, GroupGalleryImage, GroupInstance,
+    GroupMember, GroupPost, Instance, LimitedUser, Notification, NotificationV2, PlayerModeration,
+    TrustRank, TwoFactorMethod, User, World,
 };
 use vrc_store::{FriendHistoryEntry, Stats, TimelineEntry};
 
@@ -263,6 +264,60 @@ pub struct HistoryPage {
     pub total: u64,
 }
 
+/// One page of browse/search results (worlds, groups, avatars, favorites,
+/// group members/posts/galleries/instances). `total` is `Some` only for
+/// endpoints that return a `{…, total}` envelope.
+#[derive(Debug, Clone)]
+pub struct BrowsePage<T> {
+    /// Search query or resource key this page belongs to.
+    pub key: String,
+    /// Zero-based offset of this page.
+    pub offset: usize,
+    /// Rows on this page.
+    pub items: Vec<T>,
+    /// Total matching rows when the endpoint reports one.
+    pub total: Option<u64>,
+    /// A request for this page is in flight (or debouncing).
+    pub loading: bool,
+}
+
+impl<T> BrowsePage<T> {
+    /// An empty loading page for `key`/`offset`.
+    pub fn loading(key: impl Into<String>, offset: usize) -> Self {
+        Self {
+            key: key.into(),
+            offset,
+            items: Vec::new(),
+            total: None,
+            loading: true,
+        }
+    }
+
+    /// Whether another page likely exists (`n`-sized full page or a known
+    /// total beyond this page).
+    pub fn has_more(&self, page_size: usize) -> bool {
+        if let Some(total) = self.total {
+            return (self.offset + self.items.len()) < total as usize;
+        }
+        self.items.len() == page_size
+    }
+}
+
+/// Resolution state of a lazily-fetched detail object (world/group/avatar),
+/// cached in-session with in-flight dedup like [`WorldName`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailState<T> {
+    /// A detail request is in flight.
+    Pending,
+    /// The fetched detail object.
+    Known(T),
+    /// The fetch failed; don't retry before `retry_at`.
+    Unknown {
+        /// Earliest instant a retry is allowed.
+        retry_at: Instant,
+    },
+}
+
 /// Snapshot of everything the UI/CLI renders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -301,6 +356,36 @@ pub struct AppState {
     pub instance: Option<Instance>,
     /// Multi-invite batch progress (`None` until the first batch).
     pub multi_invite: Option<MultiInviteProgress>,
+    /// `GET /worlds` search/browse page.
+    pub world_search: Option<BrowsePage<World>>,
+    /// `GET /groups` search page.
+    pub group_search: Option<BrowsePage<Group>>,
+    /// `GET /avatars` search page.
+    pub avatar_search: Option<BrowsePage<Avatar>>,
+    /// `GET /worlds/favorites` page.
+    pub favorite_worlds: Option<BrowsePage<World>>,
+    /// `GET /avatars/favorites` page.
+    pub favorite_avatars: Option<BrowsePage<Avatar>>,
+    /// `/favorites?type=world|avatar` records used to add/remove favorites.
+    pub favorite_records: Vec<Favorite>,
+    /// `GET /worlds/{id}` detail cache keyed by world id.
+    pub world_details: HashMap<String, DetailState<World>>,
+    /// `GET /groups/{id}` detail cache keyed by group id.
+    pub group_details: HashMap<String, DetailState<Group>>,
+    /// `GET /avatars/{id}` detail cache keyed by avatar id.
+    pub avatar_details: HashMap<String, DetailState<Avatar>>,
+    /// `GET /users/{me}/avatar` — the current user's active avatar.
+    pub own_avatar: Option<Avatar>,
+    /// `GET /groups/{id}/members` pages keyed by group id.
+    pub group_members: HashMap<String, BrowsePage<GroupMember>>,
+    /// `GET /groups/{id}/members/search` pages keyed by group id.
+    pub group_member_searches: HashMap<String, BrowsePage<GroupMember>>,
+    /// `GET /groups/{id}/posts` pages keyed by group id.
+    pub group_posts: HashMap<String, BrowsePage<GroupPost>>,
+    /// `GET /groups/{id}/galleries/{galleryId}` pages keyed `group:gallery`.
+    pub group_gallery_images: HashMap<String, BrowsePage<GroupGalleryImage>>,
+    /// `GET /groups/{id}/instances` pages keyed by group id.
+    pub group_instances: HashMap<String, BrowsePage<GroupInstance>>,
 }
 
 #[cfg(test)]

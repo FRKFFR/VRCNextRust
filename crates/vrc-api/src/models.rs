@@ -779,6 +779,360 @@ pub(crate) struct AuthState {
     pub requires_two_factor_auth: Vec<String>,
 }
 
+/// Favorite-object kinds accepted by `/favorites` and the typed favorite
+/// list endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FavoriteKind {
+    /// A world (`wrld_…`).
+    World,
+    /// An avatar (`avtr_…`).
+    Avatar,
+    /// A user (`usr_…`).
+    Friend,
+}
+
+impl FavoriteKind {
+    /// The documented `type` query/body value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::World => "world",
+            Self::Avatar => "avatar",
+            Self::Friend => "friend",
+        }
+    }
+
+    /// Parse a documented kind name; unknown values return `None`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "world" => Self::World,
+            "avatar" => Self::Avatar,
+            "friend" => Self::Friend,
+            _ => return None,
+        })
+    }
+}
+
+/// An avatar (`GET /avatars`, `/avatars/{id}`, `/users/{id}/avatar`,
+/// `/avatars/favorites`).
+///
+/// Public metadata only; price/listing internals that are not needed for
+/// browse/switch are ignored on decode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Avatar {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(rename = "authorId", deserialize_with = "null_to_default")]
+    pub author_id: String,
+    #[serde(rename = "authorName", deserialize_with = "null_to_default")]
+    pub author_name: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(rename = "thumbnailImageUrl", deserialize_with = "null_to_default")]
+    pub thumbnail_image_url: String,
+    #[serde(rename = "assetUrl", deserialize_with = "null_to_default")]
+    pub asset_url: String,
+    #[serde(rename = "unityPackageUrl", deserialize_with = "null_to_default")]
+    pub unity_package_url: String,
+    #[serde(rename = "releaseStatus", deserialize_with = "null_to_default")]
+    pub release_status: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub tags: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub featured: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub searchable: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub lock: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub version: i32,
+    #[serde(rename = "created_at", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updated_at", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+    #[serde(rename = "listingDate", deserialize_with = "null_to_default")]
+    pub listing_date: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub performance: serde_json::Value,
+    #[serde(rename = "productId", deserialize_with = "null_to_default")]
+    pub product_id: String,
+    #[serde(rename = "pendingUpload", deserialize_with = "null_to_default")]
+    pub pending_upload: bool,
+}
+
+/// A group (`GET /groups`, `/groups/{id}`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Group {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(rename = "shortCode", deserialize_with = "null_to_default")]
+    pub short_code: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(rename = "iconUrl", deserialize_with = "null_to_default")]
+    pub icon_url: String,
+    #[serde(rename = "bannerUrl", deserialize_with = "null_to_default")]
+    pub banner_url: String,
+    #[serde(rename = "ownerId", deserialize_with = "null_to_default")]
+    pub owner_id: String,
+    #[serde(rename = "memberCount", deserialize_with = "null_to_default")]
+    pub member_count: i32,
+    #[serde(rename = "onlineMemberCount", deserialize_with = "null_to_default")]
+    pub online_member_count: i32,
+    #[serde(rename = "joinState", deserialize_with = "null_to_default")]
+    pub join_state: String,
+    #[serde(rename = "membershipStatus", deserialize_with = "null_to_default")]
+    pub membership_status: String,
+    #[serde(rename = "isSearchable", deserialize_with = "null_to_default")]
+    pub is_searchable: bool,
+    #[serde(rename = "isVerified", deserialize_with = "null_to_default")]
+    pub is_verified: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub badges: Vec<String>,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+    #[serde(rename = "lastPostCreatedAt", deserialize_with = "null_to_default")]
+    pub last_post_created_at: String,
+    /// The requesting user's membership, when present (`myMember`).
+    #[serde(rename = "myMember", deserialize_with = "null_to_default")]
+    pub my_member: Option<GroupMember>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub galleries: Vec<GroupGallery>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub roles: Vec<GroupRole>,
+}
+
+/// A group gallery (`Group.galleries`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupGallery {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(rename = "membersOnly", deserialize_with = "null_to_default")]
+    pub members_only: bool,
+    #[serde(rename = "roleIdsToView", deserialize_with = "null_to_default")]
+    pub role_ids_to_view: Vec<String>,
+    #[serde(rename = "roleIdsToSubmit", deserialize_with = "null_to_default")]
+    pub role_ids_to_submit: Vec<String>,
+    #[serde(rename = "roleIdsToManage", deserialize_with = "null_to_default")]
+    pub role_ids_to_manage: Vec<String>,
+    #[serde(rename = "roleIdsToAutoApprove", deserialize_with = "null_to_default")]
+    pub role_ids_to_auto_approve: Vec<String>,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+}
+
+/// A group role (`Group.roles` when `includeRoles=true`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupRole {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub description: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub permissions: Vec<String>,
+    #[serde(rename = "defaultRole", deserialize_with = "null_to_default")]
+    pub default_role: bool,
+    #[serde(rename = "isManagementRole", deserialize_with = "null_to_default")]
+    pub is_management_role: bool,
+    #[serde(rename = "isSelfAssignable", deserialize_with = "null_to_default")]
+    pub is_self_assignable: bool,
+    #[serde(rename = "requiresPurchase", deserialize_with = "null_to_default")]
+    pub requires_purchase: bool,
+    #[serde(rename = "requiresTwoFactor", deserialize_with = "null_to_default")]
+    pub requires_two_factor: bool,
+    #[serde(deserialize_with = "null_to_default")]
+    pub order: i32,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+}
+
+/// The limited user object embedded on a [`GroupMember`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupMemberUser {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "displayName", deserialize_with = "null_to_default")]
+    pub display_name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub username: String,
+    #[serde(rename = "iconUrl", deserialize_with = "null_to_default")]
+    pub icon_url: String,
+    #[serde(rename = "bannerUrl", deserialize_with = "null_to_default")]
+    pub banner_url: String,
+    #[serde(rename = "bannerColor", deserialize_with = "null_to_default")]
+    pub banner_color: String,
+    #[serde(rename = "bannerType", deserialize_with = "null_to_default")]
+    pub banner_type: String,
+    #[serde(rename = "iconFrame", deserialize_with = "null_to_default")]
+    pub icon_frame: String,
+    #[serde(rename = "nameplateEffect", deserialize_with = "null_to_default")]
+    pub nameplate_effect: String,
+    #[serde(rename = "profileEffect", deserialize_with = "null_to_default")]
+    pub profile_effect: String,
+}
+
+/// A group membership (`GET /groups/{id}/members`, join/leave responses).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupMember {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(rename = "userId", deserialize_with = "null_to_default")]
+    pub user_id: String,
+    #[serde(rename = "membershipStatus", deserialize_with = "null_to_default")]
+    pub membership_status: String,
+    #[serde(rename = "roleIds", deserialize_with = "null_to_default")]
+    pub role_ids: Vec<String>,
+    #[serde(rename = "mRoleIds", deserialize_with = "null_to_default")]
+    pub m_role_ids: Vec<String>,
+    #[serde(rename = "joinedAt", deserialize_with = "null_to_default")]
+    pub joined_at: String,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "bannedAt", deserialize_with = "null_to_default")]
+    pub banned_at: String,
+    #[serde(rename = "hasJoinedFromPurchase", deserialize_with = "null_to_default")]
+    pub has_joined_from_purchase: bool,
+    #[serde(rename = "has2FA", deserialize_with = "null_to_default")]
+    pub has_2fa: bool,
+    #[serde(rename = "isRepresenting", deserialize_with = "null_to_default")]
+    pub is_representing: bool,
+    #[serde(
+        rename = "isSubscribedToAnnouncements",
+        deserialize_with = "null_to_default"
+    )]
+    pub is_subscribed_to_announcements: bool,
+    #[serde(
+        rename = "isSubscribedToEventAnnouncements",
+        deserialize_with = "null_to_default"
+    )]
+    pub is_subscribed_to_event_announcements: bool,
+    #[serde(rename = "lastPostReadAt", deserialize_with = "null_to_default")]
+    pub last_post_read_at: String,
+    #[serde(rename = "managerNotes", deserialize_with = "null_to_default")]
+    pub manager_notes: String,
+    #[serde(rename = "acceptedById", deserialize_with = "null_to_default")]
+    pub accepted_by_id: String,
+    #[serde(rename = "acceptedByDisplayName", deserialize_with = "null_to_default")]
+    pub accepted_by_display_name: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub visibility: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub permissions: Vec<String>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub user: Option<GroupMemberUser>,
+}
+
+/// A group post (`GET /groups/{id}/posts`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupPost {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(rename = "authorId", deserialize_with = "null_to_default")]
+    pub author_id: String,
+    #[serde(rename = "editorId", deserialize_with = "null_to_default")]
+    pub editor_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub title: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub text: String,
+    #[serde(rename = "imageId", deserialize_with = "null_to_default")]
+    pub image_id: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub visibility: String,
+    #[serde(rename = "roleIds", deserialize_with = "null_to_default")]
+    pub role_ids: Vec<String>,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt", deserialize_with = "null_to_default")]
+    pub updated_at: String,
+}
+
+/// The `{posts, total}` envelope returned by `GET /groups/{id}/posts`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupPostPage {
+    #[serde(deserialize_with = "null_to_default")]
+    pub posts: Vec<GroupPost>,
+    #[serde(deserialize_with = "null_to_default")]
+    pub total: i64,
+}
+
+/// One image inside a group gallery.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupGalleryImage {
+    #[serde(deserialize_with = "null_to_default")]
+    pub id: String,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(rename = "galleryId", deserialize_with = "null_to_default")]
+    pub gallery_id: String,
+    #[serde(rename = "fileId", deserialize_with = "null_to_default")]
+    pub file_id: String,
+    #[serde(rename = "imageUrl", deserialize_with = "null_to_default")]
+    pub image_url: String,
+    #[serde(rename = "submittedByUserId", deserialize_with = "null_to_default")]
+    pub submitted_by_user_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub approved: bool,
+    #[serde(rename = "approvedByUserId", deserialize_with = "null_to_default")]
+    pub approved_by_user_id: String,
+    #[serde(rename = "approvedAt", deserialize_with = "null_to_default")]
+    pub approved_at: String,
+    #[serde(rename = "createdAt", deserialize_with = "null_to_default")]
+    pub created_at: String,
+}
+
+/// One active instance of a group (`GET /groups/{id}/instances`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupInstance {
+    #[serde(rename = "instanceId", deserialize_with = "null_to_default")]
+    pub instance_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub location: String,
+    #[serde(rename = "memberCount", deserialize_with = "null_to_default")]
+    pub member_count: i32,
+    #[serde(rename = "groupId", deserialize_with = "null_to_default")]
+    pub group_id: String,
+    #[serde(deserialize_with = "null_to_default")]
+    pub world: World,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@
 | M2 Real-time | M2b in review | m2b-coder | agent/m2b-desktop-ui-for-real-time-friends-rea-mw3vxzls | M2b desktop UI: egui login/2FA/main screens, friend sections + search, friends' worlds dashboard with lazy world-name resolution (`GET /worlds/{id}`, 10-min failure cache) | — |
 | M3 Local data | in review | m3-coder | agent/m3-local-data-sqlite-vrchat-log-parser-t-mw3zy1r8 | vrc-logs log parser/tailer, vrc-store SQLite repos (timeline, friend history, sessions, stats), vrc-core commands + store thread, egui data tabs, cli timeline/stats/tail-logs | — |
 | M4 Social actions | in review | m4-coder | agent/m4-social-actions-read-rules-md-first-ma-mw4606ou | vrc-api social endpoints, typed pipeline notification events, vrc-core commands + live notification state + throttled multi-invite, egui notifications/profile/invite UI, cli notifications/invite/profile/note | — |
-| M5 Worlds, groups, avatars | not started | | | | |
+| M5 Worlds, groups, avatars | in review | m5-coder | agent/m5-worlds-groups-avatars-read-rules-md-f-mw6erppm | vrc-api worlds/groups/avatars/favorites/instances endpoints + validators, vrc-core browse commands with debounced deduped search and detail caches, egui Worlds/Groups/Avatars/Favorites tabs, cli subcommands | — |
 | M6 Media | not started | | | | |
 | M7 Launcher and tools | not started | | | | |
 | M8 Optional | not started | | | | |

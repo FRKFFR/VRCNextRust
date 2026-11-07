@@ -16,8 +16,9 @@ use tokio::sync::broadcast;
 
 use vrc_core::{
     format, friend_status_label, moderation_label, notification_kind_label, sections, App,
-    AppConfig, AppEvent, AppHandle, AuthState, Client, Command, KeyringVault, MemoryVault,
-    StatsRange, TimelineFilter, TimelineKind, TwoFactorMethod, USER_AGENT,
+    AppConfig, AppEvent, AppHandle, AuthState, Client, Command, CreateInstanceRequest, DetailState,
+    GroupAccessType, InstanceKind, InstanceRegion, KeyringVault, MemoryVault, StatsRange,
+    TimelineFilter, TimelineKind, TwoFactorMethod, USER_AGENT,
 };
 
 #[derive(Parser)]
@@ -114,6 +115,86 @@ enum Commands {
         /// Note text (multiple words are joined with spaces)
         note: Vec<String>,
     },
+    /// Search worlds by name
+    Worlds {
+        /// Free-text world-name filter (empty = browse defaults)
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Show one world's public details
+    World {
+        /// `wrld_…` world id
+        world_id: String,
+    },
+    /// Search groups by name
+    Groups {
+        /// Free-text group-name filter
+        #[arg(long)]
+        query: Option<String>,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Show one group's details (membership, galleries, roles)
+    Group {
+        /// `grp_…` group id
+        group_id: String,
+    },
+    /// Search avatars (featured, or your own with --own)
+    Avatars {
+        /// Free-text avatar-name filter
+        #[arg(long)]
+        query: Option<String>,
+        /// Search your own avatars instead of featured ones
+        #[arg(long)]
+        own: bool,
+        /// Zero-based item offset for paging
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Show one avatar's public details
+    Avatar {
+        /// `avtr_…` avatar id
+        avatar_id: String,
+    },
+    /// Switch into an avatar (requires --yes)
+    AvatarSelect {
+        /// `avtr_…` avatar id to switch into
+        avatar_id: String,
+        /// Confirm the switch without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List your world/avatar favorites
+    Favorites,
+    /// Create a world or group instance
+    InstanceCreate {
+        /// `wrld_…` world id to instance
+        world_id: String,
+        /// Instance type
+        #[arg(long, value_enum, default_value_t = InstanceKindArg::Public)]
+        kind: InstanceKindArg,
+        /// Instance region
+        #[arg(long, value_enum, default_value_t = InstanceRegionArg::Us)]
+        region: InstanceRegionArg,
+        /// `grp_…` group id — required for --kind group
+        #[arg(long)]
+        group: Option<String>,
+        /// Group access type (only with --group)
+        #[arg(long, value_enum)]
+        access: Option<GroupAccessArg>,
+        /// `grol_…` role ids allowed to join a members-only group instance
+        #[arg(long)]
+        roles: Vec<String>,
+    },
+    /// Send yourself an invite to an instance (`wrld_…:instanceId`)
+    SelfInvite {
+        /// Instance location `wrld_…:instanceId`
+        location: String,
+    },
 }
 
 /// Actions for `vrcnext-cli notifications`.
@@ -156,6 +237,68 @@ impl From<TimelineKindArg> for TimelineKind {
             TimelineKindArg::PlayerJoined => TimelineKind::PlayerJoined,
             TimelineKindArg::PlayerLeft => TimelineKind::PlayerLeft,
             TimelineKindArg::PhotoTaken => TimelineKind::PhotoTaken,
+        }
+    }
+}
+
+/// `--kind` values for `instance-create`.
+#[derive(Clone, Copy, ValueEnum)]
+enum InstanceKindArg {
+    Public,
+    Hidden,
+    Friends,
+    Private,
+    Group,
+}
+
+impl From<InstanceKindArg> for InstanceKind {
+    fn from(arg: InstanceKindArg) -> Self {
+        match arg {
+            InstanceKindArg::Public => InstanceKind::Public,
+            InstanceKindArg::Hidden => InstanceKind::Hidden,
+            InstanceKindArg::Friends => InstanceKind::Friends,
+            InstanceKindArg::Private => InstanceKind::Private,
+            InstanceKindArg::Group => InstanceKind::Group,
+        }
+    }
+}
+
+/// `--region` values for `instance-create`.
+#[derive(Clone, Copy, ValueEnum)]
+enum InstanceRegionArg {
+    Us,
+    Use,
+    Eu,
+    Jp,
+    Unknown,
+}
+
+impl From<InstanceRegionArg> for InstanceRegion {
+    fn from(arg: InstanceRegionArg) -> Self {
+        match arg {
+            InstanceRegionArg::Us => InstanceRegion::Us,
+            InstanceRegionArg::Use => InstanceRegion::Use,
+            InstanceRegionArg::Eu => InstanceRegion::Eu,
+            InstanceRegionArg::Jp => InstanceRegion::Jp,
+            InstanceRegionArg::Unknown => InstanceRegion::Unknown,
+        }
+    }
+}
+
+/// `--access` values for `instance-create --group`.
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupAccessArg {
+    Public,
+    Plus,
+    Members,
+}
+
+impl From<GroupAccessArg> for GroupAccessType {
+    fn from(arg: GroupAccessArg) -> Self {
+        match arg {
+            GroupAccessArg::Public => GroupAccessType::Public,
+            GroupAccessArg::Plus => GroupAccessType::Plus,
+            GroupAccessArg::Members => GroupAccessType::Members,
         }
     }
 }
@@ -209,6 +352,23 @@ async fn main() -> Result<()> {
         }
         Commands::Profile { user_id } => profile(&user_id).await,
         Commands::Note { user_id, note } => set_note(&user_id, note).await,
+        Commands::Worlds { query, offset } => worlds(query, offset).await,
+        Commands::World { world_id } => world(&world_id).await,
+        Commands::Groups { query, offset } => groups(query, offset).await,
+        Commands::Group { group_id } => group(&group_id).await,
+        Commands::Avatars { query, own, offset } => avatars(query, own, offset).await,
+        Commands::Avatar { avatar_id } => avatar(&avatar_id).await,
+        Commands::AvatarSelect { avatar_id, yes } => avatar_select(&avatar_id, yes).await,
+        Commands::Favorites => favorites().await,
+        Commands::InstanceCreate {
+            world_id,
+            kind,
+            region,
+            group,
+            access,
+            roles,
+        } => instance_create(world_id, kind, region, group, access, roles).await,
+        Commands::SelfInvite { location } => self_invite(&location).await,
     }
 }
 
@@ -410,6 +570,7 @@ async fn watch() -> Result<()> {
                 Ok(AppEvent::InstanceLoaded) => println!("instance loaded"),
                 Ok(AppEvent::InviteSent) => println!("invite sent"),
                 Ok(AppEvent::MultiInviteProgress) => println!("multi-invite progress"),
+                Ok(AppEvent::BrowseChanged) => println!("browse data changed"),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     println!("(missed {n} events)");
                 }
@@ -793,6 +954,316 @@ async fn set_note(user_id: &str, note: Vec<String>) -> Result<()> {
         .await?;
     wait_for(&mut handle, |e| matches!(e, AppEvent::ProfileChanged)).await?;
     println!("Note saved.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Browse actions (M5): worlds, groups, avatars, favorites, instances
+// ---------------------------------------------------------------------------
+
+/// Wait for the next `BrowseChanged` event (any M5 state update).
+async fn wait_browse(handle: &mut AppHandle) -> Result<()> {
+    wait_for(handle, |e| matches!(e, AppEvent::BrowseChanged)).await?;
+    Ok(())
+}
+
+async fn worlds(query: Option<String>, offset: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::SearchWorlds {
+            query: query.unwrap_or_default(),
+            offset,
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(page) = &state.world_search else {
+        bail!("no world results");
+    };
+    for world in &page.items {
+        println!(
+            "{:<40} by {:<24} cap {:>4}  {}",
+            world.name, world.author_name, world.capacity, world.id
+        );
+    }
+    println!("-- {} world(s) --", page.items.len());
+    Ok(())
+}
+
+async fn world(world_id: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadWorld {
+            world_id: world_id.to_string(),
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(DetailState::Known(world)) = state.world_details.get(world_id) else {
+        bail!("world details unavailable for {world_id}");
+    };
+    println!("{}", world.name);
+    println!("  id:       {}", world.id);
+    if !world.author_name.is_empty() {
+        println!("  author:   {}", world.author_name);
+    }
+    if world.capacity > 0 {
+        println!("  capacity: {}", world.capacity);
+    }
+    if world.favorites > 0 {
+        println!("  favorites: {}", world.favorites);
+    }
+    if !world.release_status.is_empty() {
+        println!("  status:   {}", world.release_status);
+    }
+    if !world.url.is_empty() {
+        println!("  url:      {}", world.url);
+    }
+    if !world.description.is_empty() {
+        println!(
+            "  about:    {}",
+            world.description.lines().next().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+async fn groups(query: Option<String>, offset: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::SearchGroups {
+            query: query.unwrap_or_default(),
+            offset,
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(page) = &state.group_search else {
+        bail!("no group results");
+    };
+    for group in &page.items {
+        println!(
+            "{:<32} {:<10} {:>5} members ({:>4} online)  {}",
+            group.name, group.short_code, group.member_count, group.online_member_count, group.id
+        );
+    }
+    println!("-- {} group(s) --", page.items.len());
+    Ok(())
+}
+
+async fn group(group_id: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadGroup {
+            group_id: group_id.to_string(),
+            include_roles: true,
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(DetailState::Known(group)) = state.group_details.get(group_id) else {
+        bail!("group details unavailable for {group_id}");
+    };
+    println!("{}", group.name);
+    println!("  id:       {}", group.id);
+    if !group.short_code.is_empty() {
+        println!("  code:     {}", group.short_code);
+    }
+    println!(
+        "  members:  {} ({} online)",
+        group.member_count, group.online_member_count
+    );
+    if !group.membership_status.is_empty() {
+        println!("  status:   {}", group.membership_status);
+    }
+    println!(
+        "  member:   {}",
+        if group.my_member.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if !group.description.is_empty() {
+        println!(
+            "  about:    {}",
+            group.description.lines().next().unwrap_or_default()
+        );
+    }
+    println!(
+        "  galleries: {} · roles: {}",
+        group.galleries.len(),
+        group.roles.len()
+    );
+    Ok(())
+}
+
+async fn avatars(query: Option<String>, own: bool, offset: usize) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::SearchAvatars {
+            query: query.unwrap_or_default(),
+            offset,
+            own,
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(page) = &state.avatar_search else {
+        bail!("no avatar results");
+    };
+    for avatar in &page.items {
+        println!(
+            "{:<40} by {:<24} {:<10}  {}",
+            avatar.name, avatar.author_name, avatar.release_status, avatar.id
+        );
+    }
+    println!("-- {} avatar(s) --", page.items.len());
+    Ok(())
+}
+
+async fn avatar(avatar_id: &str) -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::LoadAvatar {
+            avatar_id: avatar_id.to_string(),
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let Some(DetailState::Known(avatar)) = state.avatar_details.get(avatar_id) else {
+        bail!("avatar details unavailable for {avatar_id}");
+    };
+    println!("{}", avatar.name);
+    println!("  id:       {}", avatar.id);
+    if !avatar.author_name.is_empty() {
+        println!("  author:   {}", avatar.author_name);
+    }
+    if !avatar.release_status.is_empty() {
+        println!("  status:   {}", avatar.release_status);
+    }
+    if avatar.version > 0 {
+        println!("  version:  {}", avatar.version);
+    }
+    if !avatar.description.is_empty() {
+        println!(
+            "  about:    {}",
+            avatar.description.lines().next().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+async fn avatar_select(avatar_id: &str, yes: bool) -> Result<()> {
+    if !yes {
+        bail!("refusing to switch avatar without --yes");
+    }
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::SelectAvatar {
+            avatar_id: avatar_id.to_string(),
+            confirm: true,
+        })
+        .await?;
+    wait_browse(&mut handle).await?;
+    println!("Avatar switched.");
+    Ok(())
+}
+
+async fn favorites() -> Result<()> {
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle.commands.send(Command::RefreshFavorites).await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    println!("== Worlds ==");
+    if let Some(page) = &state.favorite_worlds {
+        for world in &page.items {
+            println!("  {}  {}", world.name, world.id);
+        }
+        println!("  -- {} world(s) --", page.items.len());
+    } else {
+        println!("  (none)");
+    }
+    println!("== Avatars ==");
+    if let Some(page) = &state.favorite_avatars {
+        for avatar in &page.items {
+            println!("  {}  {}", avatar.name, avatar.id);
+        }
+        println!("  -- {} avatar(s) --", page.items.len());
+    } else {
+        println!("  (none)");
+    }
+    Ok(())
+}
+
+async fn instance_create(
+    world_id: String,
+    kind: InstanceKindArg,
+    region: InstanceRegionArg,
+    group: Option<String>,
+    access: Option<GroupAccessArg>,
+    roles: Vec<String>,
+) -> Result<()> {
+    let kind = InstanceKind::from(kind);
+    let mut request = CreateInstanceRequest::new(world_id, kind, InstanceRegion::from(region));
+    if kind == InstanceKind::Group {
+        let Some(group_id) = group else {
+            bail!("--kind group requires --group grp_…");
+        };
+        request.owner_id = Some(group_id);
+        request.group_access_type = access.map(GroupAccessType::from);
+        request.role_ids = roles;
+    } else if group.is_some() || access.is_some() || !roles.is_empty() {
+        bail!("--group/--access/--roles only apply to --kind group");
+    }
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::CreateInstance { request })
+        .await?;
+    wait_browse(&mut handle).await?;
+    let state = handle.state.snapshot();
+    let instance = state
+        .instance
+        .context("instance creation returned nothing")?;
+    println!(
+        "Instance created: {} ({})",
+        instance.location, instance.instance_id
+    );
+    Ok(())
+}
+
+async fn self_invite(location: &str) -> Result<()> {
+    let (world_id, instance_id) = location
+        .split_once(':')
+        .context("location must be wrld_…:instanceId")?;
+    let mut handle = App::spawn(cli_config(logged_in_client()?));
+    ensure_session(&mut handle).await?;
+    handle
+        .commands
+        .send(Command::InviteMyselfToInstance {
+            world_id: world_id.to_string(),
+            instance_id: instance_id.to_string(),
+        })
+        .await?;
+    wait_for(&mut handle, |e| matches!(e, AppEvent::InviteSent)).await?;
+    println!("Invite sent.");
     Ok(())
 }
 
